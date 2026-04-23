@@ -10,6 +10,9 @@
 //!   by a single `AtomicU64` bitmap. Release one, wait for any / all / subset.
 //! - [`SignalId`] — typed handle returned by `SignalSet::create()` for O(1)
 //!   hot-path ops (no string lookup).
+//! - [`Pipe`] — SPSC single-slot transport built on one [`Signal`]. The
+//!   minimal atom between a raw `Signal` and higher-level composites. Carries
+//!   an optional zero-cost observer [`PipeHook`].
 //! - [`Channel`] — SPSC request/response channel built on two [`Signal`]s.
 //!   Zero-copy ownership transfer; see [`Client`] / [`Server`] for the typed
 //!   split API.
@@ -27,7 +30,9 @@
 mod channel;
 mod gate;
 mod gate_set;
+mod pipe;
 
 pub use channel::{Channel, Client, Server};
 pub use gate::{Signal, DEFAULT_SPIN_ITERS};
 pub use gate_set::{SignalId, SignalSet};
+pub use pipe::{NoHook, Pipe, PipeHook};
