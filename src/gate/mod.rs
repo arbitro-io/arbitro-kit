@@ -30,9 +30,11 @@
 mod channel;
 mod gate;
 mod gate_set;
+mod hub;
 mod pipe;
 
 pub use channel::{Channel, Client, Server};
 pub use gate::{Signal, DEFAULT_SPIN_ITERS};
-pub use gate_set::{SignalId, SignalSet};
+pub use gate_set::{SignalId, SignalSet, MAX_GATES};
+pub use hub::{Hub, HubDrain, HubPort, HubReply, HubShutdown, Shutdown, MAX_HUB_PORTS};
 pub use pipe::{NoHook, Pipe, PipeHook};
