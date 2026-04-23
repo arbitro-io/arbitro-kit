@@ -114,9 +114,16 @@ impl Signal {
 
     /// Mark the gate as having no pending work. Called by the consumer after
     /// draining everything so the next `acquire()` will block.
+    ///
+    /// Uses `Release` ordering: any reads the consumer performed on payload
+    /// memory before calling `lock()` are published before the signal is
+    /// marked closed. This is what makes composites like `Pipe` safe — the
+    /// producer observes `is_open() == false` (via Acquire) only *after*
+    /// the consumer's payload reads have committed. On x86 this emits the
+    /// same `mov` as `Relaxed`; on ARM it adds one `dmb ish st`.
     #[inline]
     pub fn lock(&self) {
-        self.locked.store(true, Ordering::Relaxed);
+        self.locked.store(true, Ordering::Release);
     }
 
     /// `true` if there is pending work (i.e. `release()` was called since the
@@ -140,15 +147,22 @@ impl Signal {
     #[cold]
     #[inline(never)]
     fn acquire_slow(&self) {
+        // Every early-return from this function must synchronize-with the
+        // producer's `release()` (Release store) so the caller sees any
+        // payload the producer wrote before releasing. That means every
+        // exit-condition load of `locked` must be **Acquire**, not Relaxed.
+        // On x86 Acquire and Relaxed compile to the same plain `mov`; on
+        // ARM Acquire adds one `dmb ishld`. Cost: ~free, correctness: yes.
+
         // Phase 1: tight spin (~1-2 ns/iter). Catches intra-socket signals
         // (~100-200 ns coherence) without paying a single PAUSE.
         for _ in 0..TIGHT_SPIN {
-            if !self.locked.load(Ordering::Relaxed) { return; }
+            if !self.locked.load(Ordering::Acquire) { return; }
             std::hint::black_box(());
         }
         // Phase 2: PAUSE spin (~20-40 ns/iter on x86). Covers the ~µs range.
         for _ in 0..self.spin_iters {
-            if !self.locked.load(Ordering::Relaxed) { return; }
+            if !self.locked.load(Ordering::Acquire) { return; }
             std::hint::spin_loop();
         }
         // Phase 3: announce parking. SeqCst store = mfence on x86 / dmb ish
@@ -156,7 +170,7 @@ impl Signal {
         // every globally-visible store from any producer. Pays ~20 ns, once
         // per park event.
         self.parked.store(true, Ordering::SeqCst);
-        if !self.locked.load(Ordering::Relaxed) {
+        if !self.locked.load(Ordering::Acquire) {
             // Producer fired between spin-end and parked-set; no need to park.
             self.parked.store(false, Ordering::Relaxed);
             return;

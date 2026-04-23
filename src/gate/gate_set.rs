@@ -175,15 +175,22 @@ impl SignalSet {
     }
 
     /// Close one gate. No wake needed.
+    ///
+    /// Uses `Release` ordering so that any reads the consumer performed on
+    /// payload memory (e.g. a `Hub` inbound slot) before calling `lock`
+    /// are published before the bit is cleared. Producers observing the
+    /// cleared bit via Acquire therefore see a committed consumer read.
+    /// Same cost as Relaxed on x86; one `dmb ish st` on ARM.
     #[inline]
     pub fn lock(&self, id: SignalId) {
-        self.state.fetch_and(!id.mask(), Ordering::Relaxed);
+        self.state.fetch_and(!id.mask(), Ordering::Release);
     }
 
     /// Close every bit in `mask`. Useful to clear a subset in one op.
+    /// See [`lock`](Self::lock) for the `Release` ordering rationale.
     #[inline]
     pub fn lock_mask(&self, mask: u64) {
-        self.state.fetch_and(!mask, Ordering::Relaxed);
+        self.state.fetch_and(!mask, Ordering::Release);
     }
 
     /// `true` if this specific gate is open.
@@ -242,7 +249,13 @@ impl SignalSet {
             if pred(self.state.load(Ordering::Acquire)) { return; }
             std::hint::spin_loop();
         }
-        self.parked.store(true, Ordering::Relaxed);
+        // `parked.store(true)` needs SeqCst for the same Dekker-race reason
+        // as `Signal`: producer's (fetch_or, parked.load) pair must not be
+        // reorderable past consumer's (parked.store, state.load) pair.
+        // Without SeqCst the producer could see parked=false, skip unpark;
+        // consumer could see bits=0, then park — deadlock. Paid once per
+        // park event, not per hot-path op.
+        self.parked.store(true, Ordering::SeqCst);
         // Recheck after setting `parked` so a release that sneaks in between
         // the spin exit and the flag store still wakes us.
         while !pred(self.state.load(Ordering::Acquire)) {
