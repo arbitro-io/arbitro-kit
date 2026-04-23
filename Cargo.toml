@@ -22,6 +22,10 @@ harness = false
 name = "gate_channel_focus"
 harness = false
 
+[[bench]]
+name = "pipe_overhead"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
