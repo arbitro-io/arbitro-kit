@@ -319,13 +319,39 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         let free = CAP - head.wrapping_sub(tail);
         let n = src.len().min(free);
         if n == 0 { return 0; }
+
+        // Drop-guard: if any `write` panics (or `src.drain`'s iterator
+        // panics), advance `head` by the number of slots we already
+        // initialized so `Ring::drop` drops them and no slot leaks.
+        struct Guard<'a, T, const CAP: usize> {
+            ring: &'a Ring<T, CAP>,
+            head_start: usize,
+            written: usize,
+        }
+        impl<T, const CAP: usize> Drop for Guard<'_, T, CAP> {
+            fn drop(&mut self) {
+                // Only runs on panic unwind (we `forget` on success).
+                self.ring
+                    .head
+                    .store(self.head_start.wrapping_add(self.written), Ordering::Release);
+                self.ring.not_empty.release();
+            }
+        }
+        let mut guard = Guard::<T, CAP> {
+            ring: self,
+            head_start: head,
+            written: 0,
+        };
         // Safety: slots [head, head+n) are empty (free >= n); producer
         // owns all writes to them. `drain(..n)` moves ownership out.
         for (i, v) in src.drain(..n).enumerate() {
             unsafe {
                 (*self.slots[head.wrapping_add(i) & Self::MASK].get()).write(v);
             }
+            guard.written = i + 1;
         }
+        // Success: take the guard apart manually so its Drop does not run.
+        std::mem::forget(guard);
         // Single Release publishes all n slots at once.
         self.head.store(head.wrapping_add(n), Ordering::Release);
         // Single wake covers the whole batch.
@@ -348,8 +374,15 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         let available = head.wrapping_sub(tail);
         let n = available.min(max);
         if n == 0 { return 0; }
+        // Reserve up-front so the subsequent `push` calls cannot reallocate
+        // and therefore cannot panic mid-drain. If `reserve` itself panics
+        // (OOM), it does so BEFORE any slot has been moved out — the ring
+        // stays consistent and `Drop` will correctly drop [tail, head).
+        out.reserve(n);
         // Safety: slots [tail, tail+n) are initialized (published by the
-        // producer with Release on head). We own reading them.
+        // producer with Release on head). We own reading them. `push` is
+        // now infallible (capacity was pre-reserved), so no slot can be
+        // moved out without `tail` being advanced below.
         for i in 0..n {
             let v = unsafe {
                 (*self.slots[tail.wrapping_add(i) & Self::MASK].get())
