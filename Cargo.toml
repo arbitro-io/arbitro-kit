@@ -1,0 +1,33 @@
+[package]
+name = "arbitro-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Zero-dependency synchronization and utility primitives from the Arbitro ecosystem."
+readme = "README.md"
+
+[dependencies]
+# No runtime dependencies. std-only.
+
+[dev-dependencies]
+# Only for benchmarks: compare Gate / GateSet against crossbeam's bounded(1).
+# Runtime crate itself stays dep-free.
+crossbeam-channel = "0.5"
+
+[[bench]]
+name = "signal_compare"
+harness = false
+
+[[bench]]
+name = "gate_channel_focus"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
