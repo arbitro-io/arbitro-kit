@@ -74,6 +74,7 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::gate::Signal;
 
@@ -96,6 +97,11 @@ pub struct Channel<Req, Resp> {
     // ── response direction (server → client) ────────────────────────────
     resp_gate: Signal,
     resp_slot: UnsafeCell<MaybeUninit<Resp>>,
+    // ── poison flag ─────────────────────────────────────────────────────
+    // Set if the server handler panics inside `serve_one`. The drop-guard
+    // also releases `resp_gate` so the blocked client observes the flag
+    // instead of parking forever. Read by `call` on the resp-side ack.
+    poisoned: AtomicBool,
 }
 
 // Safety: slot access is serialized by the gate handshake — the writer
@@ -123,6 +129,7 @@ impl<Req: Send, Resp: Send> Channel<Req, Resp> {
             _pad: CachePad([]),
             resp_gate: Signal::new(),
             resp_slot: UnsafeCell::new(MaybeUninit::uninit()),
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -153,6 +160,12 @@ impl<Req: Send, Resp: Send> Channel<Req, Resp> {
     /// Client API. Send `req` and block until the server returns a `Resp`.
     ///
     /// Must only be called from the registered client thread.
+    ///
+    /// # Panics
+    ///
+    /// If the server handler panicked in a previous `serve_one`, the channel
+    /// is poisoned: the next (or in-flight) `call` observes the flag and
+    /// panics rather than returning garbage or blocking forever.
     #[inline]
     pub fn call(&self, req: Req) -> Resp {
         // Safety: slot is written by the client alone; the subsequent
@@ -161,6 +174,13 @@ impl<Req: Send, Resp: Send> Channel<Req, Resp> {
         unsafe { (*self.req_slot.get()).write(req); }
         self.req_gate.release();
         self.resp_gate.acquire();
+        // Poison check: if the server handler panicked, the PoisonGuard in
+        // `serve_one` set this flag and released `resp_gate` to wake us.
+        // `resp_slot` holds no initialized value in that case — don't read it.
+        if self.poisoned.load(Ordering::Acquire) {
+            self.resp_gate.lock();
+            panic!("arbitro-kit Channel poisoned: server handler panicked");
+        }
         // Safety: server wrote resp_slot and published via release(); our
         // acquire() synchronizes-with it.
         let r = unsafe { (*self.resp_slot.get()).assume_init_read() };
@@ -187,6 +207,12 @@ impl<Req: Send, Resp: Send> Channel<Req, Resp> {
         if !self.resp_gate.is_open() {
             return Err(req);
         }
+        // Resp gate is open — but that may be because the server panicked
+        // and the PoisonGuard released it without writing `resp_slot`.
+        if self.poisoned.load(Ordering::Acquire) {
+            self.resp_gate.lock();
+            panic!("arbitro-kit Channel poisoned: server handler panicked");
+        }
         // Response already pending. Take it, then fire our next request.
         let r = unsafe { (*self.resp_slot.get()).assume_init_read() };
         self.resp_gate.lock();
@@ -199,13 +225,43 @@ impl<Req: Send, Resp: Send> Channel<Req, Resp> {
     /// `Resp` to the waiting client. Executes exactly one round-trip.
     ///
     /// Must only be called from the registered server thread.
+    ///
+    /// # Panic safety
+    ///
+    /// If `f` panics, the channel is **poisoned**: an internal flag is set,
+    /// `resp_gate` is released to wake the blocked client, and the panic
+    /// propagates up through this call. The client's current (and any
+    /// future) `call` observes the poison flag and panics instead of
+    /// blocking forever or reading uninitialized memory.
     #[inline]
     pub fn serve_one<F: FnOnce(Req) -> Resp>(&self, f: F) {
         self.req_gate.acquire();
         // Safety: client wrote req_slot and published via release().
         let req = unsafe { (*self.req_slot.get()).assume_init_read() };
         self.req_gate.lock();
+
+        // Drop-guard: if `f(req)` panics, we still need to wake the client
+        // (which is parked in `resp_gate.acquire()`). Setting `poisoned`
+        // before releasing the gate establishes a happens-before edge with
+        // the Acquire load in `call`.
+        struct PoisonGuard<'a> {
+            poisoned: &'a AtomicBool,
+            resp_gate: &'a Signal,
+        }
+        impl<'a> Drop for PoisonGuard<'a> {
+            fn drop(&mut self) {
+                // Release so the Acquire load in `call` observes `true`.
+                self.poisoned.store(true, Ordering::Release);
+                self.resp_gate.release();
+            }
+        }
+        let guard = PoisonGuard { poisoned: &self.poisoned, resp_gate: &self.resp_gate };
+
         let resp = f(req);
+
+        // Normal path: disarm the guard before publishing the response.
+        std::mem::forget(guard);
+
         // Safety: resp_slot write is paired with the following release().
         unsafe { (*self.resp_slot.get()).write(resp); }
         self.resp_gate.release();
@@ -233,13 +289,17 @@ impl<Req: Send, Resp: Send> Channel<Req, Resp> {
 
 impl<Req, Resp> Drop for Channel<Req, Resp> {
     fn drop(&mut self) {
-        // Safety: `&mut self` means no other references exist. If either
-        // gate is open, its slot still holds an initialized value that
-        // must be dropped to avoid leaking RAII resources.
+        // Safety: `&mut self` means no other references exist. If a gate is
+        // open, its slot normally holds an initialized value that must be
+        // dropped to avoid leaking RAII resources.
+        //
+        // Exception: if the channel is poisoned, `resp_gate` was released
+        // by the PoisonGuard without writing `resp_slot` — the slot is
+        // still uninitialized, so we must skip the drop.
         if self.req_gate.is_open() {
             unsafe { (*self.req_slot.get()).assume_init_drop(); }
         }
-        if self.resp_gate.is_open() {
+        if self.resp_gate.is_open() && !*self.poisoned.get_mut() {
             unsafe { (*self.resp_slot.get()).assume_init_drop(); }
         }
     }
@@ -442,5 +502,78 @@ mod tests {
         // Nothing has been served yet → no response pending → req bounces back.
         let r = client.try_call(42);
         assert_eq!(r, Err(42));
+    }
+
+    #[test]
+    fn server_panic_poisons_and_wakes_client() {
+        // Regression: without the PoisonGuard, a panic inside `serve_one`
+        // left `resp_gate` closed forever; the client's `call` parked and
+        // never woke up. With the guard, the client observes the poison
+        // flag and panics instead of blocking forever.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let (client, server) = Channel::<u64, u64>::spsc();
+
+        let h = std::thread::spawn(move || {
+            server.bind();
+            // Handler panics on the first request — simulates a buggy server.
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                server.serve_one(|_req| -> u64 { panic!("handler boom") });
+            }));
+            assert!(res.is_err(), "serve_one must propagate the panic");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        client.bind();
+
+        // The client should NOT hang. It should panic on the call instead.
+        let res = catch_unwind(AssertUnwindSafe(|| client.call(42)));
+        assert!(res.is_err(), "client.call must panic when channel is poisoned");
+
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn poisoned_channel_drop_does_not_double_free() {
+        // After poisoning, `resp_gate` is open but `resp_slot` is
+        // uninitialized. The Drop impl must skip the resp_slot drop —
+        // otherwise it would try to drop uninit memory.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        struct Tracked(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops_s = drops.clone();
+
+        {
+            let (client, server) = Channel::<u64, Tracked>::spsc();
+
+            let h = std::thread::spawn(move || {
+                server.bind();
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    server.serve_one(|_req| -> Tracked {
+                        // Never constructs a Tracked — panics first.
+                        panic!("handler boom");
+                        #[allow(unreachable_code)]
+                        Tracked(drops_s.clone())
+                    });
+                }));
+                // server handle drops here (Arc refcount decrement only).
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            client.bind();
+            let _ = catch_unwind(AssertUnwindSafe(|| client.call(1)));
+            h.join().unwrap();
+            // Channel Arc is released here; Drop runs.
+        }
+
+        // No Tracked was ever constructed, so the count must remain 0.
+        // If Drop had called assume_init_drop on the uninit resp_slot,
+        // we'd see a bogus increment or (worse) UB.
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
 }
