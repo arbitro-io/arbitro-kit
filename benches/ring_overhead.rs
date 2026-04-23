@@ -1,34 +1,19 @@
-//! Ring overhead bench — measures Ring<T, CAP> in isolation across the
-//! scenarios that stress its different code paths.
+//! Ring overhead bench — measures Ring<T, CAP> in isolation.
 //!
-//! Scenarios:
+//! Organized into two halves:
 //!
-//!   1. **Single-thread primitive cost** — producer and consumer on the
-//!      same thread, alternating try_send/try_recv. No park, no cross-core
-//!      coherence — just cursor math + one Release store per side.
+//! ## A. Flow (one-way, producer → consumer)
+//!   A1. single-thread, per-item       (try_send / try_recv)
+//!   A2. single-thread, batch          (try_send_from / drain_into)
+//!   A3. cross-thread,  per-item       (send / recv)
+//!   A4. cross-thread,  batch          (try_send_from / drain_into)
+//!   A5. cross-thread,  burst          (producer-only latency)
 //!
-//!   2. **Cross-thread steady-state throughput** — one producer, one
-//!      consumer, distinct threads. N messages pushed end-to-end; we
-//!      measure total wall-time / N. Exercises the pipelining win as CAP
-//!      grows.
-//!
-//!   3. **Burst absorption, producer-side** — producer fires N items as
-//!      fast as possible. With CAP >= N the producer never blocks; with
-//!      CAP < N it parks and resumes as the consumer drains.
-//!
-//!   4. **Batch drain (single-thread)** — Produce K items, then drain
-//!      them with `drain_into`. Compared against K individual `try_recv`
-//!      calls. Measures the raw amortization win in cache-hot conditions.
-//!
-//!   5. **Cross-thread round-trip** — two Rings composed into a closed
-//!      loop (request → worker → reply). Measures ns/CYCLE, not ns/op,
-//!      and is the correct number for request/response workloads.
-//!
-//!   6. **Cross-thread batch-send + batch-drain** — producer uses
-//!      `try_send_from`, consumer uses `drain_into`. Both signal
-//!      handshakes amortize across the batch, and the numbers drop below
-//!      the L1↔L1 per-item floor because coherence traffic is now
-//!      per-BATCH, not per-item.
+//! ## B. Round-trip (closed loop, 2 Rings, producer → worker → producer)
+//!   B1. single-thread, per-item       (4 ops/cycle, no coherence)
+//!   B2. single-thread, batch          (batched request + batched reply)
+//!   B3. cross-thread,  per-item       (2 cross-core hops/cycle)
+//!   B4. cross-thread,  batch          (amortized across batched cycles)
 //!
 //! Run:
 //!   cargo bench --bench ring_overhead 2>&1 | tee ring_overhead.log
@@ -298,6 +283,125 @@ fn batched_ring<const CAP: usize, const BSZ: usize>() -> f64 {
     ns / MSGS as f64
 }
 
+// Scenario B2 — single-thread BATCHED round-trip. ─────────────────────
+
+fn rt_single_thread_batched<const CAP: usize, const BSZ: usize>() -> f64 {
+    // Same-thread closed loop but each cycle moves BSZ items per direction
+    // via the batch API. Measures the raw cursor+signal cost with bulk ops
+    // amortized.  ns reported is per ITEM (not per batch).
+    let req: Ring<u64, CAP> = Ring::new();
+    let rsp: Ring<u64, CAP> = Ring::new();
+    req.set_producer(thread::current());
+    req.set_consumer(thread::current());
+    rsp.set_producer(thread::current());
+    rsp.set_consumer(thread::current());
+
+    let mut src = Vec::with_capacity(BSZ);
+    let mut recv_buf = Vec::with_capacity(BSZ);
+
+    // warmup
+    for _ in 0..4 {
+        src.clear();
+        src.extend(0..BSZ as u64);
+        let _ = req.try_send_from(&mut src);
+        recv_buf.clear();
+        let _ = req.drain_into(&mut recv_buf, BSZ);
+        let mut reply: Vec<u64> = recv_buf.iter().map(|v| v.wrapping_mul(2).wrapping_add(1)).collect();
+        let _ = rsp.try_send_from(&mut reply);
+        recv_buf.clear();
+        let _ = rsp.drain_into(&mut recv_buf, BSZ);
+    }
+
+    let cycles = MSGS / BSZ;
+    let t0 = Instant::now();
+    for _ in 0..cycles {
+        src.clear();
+        src.extend(0..BSZ as u64);
+        let _ = req.try_send_from(&mut src);
+        recv_buf.clear();
+        let _ = req.drain_into(&mut recv_buf, BSZ);
+        let mut reply: Vec<u64> = recv_buf.iter().map(|v| v.wrapping_mul(2).wrapping_add(1)).collect();
+        let _ = rsp.try_send_from(&mut reply);
+        recv_buf.clear();
+        let _ = rsp.drain_into(&mut recv_buf, BSZ);
+    }
+    let total_items = (cycles * BSZ) as f64;
+    t0.elapsed().as_nanos() as f64 / total_items
+}
+
+// Scenario B4 — cross-thread BATCHED round-trip. ──────────────────────
+
+fn rt_cross_thread_batched<const CAP: usize, const BSZ: usize>() -> f64 {
+    // Producer (main) sends BSZ requests, then batch-drains BSZ replies.
+    // Worker batch-drains requests, transforms, batch-sends replies.
+    // One "cycle" = one batch moving forward + one batch returning.
+    // ns reported is per ITEM to be comparable with per-item numbers.
+    let req: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
+    let rsp: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
+    let req2 = req.clone();
+    let rsp2 = rsp.clone();
+
+    let worker = thread::spawn(move || {
+        req2.set_consumer(thread::current());
+        rsp2.set_producer(thread::current());
+        let mut buf: Vec<u64> = Vec::with_capacity(BSZ);
+        let mut processed: usize = 0;
+        while processed < MSGS {
+            // Block until at least one item arrives, then batch-drain.
+            let first = req2.recv();
+            if first == u64::MAX { break; }
+            buf.clear();
+            buf.push(first.wrapping_mul(2).wrapping_add(1));
+            let mut batch: Vec<u64> = Vec::with_capacity(BSZ);
+            let _ = req2.drain_into(&mut batch, BSZ - 1);
+            for v in batch {
+                if v == u64::MAX { break; }
+                buf.push(v.wrapping_mul(2).wrapping_add(1));
+            }
+            processed += buf.len();
+            while !buf.is_empty() {
+                let n = rsp2.try_send_from(&mut buf);
+                if n == 0 { let v = buf.remove(0); rsp2.send(v); }
+            }
+        }
+    });
+
+    req.set_producer(thread::current());
+    rsp.set_consumer(thread::current());
+
+    let mut pending: Vec<u64> = Vec::with_capacity(BSZ);
+    let mut recv_buf: Vec<u64> = Vec::with_capacity(BSZ);
+    let mut sent: u64 = 0;
+    let mut received: usize = 0;
+
+    let t0 = Instant::now();
+    while received < MSGS {
+        // Send a batch of requests.
+        if sent < MSGS as u64 {
+            let take = ((MSGS as u64) - sent).min(BSZ as u64) as usize;
+            pending.clear();
+            pending.extend(sent..sent + take as u64);
+            while !pending.is_empty() {
+                let n = req.try_send_from(&mut pending);
+                if n == 0 { let v = pending.remove(0); req.send(v); }
+            }
+            sent += take as u64;
+        }
+        // Pull a batch of replies.
+        let first = rsp.recv();
+        debug_assert!(first != u64::MAX);
+        received += 1;
+        recv_buf.clear();
+        let _ = rsp.drain_into(&mut recv_buf, BSZ - 1);
+        received += recv_buf.len();
+    }
+    let ns = t0.elapsed().as_nanos() as f64;
+
+    req.send(u64::MAX); // unblock worker
+    worker.join().unwrap();
+    ns / MSGS as f64
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────────────
@@ -306,14 +410,34 @@ fn main() {
     println!("Ring overhead bench  ({} ops × {} rounds + warmup)", BATCH, ROUNDS);
     println!("Cross-thread scenarios use N = {} messages.", MSGS);
 
-    // ── Scenario 1 — single-thread hot loop ──────────────────────────
-    header("1. single-thread (producer = consumer, no park, no coherence)");
+    // ══════════════════════════════════════════════════════════════════
+    //                    A. FLOW (one-way, producer → consumer)
+    // ══════════════════════════════════════════════════════════════════
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║ A. FLOW (one-way, producer → consumer)                   ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+
+    // ── A1. single-thread, per-item ─────────────────────────────────
+    header("A1. single-thread, per-item (try_send / try_recv)");
     row("Ring<u64, 16>",   st_ring::<16>());
     row("Ring<u64, 256>",  st_ring::<256>());
     row("Ring<u64, 1024>", st_ring::<1024>());
 
-    // ── Scenario 2 — cross-thread steady state ───────────────────────
-    println!("\n── 2. cross-thread steady state ({} msgs) ──", MSGS);
+    // ── A2. single-thread, batch ────────────────────────────────────
+    println!("\n── A2. single-thread, batch ({} items) ──", MSGS);
+    println!("{:<28} {:>14}", "variant", "ns/item");
+    println!("{}", "─".repeat(48));
+    let (lps, bts) = send_loop_vs_batch::<2048>(MSGS);
+    let (lp,  bt ) = drain_loop_vs_batch::<2048>(MSGS);
+    println!("{:<28} {:>12.2}", "send loop: try_send × N",     lps);
+    println!("{:<28} {:>12.2}", "send batch: try_send_from",   bts);
+    println!("  speedup (send):  {:.2}×", lps / bts);
+    println!("{:<28} {:>12.2}", "recv loop: try_recv × N",     lp);
+    println!("{:<28} {:>12.2}", "recv batch: drain_into",      bt);
+    println!("  speedup (recv):  {:.2}×", lp / bt);
+
+    // ── A3. cross-thread, per-item ──────────────────────────────────
+    println!("\n── A3. cross-thread, per-item ({} msgs) ──", MSGS);
     println!("{:<28} {:>14} {:>14}", "variant", "ns/op (min)", "ops/sec");
     println!("{}", "─".repeat(60));
     let ct_r16   = (0..3).map(|_| ct_ring::<16>()).fold(f64::INFINITY, f64::min);
@@ -323,8 +447,19 @@ fn main() {
     println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>",  ct_r256,  1e9 / ct_r256);
     println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 1024>", ct_r1024, 1e9 / ct_r1024);
 
-    // ── Scenario 3 — burst absorption, producer side ────────────────
-    println!("\n── 3. burst absorption, producer-side ({} msgs) ──", MSGS);
+    // ── A4. cross-thread, batch ─────────────────────────────────────
+    println!("\n── A4. cross-thread, batch (send + ack amortized, {} msgs) ──", MSGS);
+    println!("{:<28} {:>14} {:>14}", "variant", "ns/item (min)", "ops/sec");
+    println!("{}", "─".repeat(60));
+    let bt_b16  = (0..3).map(|_| batched_ring::<128, 16>()).fold(f64::INFINITY, f64::min);
+    let bt_b64  = (0..3).map(|_| batched_ring::<128, 64>()).fold(f64::INFINITY, f64::min);
+    let bt_b128 = (0..3).map(|_| batched_ring::<256, 128>()).fold(f64::INFINITY, f64::min);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=16",  bt_b16,  1e9 / bt_b16);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=64",  bt_b64,  1e9 / bt_b64);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=256, B=128", bt_b128, 1e9 / bt_b128);
+
+    // ── A5. cross-thread, burst ─────────────────────────────────────
+    println!("\n── A5. cross-thread, burst (producer-side, {} msgs) ──", MSGS);
     println!("{:<28} {:>14}", "variant", "producer ns/op");
     println!("{}", "─".repeat(48));
     let b_r16   = (0..3).map(|_| burst_ring::<16>()).fold(f64::INFINITY, f64::min);
@@ -334,26 +469,15 @@ fn main() {
     println!("{:<28} {:>12.1}", "Ring<u64, 1024>", b_r1024);
     println!("{:<28} {:>12.1} (CAP > MSGS)", "Ring<u64, 2048>", b_r2048);
 
-    // ── Scenario 4 — batch drain (single-thread) ────────────────────
-    println!("\n── 4. batch drain, single-thread ({} items) ──", MSGS);
-    println!("{:<28} {:>14}", "variant", "ns/item");
-    println!("{}", "─".repeat(48));
-    let (lp, bt) = drain_loop_vs_batch::<2048>(MSGS);
-    println!("{:<28} {:>12.2}", "loop: try_recv × N",  lp);
-    println!("{:<28} {:>12.2}", "batch: drain_into",   bt);
-    println!("  speedup: {:.2}×", lp / bt);
+    // ══════════════════════════════════════════════════════════════════
+    //            B. ROUND-TRIP (closed loop, 2 rings, req → worker → resp)
+    // ══════════════════════════════════════════════════════════════════
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║ B. ROUND-TRIP (closed loop, 2 Rings)                     ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
 
-    // ── Scenario 4b — batch send (single-thread) ────────────────────
-    println!("\n── 4b. batch send, single-thread ({} items) ──", MSGS);
-    println!("{:<28} {:>14}", "variant", "ns/item");
-    println!("{}", "─".repeat(48));
-    let (lps, bts) = send_loop_vs_batch::<2048>(MSGS);
-    println!("{:<28} {:>12.2}", "loop: try_send × N",     lps);
-    println!("{:<28} {:>12.2}", "batch: try_send_from",   bts);
-    println!("  speedup: {:.2}×", lps / bts);
-
-    // ── Scenario 5a — single-thread round-trip ──────────────────────
-    println!("\n── 5a. single-thread round-trip, 2 rings ({} cycles) ──", MSGS);
+    // ── B1. single-thread, per-item ─────────────────────────────────
+    println!("\n── B1. single-thread round-trip, per-item ({} cycles) ──", MSGS);
     println!("{:<28} {:>14} {:>14}", "variant", "ns/cycle (min)", "cycles/sec");
     println!("{}", "─".repeat(60));
     let st_rt_r32  = (0..3).map(|_| rt_single_thread::<32>()).fold(f64::INFINITY, f64::min);
@@ -361,8 +485,17 @@ fn main() {
     println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 32>",  st_rt_r32,  1e9 / st_rt_r32);
     println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>", st_rt_r256, 1e9 / st_rt_r256);
 
-    // ── Scenario 5b — cross-thread round-trip ───────────────────────
-    println!("\n── 5b. cross-thread round-trip, 2 rings ({} cycles) ──", MSGS);
+    // ── B2. single-thread, batch ────────────────────────────────────
+    println!("\n── B2. single-thread round-trip, batch ({} items) ──", MSGS);
+    println!("{:<28} {:>14} {:>14}", "variant", "ns/item (min)", "ops/sec");
+    println!("{}", "─".repeat(60));
+    let stb_r256_b64  = (0..3).map(|_| rt_single_thread_batched::<256, 64>()).fold(f64::INFINITY, f64::min);
+    let stb_r512_b128 = (0..3).map(|_| rt_single_thread_batched::<512, 128>()).fold(f64::INFINITY, f64::min);
+    println!("{:<28} {:>12.2} {:>14.0}", "CAP=256, B=64",  stb_r256_b64,  1e9 / stb_r256_b64);
+    println!("{:<28} {:>12.2} {:>14.0}", "CAP=512, B=128", stb_r512_b128, 1e9 / stb_r512_b128);
+
+    // ── B3. cross-thread, per-item ──────────────────────────────────
+    println!("\n── B3. cross-thread round-trip, per-item ({} cycles) ──", MSGS);
     println!("{:<28} {:>14} {:>14}", "variant", "ns/cycle (min)", "cycles/sec");
     println!("{}", "─".repeat(60));
     let rt_r32   = (0..3).map(|_| rt_ring::<32>()).fold(f64::INFINITY, f64::min);
@@ -370,16 +503,14 @@ fn main() {
     println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 32>",  rt_r32,  1e9 / rt_r32);
     println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>", rt_r256, 1e9 / rt_r256);
 
-    // ── Scenario 6 — cross-thread batched send + batched drain ──────
-    println!("\n── 6. cross-thread batched (send + ack amortized, {} msgs) ──", MSGS);
+    // ── B4. cross-thread, batch ─────────────────────────────────────
+    println!("\n── B4. cross-thread round-trip, batch ({} items) ──", MSGS);
     println!("{:<28} {:>14} {:>14}", "variant", "ns/item (min)", "ops/sec");
     println!("{}", "─".repeat(60));
-    let bt_b16  = (0..3).map(|_| batched_ring::<128, 16>()).fold(f64::INFINITY, f64::min);
-    let bt_b64  = (0..3).map(|_| batched_ring::<128, 64>()).fold(f64::INFINITY, f64::min);
-    let bt_b128 = (0..3).map(|_| batched_ring::<256, 128>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=16",  bt_b16,  1e9 / bt_b16);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=64",  bt_b64,  1e9 / bt_b64);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=256, B=128", bt_b128, 1e9 / bt_b128);
+    let xtb_r128_b32  = (0..3).map(|_| rt_cross_thread_batched::<128, 32>()).fold(f64::INFINITY, f64::min);
+    let xtb_r256_b128 = (0..3).map(|_| rt_cross_thread_batched::<256, 128>()).fold(f64::INFINITY, f64::min);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=32",  xtb_r128_b32,  1e9 / xtb_r128_b32);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=256, B=128", xtb_r256_b128, 1e9 / xtb_r256_b128);
 
     println!("\nDone.");
 }
