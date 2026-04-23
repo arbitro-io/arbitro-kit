@@ -18,6 +18,7 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -208,14 +209,169 @@ fn bench_pipe_boxed() {
     row("pipe_boxed_dyn_hook", lats, t_wall.elapsed().as_nanos() as u64);
 }
 
+// ── 5. Cross-thread round-trip ───────────────────────────────────────────
+//
+// Pipe alone has no backpressure primitive. To measure cross-thread cost
+// without allowing the producer to silently overwrite the slot, we build
+// a closed loop with TWO Pipes: producer→consumer (fwd), consumer→producer
+// (ack). Every cycle is: send fwd → recv fwd → send ack → recv ack.
+//
+// Each cycle = 2 single-slot handshakes across L1↔L1. "ns/cycle" is the
+// request→reply latency. Compare vs Ring B3 XT round-trip per-item
+// (~212 ns/cycle) — Pipe should be in the same ballpark since both are
+// single-slot per direction.
+
+fn bench_pipe_xt_round_trip() {
+    const N: u64 = 5_000;
+    let fwd: Arc<Pipe<u64>> = Arc::new(Pipe::new());
+    let ack: Arc<Pipe<()>> = Arc::new(Pipe::new());
+
+    let fwd_c = fwd.clone();
+    let ack_c = ack.clone();
+    let consumer = std::thread::spawn(move || {
+        fwd_c.set_consumer(std::thread::current());
+        let mut sum: u64 = 0;
+        for _ in 0..N {
+            let v = fwd_c.recv();
+            sum = sum.wrapping_add(v);
+            ack_c.send(());
+        }
+        sum
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    ack.set_consumer(std::thread::current());
+
+    let t0 = Instant::now();
+    for i in 0..N {
+        fwd.send(i);
+        ack.recv();
+    }
+    let elapsed = t0.elapsed().as_nanos() as u64;
+    let sum = consumer.join().unwrap();
+    let expected: u64 = (0..N).sum();
+    assert_eq!(sum, expected);
+    let per_cycle = elapsed as f64 / N as f64;
+    println!("{:<26} {:>12.2} {:>12} {:>12} {:>14}",
+             "pipe_xt_round_trip", per_cycle, "-", "-",
+             ((N as f64) / (elapsed as f64 / 1e9)) as u64);
+}
+
+// ── 6. Cross-thread burst: the single-slot stall ─────────────────────────
+//
+// Same round-trip shape, but with tiny payload to isolate handshake cost.
+// What we want to see: Pipe cannot pipeline — every cycle waits for the
+// other thread. This is the number to beat with Ring's CAP>1 pipelining.
+
+fn bench_pipe_xt_handshake_only() {
+    const N: u64 = 5_000;
+    let fwd: Arc<Pipe<()>> = Arc::new(Pipe::new());
+    let ack: Arc<Pipe<()>> = Arc::new(Pipe::new());
+
+    let fwd_c = fwd.clone();
+    let ack_c = ack.clone();
+    let consumer = std::thread::spawn(move || {
+        fwd_c.set_consumer(std::thread::current());
+        for _ in 0..N {
+            fwd_c.recv();
+            ack_c.send(());
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    ack.set_consumer(std::thread::current());
+
+    let t0 = Instant::now();
+    for _ in 0..N {
+        fwd.send(());
+        ack.recv();
+    }
+    let elapsed = t0.elapsed().as_nanos() as u64;
+    let _ = consumer.join().unwrap();
+    let per_cycle = elapsed as f64 / N as f64;
+    println!("{:<26} {:>12.2} {:>12} {:>12} {:>14}",
+             "pipe_xt_handshake (unit)", per_cycle, "-", "-",
+             ((N as f64) / (elapsed as f64 / 1e9)) as u64);
+}
+
+// ── 7. Cross-thread with batched payload: Pipe<Vec<u64>> ─────────────────
+//
+// The "right way" to do batch over Pipe without turning Pipe into Ring:
+// the payload IS a batch. One send, one recv, handshake amortized over B
+// items. Still round-trip shape (fwd + ack) so the producer respects the
+// single-slot contract.
+//
+// Shows what user-level batching buys you vs Ring's built-in batch API.
+
+fn bench_pipe_xt_batched_payload() {
+    const TOTAL: usize = 10_000;
+    for &batch in &[16usize, 64, 256] {
+        let fwd: Arc<Pipe<Vec<u64>>> = Arc::new(Pipe::new());
+        let ack: Arc<Pipe<()>> = Arc::new(Pipe::new());
+
+        let batches = TOTAL / batch;
+        let fwd_c = fwd.clone();
+        let ack_c = ack.clone();
+        let consumer = std::thread::spawn(move || {
+            fwd_c.set_consumer(std::thread::current());
+            let mut items: u64 = 0;
+            for _ in 0..batches {
+                let v = fwd_c.recv();
+                items += v.len() as u64;
+                ack_c.send(());
+            }
+            items
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ack.set_consumer(std::thread::current());
+
+        let t0 = Instant::now();
+        for b in 0..batches {
+            let v: Vec<u64> = (0..batch as u64)
+                .map(|k| (b * batch) as u64 + k)
+                .collect();
+            fwd.send(v);
+            ack.recv();
+        }
+        let elapsed = t0.elapsed().as_nanos() as u64;
+        let items = consumer.join().unwrap();
+        assert_eq!(items as usize, batches * batch);
+        let per_item = elapsed as f64 / (batches * batch) as f64;
+        let name = format!("pipe_xt_vec B={}", batch);
+        println!("{:<26} {:>12.2} {:>12} {:>12} {:>14}",
+                 name, per_item, "-", "-",
+                 ((batches * batch) as f64 / (elapsed as f64 / 1e9)) as u64);
+    }
+}
+
 fn main() {
-    println!("=== Pipe overhead bench (single-thread, no park) ===");
+    println!("=== Pipe overhead bench ===");
     println!("rounds={}  warmup={}", rounds(), warmup());
+    println!();
+    println!("── A. Single-thread (no park) ──");
     println!("Thesis: pipe_nohook must match raw_signal_slot within noise.");
     header();
     bench_raw_signal_slot();
     bench_pipe_nohook();
     bench_pipe_counting();
     bench_pipe_boxed();
+
+    println!();
+    println!("── B. Cross-thread round-trip (fwd + ack = 2 Pipes) ──");
+    println!("Pipe has no backpressure primitive; a second Pipe<()> ack closes");
+    println!("the loop so the producer respects the single-slot contract.");
+    println!("{:<26} {:>12} {:>12} {:>12} {:>14}",
+             "variant", "ns/cycle", "", "", "cycles/sec");
+    println!("{}", "─".repeat(80));
+    bench_pipe_xt_round_trip();
+    bench_pipe_xt_handshake_only();
+
+    println!();
+    println!("── C. Batched payload: Pipe<Vec<u64>> (user-level batching) ──");
+    println!("One send/recv per batch. Shows 'the right way' to batch over Pipe");
+    println!("without turning it into Ring.");
+    println!("{:<26} {:>12} {:>12} {:>12} {:>14}",
+             "variant", "ns/item", "", "", "items/sec");
+    println!("{}", "─".repeat(80));
+    bench_pipe_xt_batched_payload();
     println!();
 }

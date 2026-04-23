@@ -403,6 +403,136 @@ fn rt_cross_thread_batched<const CAP: usize, const BSZ: usize>() -> f64 {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Payload-size sweep — how Ring behaves with fat payloads.
+//
+// `Ring<T, CAP>` stores T inline in each slot. For big T this means two
+// `memcpy`s per message (into the slot on send, out of the slot on recv).
+// Sending `Box<T>` instead moves a single pointer — at the cost of a heap
+// allocation per message. The crossover size tells the user when to wrap.
+// ──────────────────────────────────────────────────────────────────────
+
+// Fewer msgs for fat payloads so total wall time + memory stays bounded.
+// At 64 KB payloads, pool variant allocates 2 × PMSGS boxes ≈ PMSGS × 128 KB.
+// 5_000 × 128 KB = 640 MB peak — comfortable on a dev machine.
+const PMSGS: usize = 5_000;
+
+// Warmup iterations per measurement run (not timed).
+const WARMUP: usize = 500;
+// Number of runs per (variant, size) for min/p50 stats.
+const PAYLOAD_RUNS: usize = 10;
+
+/// XT per-item with inline `[u8; N]` payload. Producer writes the first
+/// byte with the iteration counter (to defeat dead-store elimination);
+/// consumer reads byte 0 of each received payload.
+fn ct_ring_inline<const N: usize, const CAP: usize>() -> f64 {
+    let r: Arc<Ring<[u8; N], CAP>> = Arc::new(Ring::new());
+    let r2 = r.clone();
+    let total = WARMUP + PMSGS;
+    let consumer = thread::spawn(move || {
+        r2.set_consumer(thread::current());
+        let mut sum: u64 = 0;
+        for _ in 0..total { sum = sum.wrapping_add(r2.recv()[0] as u64); }
+        sum
+    });
+    r.set_producer(thread::current());
+    let mut buf = [0u8; N];
+    // Warmup (not timed).
+    for i in 0..WARMUP as u64 { buf[0] = i as u8; r.send(buf); }
+    // Timed region.
+    let t0 = Instant::now();
+    for i in 0..PMSGS as u64 {
+        buf[0] = i as u8;
+        r.send(buf);
+    }
+    let ns = t0.elapsed().as_nanos() as f64;
+    let _ = consumer.join().unwrap();
+    ns / PMSGS as f64
+}
+
+/// XT per-item with `Box<[u8; N]>` payload. Fresh `Box::new` per send —
+/// includes malloc+free+memset cost. This is what users pay if they
+/// naively wrap in Box without a pool.
+fn ct_ring_boxed<const N: usize, const CAP: usize>() -> f64 {
+    let r: Arc<Ring<Box<[u8; N]>, CAP>> = Arc::new(Ring::new());
+    let r2 = r.clone();
+    let total = WARMUP + PMSGS;
+    let consumer = thread::spawn(move || {
+        r2.set_consumer(thread::current());
+        let mut sum: u64 = 0;
+        for _ in 0..total { sum = sum.wrapping_add(r2.recv()[0] as u64); }
+        sum
+    });
+    r.set_producer(thread::current());
+    // Warmup (not timed).
+    for i in 0..WARMUP as u64 {
+        let mut b: Box<[u8; N]> = Box::new([0u8; N]);
+        b[0] = i as u8;
+        r.send(b);
+    }
+    // Timed region.
+    let t0 = Instant::now();
+    for i in 0..PMSGS as u64 {
+        let mut b: Box<[u8; N]> = Box::new([0u8; N]);
+        b[0] = i as u8;
+        r.send(b);
+    }
+    let ns = t0.elapsed().as_nanos() as f64;
+    let _ = consumer.join().unwrap();
+    ns / PMSGS as f64
+}
+
+/// XT per-item with `Box<[u8; N]>` payload + **pre-allocated pool**.
+/// All boxes are allocated before the timer starts; consumer reads byte 0
+/// and stashes each box in a sink Vec (dropped AFTER the timer stops).
+/// Result: pure pointer-move cost with zero malloc/free in the hot path.
+fn ct_ring_pooled<const N: usize, const CAP: usize>() -> f64 {
+    let total = WARMUP + PMSGS;
+    // Pre-allocate all payloads up-front. This heap traffic is NOT timed.
+    let src: Vec<Box<[u8; N]>> = (0..total).map(|_| Box::new([0u8; N])).collect();
+    // Use indexed access instead of Vec::pop to keep the producer hot path
+    // free of Vec bookkeeping. We walk `src` front-to-back via raw index.
+    let src_ptr = src.as_ptr();
+
+    let r: Arc<Ring<Box<[u8; N]>, CAP>> = Arc::new(Ring::new());
+    let r2 = r.clone();
+    let consumer = thread::spawn(move || {
+        r2.set_consumer(thread::current());
+        // Sink + touch byte 0 (symmetric with inline/boxed consumers).
+        let mut sink: Vec<Box<[u8; N]>> = Vec::with_capacity(total);
+        let mut sum: u64 = 0;
+        for _ in 0..total {
+            let b = r2.recv();
+            sum = sum.wrapping_add(b[0] as u64);
+            sink.push(b);
+        }
+        (sink, sum)
+    });
+    r.set_producer(thread::current());
+
+    // Warmup (not timed). Read pre-allocated boxes by index and send.
+    for i in 0..WARMUP as u64 {
+        // Safety: we own `src`, consumer only touches what we send.
+        let mut b = unsafe { std::ptr::read(src_ptr.add(i as usize)) };
+        b[0] = i as u8;
+        r.send(b);
+    }
+    // Timed region.
+    let t0 = Instant::now();
+    for i in 0..PMSGS as u64 {
+        let mut b = unsafe { std::ptr::read(src_ptr.add(WARMUP + i as usize)) };
+        b[0] = i as u8;
+        r.send(b);
+    }
+    let ns = t0.elapsed().as_nanos() as f64;
+    let (sink, _sum) = consumer.join().unwrap();
+    // Leak `src` (its contents were ptr::read'd and ownership moved via
+    // send). Drop `sink` AFTER the timer — not in the hot path.
+    std::mem::forget(src);
+    drop(sink);
+    ns / PMSGS as f64
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────────────
 
@@ -511,6 +641,54 @@ fn main() {
     let xtb_r256_b128 = (0..3).map(|_| rt_cross_thread_batched::<256, 128>()).fold(f64::INFINITY, f64::min);
     println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=32",  xtb_r128_b32,  1e9 / xtb_r128_b32);
     println!("{:<28} {:>12.1} {:>14.0}", "CAP=256, B=128", xtb_r256_b128, 1e9 / xtb_r256_b128);
+
+    // ══════════════════════════════════════════════════════════════════
+    //            C. PAYLOAD SIZE SWEEP (XT per-item, inline vs Box)
+    // ══════════════════════════════════════════════════════════════════
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║ C. PAYLOAD SIZE SWEEP (XT per-item, {} msgs)          ║", PMSGS);
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!("Inline: Ring<[u8; N], CAP>       — memcpy per send + per recv.");
+    println!("Boxed:  Ring<Box<[u8; N]>, CAP>  — fresh Box::new per send (incl. alloc+memset).");
+    println!("Pooled: Ring<Box<[u8; N]>, CAP>  — pre-allocated pool, no alloc/free timed.");
+    println!("Stats over {} runs (after {} warmup iters per run). min / p50.",
+             PAYLOAD_RUNS, WARMUP);
+    println!();
+    println!("{:<9} {:>14} {:>14} {:>14} {:>10}",
+             "payload", "inline min/p50", "boxed min/p50", "pool min/p50", "winner");
+    println!("{}", "─".repeat(74));
+
+    // Take `runs` samples; return (min, p50).
+    fn stats<F: FnMut() -> f64>(mut f: F) -> (f64, f64) {
+        let mut xs: Vec<f64> = (0..PAYLOAD_RUNS).map(|_| f()).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let min = xs[0];
+        let p50 = xs[xs.len() / 2];
+        (min, p50)
+    }
+    fn fmt(x: (f64, f64)) -> String { format!("{:>5.1} / {:>5.1}", x.0, x.1) }
+
+    let sizes: [(&str, (f64,f64), (f64,f64), (f64,f64)); 8] = [
+        ("64 B",    stats(|| ct_ring_inline::<64,    256>()), stats(|| ct_ring_boxed::<64,    256>()), stats(|| ct_ring_pooled::<64,    256>())),
+        ("256 B",   stats(|| ct_ring_inline::<256,   256>()), stats(|| ct_ring_boxed::<256,   256>()), stats(|| ct_ring_pooled::<256,   256>())),
+        ("512 B",   stats(|| ct_ring_inline::<512,   256>()), stats(|| ct_ring_boxed::<512,   256>()), stats(|| ct_ring_pooled::<512,   256>())),
+        ("1 KB",    stats(|| ct_ring_inline::<1024,  256>()), stats(|| ct_ring_boxed::<1024,  256>()), stats(|| ct_ring_pooled::<1024,  256>())),
+        ("4 KB",    stats(|| ct_ring_inline::<4096,  64 >()), stats(|| ct_ring_boxed::<4096,  64 >()), stats(|| ct_ring_pooled::<4096,  64 >())),
+        ("16 KB",   stats(|| ct_ring_inline::<16384, 16 >()), stats(|| ct_ring_boxed::<16384, 16 >()), stats(|| ct_ring_pooled::<16384, 16 >())),
+        ("32 KB",   stats(|| ct_ring_inline::<32768, 16 >()), stats(|| ct_ring_boxed::<32768, 16 >()), stats(|| ct_ring_pooled::<32768, 16 >())),
+        ("64 KB",   stats(|| ct_ring_inline::<65536, 8  >()), stats(|| ct_ring_boxed::<65536, 8  >()), stats(|| ct_ring_pooled::<65536, 8  >())),
+    ];
+    for (name, inl, bx, pl) in sizes {
+        let winner = if pl.0 <= inl.0 && pl.0 <= bx.0 { "pool"   }
+                     else if inl.0 <= bx.0           { "inline" }
+                     else                            { "box"    };
+        println!("{:<9} {:>14} {:>14} {:>14} {:>10}",
+                 name, fmt(inl), fmt(bx), fmt(pl), winner);
+    }
+
+    println!();
+    println!("Note: for publication-grade numbers run with:");
+    println!("  taskset -c 0,1 ./ring_overhead --bench   (pin to P-cores)");
 
     println!("\nDone.");
 }
