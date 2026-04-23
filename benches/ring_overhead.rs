@@ -16,9 +16,19 @@
 //!      fast as possible. With CAP >= N the producer never blocks; with
 //!      CAP < N it parks and resumes as the consumer drains.
 //!
-//!   4. **Batch drain** — Produce K items, then drain them with
-//!      `drain_into`. Compared against K individual `try_recv` calls.
-//!      Demonstrates the amortization win.
+//!   4. **Batch drain (single-thread)** — Produce K items, then drain
+//!      them with `drain_into`. Compared against K individual `try_recv`
+//!      calls. Measures the raw amortization win in cache-hot conditions.
+//!
+//!   5. **Cross-thread round-trip** — two Rings composed into a closed
+//!      loop (request → worker → reply). Measures ns/CYCLE, not ns/op,
+//!      and is the correct number for request/response workloads.
+//!
+//!   6. **Cross-thread batch-send + batch-drain** — producer uses
+//!      `try_send_from`, consumer uses `drain_into`. Both signal
+//!      handshakes amortize across the batch, and the numbers drop below
+//!      the L1↔L1 per-item floor because coherence traffic is now
+//!      per-BATCH, not per-item.
 //!
 //! Run:
 //!   cargo bench --bench ring_overhead 2>&1 | tee ring_overhead.log
@@ -139,6 +149,96 @@ fn drain_loop_vs_batch<const CAP: usize>(n: usize) -> (f64, f64) {
     (loop_ns, batch_ns)
 }
 
+// Scenario 5 — cross-thread round-trip (closed loop, two rings). ──────
+
+fn rt_ring<const CAP: usize>() -> f64 {
+    // Main thread drives: req.send(i); resp = rsp.recv(); assert correlation.
+    // Worker thread: req.recv() → rsp.send(f(v)). Each iteration is one
+    // CLOSED-LOOP CYCLE, not one op. Measures latency, not throughput.
+    let req: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
+    let rsp: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
+    let req2 = req.clone();
+    let rsp2 = rsp.clone();
+
+    let worker = thread::spawn(move || {
+        req2.set_consumer(thread::current());
+        rsp2.set_producer(thread::current());
+        for _ in 0..MSGS {
+            let v = req2.recv();
+            rsp2.send(v.wrapping_mul(2).wrapping_add(1));
+        }
+    });
+
+    req.set_producer(thread::current());
+    rsp.set_consumer(thread::current());
+
+    let t0 = Instant::now();
+    for i in 0..MSGS as u64 {
+        req.send(i);
+        let r = rsp.recv();
+        debug_assert_eq!(r, i.wrapping_mul(2).wrapping_add(1));
+    }
+    let ns = t0.elapsed().as_nanos() as f64;
+    worker.join().unwrap();
+    ns / MSGS as f64
+}
+
+// Scenario 6 — cross-thread batched send + batched drain. ─────────────
+
+fn batched_ring<const CAP: usize, const BSZ: usize>() -> f64 {
+    // Producer: try_send_from (batch). Consumer: recv one then drain_into
+    // (batch). Both sides amortize their cursor publish + signal wake
+    // across BSZ items.
+    let r: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
+    let r2 = r.clone();
+
+    let consumer = thread::spawn(move || {
+        r2.set_consumer(thread::current());
+        let mut count: u64 = 0;
+        let mut sum:   u64 = 0; // prevent loop elimination
+        let mut buf: Vec<u64> = Vec::with_capacity(BSZ);
+        'outer: loop {
+            let v = r2.recv();              // block on not_empty
+            if v == u64::MAX { break; }     // sentinel from producer
+            count += 1;
+            sum = sum.wrapping_add(v);
+            // One batched ack covers up to BSZ additional items.
+            buf.clear();
+            let _ = r2.drain_into(&mut buf, BSZ);
+            for &x in &buf {
+                if x == u64::MAX { break 'outer; }
+                count += 1;
+                sum = sum.wrapping_add(x);
+            }
+        }
+        std::hint::black_box((count, sum));
+    });
+
+    r.set_producer(thread::current());
+    let mut pending: Vec<u64> = Vec::with_capacity(BSZ);
+    let mut sent: u64 = 0;
+    let t0 = Instant::now();
+    while sent < MSGS as u64 {
+        let take = ((MSGS as u64) - sent).min(BSZ as u64) as usize;
+        pending.clear();
+        pending.extend(sent..sent + take as u64);
+        while !pending.is_empty() {
+            let n = r.try_send_from(&mut pending);
+            if n == 0 {
+                // Ring full — fall back to a blocking single send.
+                let v = pending.remove(0);
+                r.send(v);
+            }
+        }
+        sent += take as u64;
+    }
+    // sentinel to unblock consumer
+    r.send(u64::MAX);
+    let ns = t0.elapsed().as_nanos() as f64;
+    consumer.join().unwrap();
+    ns / MSGS as f64
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────────────
@@ -183,6 +283,26 @@ fn main() {
     println!("{:<28} {:>12.2}", "loop: try_recv × N",  lp);
     println!("{:<28} {:>12.2}", "batch: drain_into",   bt);
     println!("  speedup: {:.2}×", lp / bt);
+
+    // ── Scenario 5 — cross-thread round-trip ────────────────────────
+    println!("\n── 5. cross-thread round-trip, 2 rings ({} cycles) ──", MSGS);
+    println!("{:<28} {:>14} {:>14}", "variant", "ns/cycle (min)", "cycles/sec");
+    println!("{}", "─".repeat(60));
+    let rt_r32   = (0..3).map(|_| rt_ring::<32>()).fold(f64::INFINITY, f64::min);
+    let rt_r256  = (0..3).map(|_| rt_ring::<256>()).fold(f64::INFINITY, f64::min);
+    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 32>",  rt_r32,  1e9 / rt_r32);
+    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>", rt_r256, 1e9 / rt_r256);
+
+    // ── Scenario 6 — cross-thread batched send + batched drain ──────
+    println!("\n── 6. cross-thread batched (send + ack amortized, {} msgs) ──", MSGS);
+    println!("{:<28} {:>14} {:>14}", "variant", "ns/item (min)", "ops/sec");
+    println!("{}", "─".repeat(60));
+    let bt_b16  = (0..3).map(|_| batched_ring::<128, 16>()).fold(f64::INFINITY, f64::min);
+    let bt_b64  = (0..3).map(|_| batched_ring::<128, 64>()).fold(f64::INFINITY, f64::min);
+    let bt_b128 = (0..3).map(|_| batched_ring::<256, 128>()).fold(f64::INFINITY, f64::min);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=16",  bt_b16,  1e9 / bt_b16);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=64",  bt_b64,  1e9 / bt_b64);
+    println!("{:<28} {:>12.1} {:>14.0}", "CAP=256, B=128", bt_b128, 1e9 / bt_b128);
 
     println!("\nDone.");
 }
