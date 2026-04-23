@@ -149,6 +149,65 @@ fn drain_loop_vs_batch<const CAP: usize>(n: usize) -> (f64, f64) {
     (loop_ns, batch_ns)
 }
 
+// Scenario 4b — single-thread batch SEND. ─────────────────────────────
+
+fn send_loop_vs_batch<const CAP: usize>(n: usize) -> (f64, f64) {
+    // Pair of runs: `try_send × N` vs `try_send_from(&mut Vec)`. Each run
+    // starts with an empty ring; after pushing n items we drain them so
+    // the ring state doesn't interfere with the next run.
+    let r: Ring<u64, CAP> = Ring::new();
+    let mut drain = Vec::with_capacity(n);
+
+    // A) per-item try_send
+    let t0 = Instant::now();
+    for i in 0..n as u64 { r.try_send(i).unwrap(); }
+    let loop_ns = t0.elapsed().as_nanos() as f64 / n as f64;
+    drain.clear();
+    let _ = r.drain_into(&mut drain, n);
+
+    // B) batch try_send_from
+    let mut src: Vec<u64> = (0..n as u64).collect();
+    let t0 = Instant::now();
+    let sent = r.try_send_from(&mut src);
+    let batch_ns = t0.elapsed().as_nanos() as f64 / sent as f64;
+    drain.clear();
+    let _ = r.drain_into(&mut drain, n);
+
+    (loop_ns, batch_ns)
+}
+
+// Scenario 5b — single-thread round-trip (no cross-thread coherence). ─
+
+fn rt_single_thread<const CAP: usize>() -> f64 {
+    // Same-thread closed loop over two rings. No park, no cross-core
+    // coherence — measures the RAW two-cursor + two-signal cost of a
+    // full round-trip with no parallelism.
+    let req: Ring<u64, CAP> = Ring::new();
+    let rsp: Ring<u64, CAP> = Ring::new();
+    req.set_producer(thread::current());
+    req.set_consumer(thread::current());
+    rsp.set_producer(thread::current());
+    rsp.set_consumer(thread::current());
+
+    // warmup
+    for i in 0..16u64 {
+        req.try_send(i).unwrap();
+        let v = req.try_recv().unwrap();
+        rsp.try_send(v.wrapping_mul(2).wrapping_add(1)).unwrap();
+        let _ = rsp.try_recv().unwrap();
+    }
+
+    let t0 = Instant::now();
+    for i in 0..MSGS as u64 {
+        req.try_send(i).unwrap();
+        let v = req.try_recv().unwrap();
+        rsp.try_send(v.wrapping_mul(2).wrapping_add(1)).unwrap();
+        let r = rsp.try_recv().unwrap();
+        debug_assert_eq!(r, i.wrapping_mul(2).wrapping_add(1));
+    }
+    t0.elapsed().as_nanos() as f64 / MSGS as f64
+}
+
 // Scenario 5 — cross-thread round-trip (closed loop, two rings). ──────
 
 fn rt_ring<const CAP: usize>() -> f64 {
@@ -275,8 +334,8 @@ fn main() {
     println!("{:<28} {:>12.1}", "Ring<u64, 1024>", b_r1024);
     println!("{:<28} {:>12.1} (CAP > MSGS)", "Ring<u64, 2048>", b_r2048);
 
-    // ── Scenario 4 — batch drain ────────────────────────────────────
-    println!("\n── 4. batch drain ({} items) ──", MSGS);
+    // ── Scenario 4 — batch drain (single-thread) ────────────────────
+    println!("\n── 4. batch drain, single-thread ({} items) ──", MSGS);
     println!("{:<28} {:>14}", "variant", "ns/item");
     println!("{}", "─".repeat(48));
     let (lp, bt) = drain_loop_vs_batch::<2048>(MSGS);
@@ -284,8 +343,26 @@ fn main() {
     println!("{:<28} {:>12.2}", "batch: drain_into",   bt);
     println!("  speedup: {:.2}×", lp / bt);
 
-    // ── Scenario 5 — cross-thread round-trip ────────────────────────
-    println!("\n── 5. cross-thread round-trip, 2 rings ({} cycles) ──", MSGS);
+    // ── Scenario 4b — batch send (single-thread) ────────────────────
+    println!("\n── 4b. batch send, single-thread ({} items) ──", MSGS);
+    println!("{:<28} {:>14}", "variant", "ns/item");
+    println!("{}", "─".repeat(48));
+    let (lps, bts) = send_loop_vs_batch::<2048>(MSGS);
+    println!("{:<28} {:>12.2}", "loop: try_send × N",     lps);
+    println!("{:<28} {:>12.2}", "batch: try_send_from",   bts);
+    println!("  speedup: {:.2}×", lps / bts);
+
+    // ── Scenario 5a — single-thread round-trip ──────────────────────
+    println!("\n── 5a. single-thread round-trip, 2 rings ({} cycles) ──", MSGS);
+    println!("{:<28} {:>14} {:>14}", "variant", "ns/cycle (min)", "cycles/sec");
+    println!("{}", "─".repeat(60));
+    let st_rt_r32  = (0..3).map(|_| rt_single_thread::<32>()).fold(f64::INFINITY, f64::min);
+    let st_rt_r256 = (0..3).map(|_| rt_single_thread::<256>()).fold(f64::INFINITY, f64::min);
+    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 32>",  st_rt_r32,  1e9 / st_rt_r32);
+    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>", st_rt_r256, 1e9 / st_rt_r256);
+
+    // ── Scenario 5b — cross-thread round-trip ───────────────────────
+    println!("\n── 5b. cross-thread round-trip, 2 rings ({} cycles) ──", MSGS);
     println!("{:<28} {:>14} {:>14}", "variant", "ns/cycle (min)", "cycles/sec");
     println!("{}", "─".repeat(60));
     let rt_r32   = (0..3).map(|_| rt_ring::<32>()).fold(f64::INFINITY, f64::min);
