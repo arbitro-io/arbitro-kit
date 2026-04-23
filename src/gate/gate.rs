@@ -248,4 +248,76 @@ mod tests {
         gate.release();
         consumer.join().unwrap();
     }
+
+    /// Canonical usage pattern for a Signal-guarded work queue:
+    ///
+    /// ```text
+    /// loop {
+    ///     gate.acquire();              // block until there's work
+    ///     while gate.is_open() {       // drain while signal says open
+    ///         match try_work() {
+    ///             Some(item) => process(item),
+    ///             None       => gate.lock(),  // observed empty → close
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The invariant is: producer RELEASES when it adds work, consumer
+    /// LOCKS only when it observes the queue empty from inside the drain
+    /// loop (not on a hot path). Signal's Dekker protocol handles the
+    /// missed-wakeup race between consumer's `lock()` and a concurrent
+    /// producer `release()`.
+    #[test]
+    fn canonical_acquire_drain_pattern() {
+        use std::sync::atomic::AtomicU64;
+
+        const N: u64 = 1000;
+        let gate = Arc::new(Signal::new());
+        // Counter acts as our "queue": producer increments, consumer reads.
+        let produced = Arc::new(AtomicU64::new(0));
+        let consumed = Arc::new(AtomicU64::new(0));
+        let done     = Arc::new(AtomicBool::new(false));
+
+        let g = gate.clone();
+        let p = produced.clone();
+        let c = consumed.clone();
+        let d = done.clone();
+        let consumer = std::thread::spawn(move || {
+            g.set_worker(std::thread::current());
+            loop {
+                g.acquire();
+                while g.is_open() {
+                    let pr = p.load(Ordering::Acquire);
+                    let cn = c.load(Ordering::Relaxed);
+                    if pr > cn {
+                        // Work available — consume one unit.
+                        c.store(cn + 1, Ordering::Release);
+                    } else {
+                        // Queue looks empty. Close gate; outer `acquire`
+                        // will re-block unless producer releases again.
+                        g.lock();
+                    }
+                }
+                if d.load(Ordering::Acquire) && c.load(Ordering::Relaxed) >= p.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+        });
+
+        // Producer: increment counter, release gate. Repeat N times.
+        for _ in 0..N {
+            produced.fetch_add(1, Ordering::Release);
+            gate.release();
+        }
+
+        // Signal shutdown: set done, release once more so consumer wakes
+        // and sees the final `done` flag.
+        done.store(true, Ordering::Release);
+        gate.release();
+
+        consumer.join().unwrap();
+        assert_eq!(consumed.load(Ordering::Acquire), N,
+                   "canonical pattern must consume every produced unit");
+    }
 }

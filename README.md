@@ -56,7 +56,7 @@ cheaper M:1 signal primitive exists in safe Rust.
 
 ## What you can build on top
 
-`Signal` is the atom. Five composites ship in the crate, each a thin
+`Signal` is the atom. Six composites ship in the crate, each a thin
 wrapper — most of the cost model carries over unchanged:
 
 | Type         | Shape                                     | What it adds |
@@ -64,6 +64,7 @@ wrapper — most of the cost model carries over unchanged:
 | `Signal`     | single-bit M:1 signal                     | the primitive itself |
 | `SignalSet`  | up to 64 bits in one `AtomicU64`          | wait for any / all / subset of named signals |
 | `Pipe<T, H>` | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks |
+| `Ring<T, CAP>` | SPSC N-slot pipelined queue (2 × `Signal`) | burst absorption, pipelined throughput, batch send + batch ack |
 | `Channel<Req, Resp>` | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer |
 | `Hub<In, Out>` | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply |
 
@@ -94,6 +95,70 @@ baseline within sub-cycle noise. The `Box<dyn Fn>` control — what we'd
 pay if hooks lived on `Signal` itself — is ~4× the primitive cost in
 isolation, which is why hooks are opt-in at `Pipe`, not embedded in
 `Signal`.
+
+### `Ring<T, CAP>` — SPSC bounded ring with batch ack
+
+`Ring` is the multi-slot sibling of `Pipe`: same SPSC contract (one
+producer, one consumer), but with `CAP` slots pre-allocated inline so
+producer and consumer can **overlap in time** instead of alternating.
+
+Two `Signal`s coordinate the two wait states:
+
+- `not_empty` — consumer parks here when ring is empty.
+- `not_full`  — producer parks here when ring is full.
+
+Both sides follow the canonical **lock-check-acquire** park protocol:
+only the waiter closes its signal, never the hot path — so `try_send`
+and `try_recv` are lock-free in the common case.
+
+**When to reach for `Ring` instead of `Pipe`:**
+
+- **Burst absorption.** Producer fires N events in < 1 µs; consumer
+  drains at a steady rate. `Pipe` blocks the producer between every
+  event; `Ring` lets it run through the burst unhindered.
+- **Pipelined throughput.** Steady-state per-item cost drops ~1.5–2×
+  over `Pipe` because both sides work in parallel.
+- **Graduated backpressure.** `try_send` returns `Err(value)` without
+  blocking — caller can drop / coalesce / downsample per policy.
+
+**Batch API — the main win over per-item.** Both directions expose a
+bulk variant that amortizes the cursor publish and signal wakeup over
+an entire batch — exactly what makes ring-buffer brokers (LMAX
+Disruptor, Aeron) fast:
+
+```rust
+// Ingress: move up to `min(src.len(), free)` items in one shot.
+//   → one head.store(Release) + one not_empty.release() per batch.
+ring.try_send_from(&mut src_vec);
+
+// Egress:  move up to `max` items in one shot.
+//   → one tail.store(Release) + one not_full.release() per batch.
+ring.drain_into(&mut out_vec, max);
+```
+
+`CAP` must be a power of two (mask-indexed, one AND vs a division).
+
+```
+── Ring hot path (x86_64 release, 1000-msg cross-thread) ──
+scenario                         CAP      ns/op      ops/sec
+──────────────────────────────────────────────────────────────
+single-thread (no park)           16       ~1.0       ~1 G
+cross-thread steady state         16       75.1       13.3 M
+cross-thread steady state        256       34.1       29.3 M
+cross-thread steady state       1024       27.2       36.8 M
+cross-thread batched (B=64)      128        5.6      178.1 M    ← batch-ack amortized
+round-trip closed loop (2 rings)  32      280.6        3.6 M    ← ns/cycle
+```
+
+Per-item 1-a-1 cost (27–52 ns) sits on the L1↔L1 cross-core coherence
+floor. Batched throughput (5.6 ns/item) isn't breaking physics — it's
+the same coherence cost spread over 64 items per handshake.
+
+Reproduce with:
+
+```bash
+cargo bench --bench ring_overhead
+```
 
 ### `Hub<In, Out>` — N:1 multiplexer with per-port reply
 
@@ -320,6 +385,38 @@ d.join().unwrap();
 - **Ordered multi-producer delivery.** `SignalSet` coalesces repeated
   releases on the same bit. If you need to count events, use the bit
   to wake a consumer that drains a separate queue.
+
+---
+
+## Roadmap
+
+Shipped today:
+
+- [x] `Signal` — M:1 single-bit signal with Dekker-safe park
+- [x] `SignalSet` — up to 64 coalesced signals in one `AtomicU64`
+- [x] `Pipe<T, H>` — SPSC single-slot with zero-cost observer hook
+- [x] `Ring<T, CAP>` — SPSC bounded ring with batch send + batch ack
+- [x] `Channel<Req, Resp>` — SPSC zero-copy request/response
+- [x] `Hub<In, Out>` — N:1 multiplexer with per-port reply + shutdown
+
+Next:
+
+- [ ] **`Fan<T>` — 1:N broadcast** over N `Pipe`s with per-consumer
+      backpressure. Same zero-cost hook contract as `Pipe`.
+- [ ] **`Queue<T>` — MPSC unbounded** built on a `Ring` per producer +
+      a `SignalSet` drain. Lock-free enqueue, batched drain.
+- [ ] **Async adapters** — `Future`-based `acquire` without giving up
+      the synchronous lock-free producer side. Opt-in feature, no
+      runtime dependency.
+- [ ] **`no_std` core** — feature-gated extraction of `Signal` and
+      `SignalSet` for embedded / freestanding targets (park via a
+      user-provided waiter trait).
+- [ ] **Loom model checks** — permutation testing of the park protocol
+      under weak memory models beyond what `miri` already covers.
+- [ ] **ARM64 numbers** — current cost tables are x86_64; validate on
+      aarch64 (where `SeqCst` on the park path is load-bearing).
+
+Explicit non-goals stay as below.
 
 ---
 
