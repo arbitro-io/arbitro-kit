@@ -56,14 +56,71 @@ cheaper M:1 signal primitive exists in safe Rust.
 
 ## What you can build on top
 
-`Signal` is the atom. Three composites ship in the crate, each a thin
+`Signal` is the atom. Five composites ship in the crate, each a thin
 wrapper — most of the cost model carries over unchanged:
 
 | Type         | Shape                                     | What it adds |
 | :----------- | :---------------------------------------- | :----------- |
 | `Signal`     | single-bit M:1 signal                     | the primitive itself |
 | `SignalSet`  | up to 64 bits in one `AtomicU64`          | wait for any / all / subset of named signals |
+| `Pipe<T, H>` | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks |
 | `Channel<Req, Resp>` | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer |
+| `Hub<In, Out>` | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply |
+
+### `Pipe<T, H>` — zero-cost observer hooks
+
+`Pipe` is the minimal atom between `Signal` (no payload) and `Channel`
+(bidirectional): one slot, one `Signal`, one direction. Higher-level
+primitives in the crate build on it.
+
+What makes it interesting: the generic `H: PipeHook<T>` parameter lets
+you attach an observer (metrics, tracing, event propagation) with
+**literally zero cost when unused**. The default `NoHook` is a ZST
+whose methods are empty `#[inline]` no-ops; the optimizer elides the
+calls completely.
+
+```
+── Pipe hot path (single-thread, 500 × 1000 ops, WSL /tmp/arbitro) ──
+variant                    mean_ns/op   p50_ns/op   p99_ns/op    ops/sec
+────────────────────────────────────────────────────────────────────────
+raw_signal_slot (baseline)       0.44        0.42        0.43   2.28 B
+pipe_nohook                      0.64        0.62        0.63   1.57 B
+pipe_counting_hook               9.59        9.41       15.35   104 M
+pipe_boxed_dyn_hook (control)    2.22        2.16        2.27   450 M
+```
+
+`pipe_nohook` matches the raw `Signal + UnsafeCell<MaybeUninit<T>>`
+baseline within sub-cycle noise. The `Box<dyn Fn>` control — what we'd
+pay if hooks lived on `Signal` itself — is ~4× the primitive cost in
+isolation, which is why hooks are opt-in at `Pipe`, not embedded in
+`Signal`.
+
+### `Hub<In, Out>` — N:1 multiplexer with per-port reply
+
+`Hub` wires N producer ports to a single consumer ("drain") using
+`SignalSet` as the multiplexor. Each port has its own inbound slot
+(the `SignalSet` bit IS its signal — saves one atomic per send) and
+its own outbound `Pipe<Out>` for the drain's reply. Round-robin
+fairness across ports prevents starvation.
+
+Max 63 user ports (bit 63 is reserved for `HubShutdown`, which wakes
+the drain out of a blocked `recv_batch` for clean teardown).
+
+```
+── Hub hot path (WSL /tmp/arbitro, 500 × 1000 ops) ──
+variant                          mean_ns/op   p50    p99      ops/sec
+─────────────────────────────────────────────────────────────────────
+signalset_release+lock (raw)           7.71   7.33   17.54    129 M
+hub_send + local drain                12.54  12.21   19.56     80 M
+
+── Full RTT (port → drain → reply, cross-thread) ──
+hub_rtt_1port                             —   89.01  163.54   11.5 M
+hub_rtt_4port (aggregate)                 —      —       —    10.4 M
+```
+
+At 4 producers the drain saturates near 10M ops/sec — that's the
+ceiling of a single consumer. For higher throughput, shard across
+multiple Hubs.
 
 ### Round-trip channel — head-to-head with `crossbeam` and `mpsc`
 
@@ -177,6 +234,66 @@ assert_eq!(r, 42);
 
 Works transparently with `Box<T>`, `Vec<T>`, `Arc<T>`, `File` — any
 `Send` type. Ownership transfers; the heap allocation stays put.
+
+### Single-slot pipe with optional hook
+
+```rust
+use arbitro_kit::gate::{Pipe, PipeHook};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Default: zero-cost, no observer.
+let p: Pipe<u64> = Pipe::new();
+p.send(42);
+assert_eq!(p.recv(), 42);
+
+// Opt-in observer for metrics / event propagation.
+#[derive(Default)]
+struct Counter(AtomicU64);
+impl PipeHook<u64> for Counter {
+    fn on_send(&self, _: &u64) { self.0.fetch_add(1, Ordering::Relaxed); }
+}
+
+let p: Pipe<u64, Counter> = Pipe::with_hook(Counter::default());
+for i in 0..100 { p.send(i); let _ = p.recv(); }
+assert_eq!(p.hook().0.load(Ordering::Relaxed), 100);
+```
+
+### N:1 hub with per-port reply
+
+```rust
+use arbitro_kit::gate::{Hub, Shutdown};
+
+let (drain, ports) = Hub::<u64, u64>::new(4);
+let shutdown = drain.shutdown_handle();
+
+// Drain thread: handle any port that fires, reply to that port.
+let d = std::thread::spawn(move || {
+    drain.bind();
+    loop {
+        match drain.recv_batch(|port_idx, msg, reply| {
+            reply.send(msg + port_idx as u64 * 1000);
+        }) {
+            Ok(()) => continue,
+            Err(Shutdown) => break,
+        }
+    }
+});
+
+// Each port moves to its own producer thread.
+for (i, port) in ports.into_iter().enumerate() {
+    std::thread::spawn(move || {
+        port.bind();
+        for k in 0..100u64 {
+            let reply = port.call(k);
+            assert_eq!(reply, k + i as u64 * 1000);
+        }
+    });
+}
+
+// Supervisor signals shutdown; drain wakes and exits cleanly.
+shutdown.signal();
+d.join().unwrap();
+```
 
 ---
 
