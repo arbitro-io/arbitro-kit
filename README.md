@@ -216,7 +216,7 @@ Every number in the docs is reproducible:
 cargo bench --bench signal_compare       # Signal vs raw AtomicBool
 cargo bench --bench pipe_overhead        # Pipe ST/XT + hook zero-cost claim
 cargo bench --bench ring_overhead        # Ring FLOW / ROUND-TRIP / payload sweep
-cargo bench --bench gate_channel_focus   # Channel vs crossbeam vs mpsc
+cargo bench --bench gate_overhead        # Channel vs crossbeam vs mpsc
 cargo bench --bench hub_overhead         # Hub throughput + RTT
 ```
 

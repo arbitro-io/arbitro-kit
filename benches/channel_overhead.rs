@@ -1,10 +1,22 @@
 //! Focused benchmark for `Channel` — with head-to-head crossbeam and
 //! std::mpsc at the same payload shapes so throughput is directly comparable.
 //!
+//! Scope: measure the cost of a request→reply round-trip.
+//! Wake-primitive tests live in `gate_overhead.rs`.
+//!
 //! Each scenario runs `rounds` RTTs on:
 //!   - `Channel<Req, Resp>` (this crate)
 //!   - `crossbeam_channel::bounded(1)` pair  (req + resp channels)
 //!   - `std::sync::mpsc::sync_channel(1)` pair
+//!
+//! Scenarios:
+//!   - **ST** (single-thread) — only for `crossbeam bounded(1)` and
+//!     `mpsc sync(1)` (they work on one thread with capacity 1).
+//!     `Channel` is cross-thread by design (client parks on the response
+//!     gate until a *separate* server thread fires it) and has no
+//!     single-thread analogue — omitted with a note.
+//!   - **XT** (cross-thread) — producer + server on separate threads;
+//!     full payload sweep.
 //!
 //! Columns:
 //!   - p50_ns, p99_ns — latency distribution of a full round-trip.
@@ -13,7 +25,7 @@
 //!            zero-copy primitives this can exceed DRAM bandwidth because
 //!            the data never physically crosses — it's "effective" throughput.
 //!
-//! Run: `cargo bench --bench gate_channel_focus`
+//! Run: `cargo bench --bench channel_overhead`
 //! Env: `BENCH_ROUNDS=1000 BENCH_WARMUP=100`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,9 +109,11 @@ fn finish(
     }
 }
 
-// ─── runner: Channel ────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// CROSS-THREAD runners
+// ═══════════════════════════════════════════════════════════════════════════
 
-fn run_gate<Req, Resp, MkReq, Handler>(
+fn xt_channel<Req, Resp, MkReq, Handler>(
     payload_bytes: usize,
     mk: MkReq,
     handler: Handler,
@@ -147,9 +161,7 @@ where
     finish("Channel", lats, elapsed_ns, payload_bytes)
 }
 
-// ─── runner: crossbeam pair ─────────────────────────────────────────────────
-
-fn run_cbpair<Req, Resp, MkReq, Handler>(
+fn xt_cbpair<Req, Resp, MkReq, Handler>(
     payload_bytes: usize,
     mk: MkReq,
     handler: Handler,
@@ -188,14 +200,12 @@ where
     }
     let elapsed_ns = t_wall.elapsed().as_nanos() as u64;
 
-    drop(tx_req);  // closes channel → server exits
+    drop(tx_req);
     h.join().unwrap();
     finish("crossbeam pair", lats, elapsed_ns, payload_bytes)
 }
 
-// ─── runner: std::mpsc pair ─────────────────────────────────────────────────
-
-fn run_mpscpair<Req, Resp, MkReq, Handler>(
+fn xt_mpscpair<Req, Resp, MkReq, Handler>(
     payload_bytes: usize,
     mk: MkReq,
     handler: Handler,
@@ -239,7 +249,60 @@ where
     finish("mpsc pair", lats, elapsed_ns, payload_bytes)
 }
 
-// ─── scenario driver: runs all 3 primitives for one payload shape ──────────
+// ═══════════════════════════════════════════════════════════════════════════
+// SINGLE-THREAD runners — send then recv on the same thread. Capacity 1 is
+// enough; the queue acts as a single-slot mailbox. No cross-core traffic,
+// so this measures the atomic + mutex overhead of each primitive's
+// send/recv fast-path.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn st_cbpair_u64() -> Row {
+    let (tx_req, rx_req) = crossbeam_channel::bounded::<u64>(1);
+    let (tx_resp, rx_resp) = crossbeam_channel::bounded::<u64>(1);
+    for i in 0..warmup() as u64 {
+        tx_req.send(i).unwrap();
+        let r = rx_req.recv().unwrap();
+        tx_resp.send(r.wrapping_add(1)).unwrap();
+        let _ = rx_resp.recv().unwrap();
+    }
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for i in 0..rounds() as u64 {
+        let t0 = Instant::now();
+        tx_req.send(i).unwrap();
+        let r = rx_req.recv().unwrap();
+        tx_resp.send(r.wrapping_add(1)).unwrap();
+        let _ = rx_resp.recv().unwrap();
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    finish("crossbeam pair", lats, el, 8)
+}
+
+fn st_mpscpair_u64() -> Row {
+    let (tx_req, rx_req) = sync_channel::<u64>(1);
+    let (tx_resp, rx_resp) = sync_channel::<u64>(1);
+    for i in 0..warmup() as u64 {
+        tx_req.send(i).unwrap();
+        let r = rx_req.recv().unwrap();
+        tx_resp.send(r.wrapping_add(1)).unwrap();
+        let _ = rx_resp.recv().unwrap();
+    }
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for i in 0..rounds() as u64 {
+        let t0 = Instant::now();
+        tx_req.send(i).unwrap();
+        let r = rx_req.recv().unwrap();
+        tx_resp.send(r.wrapping_add(1)).unwrap();
+        let _ = rx_resp.recv().unwrap();
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    finish("mpsc pair", lats, el, 8)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn compare<Req, Resp, MkReq, Handler>(
     scenario: &str,
@@ -254,51 +317,65 @@ where
     Handler: Fn(Req) -> Resp + Send + Clone + 'static,
 {
     print_scenario_header(scenario, payload_bytes);
-    print_row(run_gate(payload_bytes, mk.clone(), handler.clone()));
-    print_row(run_cbpair(payload_bytes, mk.clone(), handler.clone()));
-    print_row(run_mpscpair(payload_bytes, mk, handler));
+    print_row(xt_channel(payload_bytes, mk.clone(), handler.clone()));
+    print_row(xt_cbpair(payload_bytes, mk.clone(), handler.clone()));
+    print_row(xt_mpscpair(payload_bytes, mk, handler));
 }
 
 fn main() {
-    println!("=== arbitro-kit Channel head-to-head bench ===");
+    println!("=== arbitro-kit channel_overhead (round-trip comparison) ===");
     println!("rounds={} (capped per size)  warmup={}", rounds(), warmup());
     println!("MB/s = payload × ops/sec (one-way equivalent). Zero-copy");
     println!("primitives can exceed DRAM bandwidth because data never moves.");
 
-    // 1. Handshake floor — Channel only (no meaningful <(),()> for others) --
+    // ── SINGLE-THREAD ─────────────────────────────────────────────────────
+    // Channel has no ST analogue (client parks on a separate gate until the
+    // server fires it from another thread). We still measure cb and mpsc ST
+    // to give a reference for their send+recv mutex overhead without
+    // cross-core coherence traffic.
+    println!("\n── SINGLE-THREAD (u64 by-value, payload = 8 B) ──");
+    println!("{:<20} {:>10} {:>10} {:>14} {:>14}",
+             "primitive", "p50_ns", "p99_ns", "ops/sec", "MB/s");
+    println!("{}", "─".repeat(72));
+    println!("{:<20} {:>10} {:>10} {:>14} {:>14}",
+             "Channel", "—", "—", "—", "(cross-thread by design)");
+    print_row(st_cbpair_u64());
+    print_row(st_mpscpair_u64());
+
+    // ── CROSS-THREAD ──────────────────────────────────────────────────────
+    // Handshake floor (Channel only has a meaningful zero-payload number)
     {
-        print_scenario_header("Handshake floor (zero payload)", 0);
-        print_row(run_gate::<(), (), _, _>(0, |_| (), |_| ()));
-        // cb/mpsc still meaningful with unit type
-        print_row(run_cbpair::<(), (), _, _>(0, |_| (), |_| ()));
-        print_row(run_mpscpair::<(), (), _, _>(0, |_| (), |_| ()));
+        print_scenario_header("XT Handshake floor (zero payload)", 0);
+        print_row(xt_channel::<(), (), _, _>(0, |_| (), |_| ()));
+        print_row(xt_cbpair::<(), (), _, _>(0, |_| (), |_| ()));
+        print_row(xt_mpscpair::<(), (), _, _>(0, |_| (), |_| ()));
     }
 
-    // 2. Small by-value ------------------------------------------------------
-    compare::<u64, u64, _, _>("u64 by-value", 8, |i| i, |r| r.wrapping_add(1));
-    compare::<[u8; 64], [u8; 64], _, _>("[u8; 64] by-value", 64,
+    // Small by-value
+    compare::<u64, u64, _, _>("XT u64 by-value", 8, |i| i, |r| r.wrapping_add(1));
+    compare::<[u8; 64], [u8; 64], _, _>("XT [u8; 64] by-value", 64,
         |i| { let mut a = [0u8; 64]; a[0] = i as u8; a },
         |r| r,
     );
-    compare::<[u8; 256], [u8; 256], _, _>("[u8; 256] by-value", 256,
+    compare::<[u8; 256], [u8; 256], _, _>("XT [u8; 256] by-value", 256,
         |i| { let mut a = [0u8; 256]; a[0] = i as u8; a },
         |r| r,
     );
 
-    // 3. Medium by-value -----------------------------------------------------
-    compare::<[u8; 1024], [u8; 1024], _, _>("[u8; 1024] by-value", 1024,
+    // Medium by-value
+    compare::<[u8; 1024], [u8; 1024], _, _>("XT [u8; 1024] by-value", 1024,
         |i| { let mut a = [0u8; 1024]; a[0] = i as u8; a },
         |r| r,
     );
-    compare::<[u8; 4096], [u8; 4096], _, _>("[u8; 4096] by-value", 4096,
+    compare::<[u8; 4096], [u8; 4096], _, _>("XT [u8; 4096] by-value", 4096,
         |i| { let mut a = [0u8; 4096]; a[0] = i as u8; a },
         |r| r,
     );
 
-    // 4. Ownership transfer Vec<u8> (zero-copy) -----------------------------
+    // Ownership transfer Vec<u8> (zero-copy)
     for size in [4 * 1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
         let sz = size;
-        compare::<Vec<u8>, Vec<u8>, _, _>("Vec<u8> ownership transfer", sz,
+        compare::<Vec<u8>, Vec<u8>, _, _>("XT Vec<u8> ownership transfer", sz,
             move |i| {
                 let mut v = vec![0u8; sz];
                 v[0] = i as u8;
@@ -308,12 +385,12 @@ fn main() {
         );
     }
 
-    // 5. Arc shared (8 B crosses; echo only, no checksum — fair handshake) --
+    // Arc shared
     for size in [1024 * 1024, 16 * 1024 * 1024] {
         let sz = size;
         let shared: Arc<Vec<u8>> = Arc::new(vec![0xA5; sz]);
         let mk_shared = shared.clone();
-        compare::<Arc<Vec<u8>>, Arc<Vec<u8>>, _, _>("Arc<Vec<u8>> shared", sz,
+        compare::<Arc<Vec<u8>>, Arc<Vec<u8>>, _, _>("XT Arc<Vec<u8>> shared", sz,
             move |_| mk_shared.clone(),
             |r| r,
         );
