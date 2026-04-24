@@ -7,7 +7,7 @@
 //! set-bit bitmap in a single pass — batching emerges for free.
 //!
 //! Baseline we want to beat: `crossbeam::channel::bounded(CAP)` in the
-//! MPMC shape. Secondary sanity: 1P/1C vs `Ring` and vs Synapse.
+//! MPMC shape. Secondary sanity: 1P/1C vs `Ring`.
 //!
 //! Sections:
 //!   A. Single-thread 1P/1C — hot path cost (no park).

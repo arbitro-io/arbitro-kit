@@ -358,12 +358,17 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
             unsafe {
                 (*ring.slots[h & PRing::<T, RING_CAP>::MASK].get()).write(value);
             }
+            // Was the ring empty before our write? Only on the empty→non-empty
+            // transition is a fetch_or required (consumer might be mid-park
+            // with our bit cleared; waking it is our job). On bursts where the
+            // ring already has items, the consumer's drain loop will see our
+            // new head.load(Acquire) and pick us up without a fresh bit set.
+            let was_empty = h == t;
             // Publish: consumer's head.load(Acquire) will see our write.
             ring.head.store(h.wrapping_add(1), Ordering::Release);
-            // Ensure the bit is set so consumer drains (idempotent if
-            // already set). Release ordering pairs with consumer's
-            // Acquire load of state().
-            shard.full_set.release(self.my_id);
+            if was_empty {
+                shard.full_set.release(self.my_id);
+            }
             self.cursor.set(((s + 1) % n) as u32);
             return Ok(());
         }
@@ -403,9 +408,14 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
                 }
                 h = h.wrapping_add(1);
             }
+            // Only fetch_or on empty→non-empty transition. See try_send
+            // for the full reasoning.
+            let was_empty = h0 == t;
             // Single Release publishing all `take` items at once.
             ring.head.store(h, Ordering::Release);
-            shard.full_set.release(self.my_id);
+            if was_empty {
+                shard.full_set.release(self.my_id);
+            }
             self.cursor.set(((s + 1) % n) as u32);
             return take;
         }
@@ -476,6 +486,8 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
             let t = ring.tail.load(Ordering::Relaxed);
             let h = ring.head.load(Ordering::Acquire);
             if t == h { continue; } // stale bit; skip
+            // Only wake producer on full→non-full transition.
+            let was_full = PRing::<T, RING_CAP>::is_full(h, t);
             // Safety: SPSC — only this consumer reads from this ring.
             // h observed via Acquire ⇒ producer's slot write is visible.
             let v = unsafe {
@@ -483,7 +495,9 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                     .assume_init_read()
             };
             ring.tail.store(t.wrapping_add(1), Ordering::Release);
-            self.inner.producer_gates[p].release();
+            if was_full {
+                self.inner.producer_gates[p].release();
+            }
             return Some(v);
         }
         None
@@ -553,6 +567,12 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                 let mut t = ring.tail.load(Ordering::Relaxed);
                 let h = ring.head.load(Ordering::Acquire);
                 if t == h { continue; }
+                // Was this ring full *before* we start draining? A producer
+                // only parks on its backpressure gate when *every* one of
+                // its rings is full. Waking on any full→non-full transition
+                // is sufficient (and correct even if overly eager). Most
+                // drains happen on non-full rings and skip the wake entirely.
+                let was_full = PRing::<T, RING_CAP>::is_full(h, t);
                 // Drain [t, h).
                 while t != h {
                     let v = unsafe {
@@ -565,8 +585,12 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                     progress = true;
                 }
                 ring.tail.store(t, Ordering::Release);
-                // One wake per bit drained (not per item) — amortized.
-                self.inner.producer_gates[p].release();
+                // One wake per drain only when the ring was saturated. For
+                // steady-state (non-full) drains, the producer is not parked
+                // and the RMW on the Signal is pure overhead.
+                if was_full {
+                    self.inner.producer_gates[p].release();
+                }
             }
             if !progress {
                 // Every set bit's ring was empty on inspection (stale).
