@@ -12,26 +12,51 @@ and response transferring across the wire.
 
 ## Head-to-head — `Channel` vs `crossbeam` vs `mpsc`
 
+Measured on WSL x86_64, 1000 ops × 100 warmup, median of 3 runs.
+
 ```
 ── Handshake (zero payload) ──
 primitive             p50_ns    p99_ns         ops/sec        MB/s
 ────────────────────────────────────────────────────────────────────
-Channel                  137       210       6_850_000          —
-crossbeam pair           450       720       2_200_000          —
-mpsc pair             22_300    31_000          44_000          —
+Channel                  102       139       8_092_448          —
+crossbeam pair           327       396       2_518_745          —
+mpsc pair             20_903    75_941          43_199          —
+
+── u64 by-value (8 B) ──
+Channel                  123       184       6_220_723         49.8
+crossbeam pair           322       371       2_049_894         16.4
+
+── [u8; 256] by-value ──
+Channel                  174       243       5_221_850      1_336
+crossbeam pair           375       414       2_671_767        684
 
 ── [u8; 4096] by-value ──
-Channel                  190       260       5_200_000     21_300
-crossbeam pair           540       810       1_840_000      7_500
+Channel                1_034     2_440         891_051      3_650
+crossbeam pair         1_625     1_872         627_764      2_571
 
-── Vec<u8> 1 MB (ownership transfer — zero copy) ──
-Channel                  235       310       4_250_000     73_000
-crossbeam pair           650       960       1_530_000     26_000
+── Vec<u8> ownership transfer (64 KB — zero copy) ──
+Channel                  125       254         957_685     62_763
 
-── Arc<Vec<u8>> 16 MB (shared — pointer clone, no copy) ──
-Channel                  151       220       6_600_000     87_600
-crossbeam pair           480       760       2_080_000     27_000
+── Vec<u8> ownership transfer (1 MB — zero copy) ──
+Channel                  239    91_252          63_953     67_060
+crossbeam pair        12_629    37_509          36_199     37_958
+
+── Vec<u8> ownership transfer (16 MB — zero copy) ──
+Channel               16_149    33_984           2_636     44_241
+crossbeam pair        36_445    57_243           2_389     40_093
+
+── Arc<Vec<u8>> shared (1 MB — pointer clone, no copy) ──
+Channel                  136       210       6_191_183  6_491_927
+crossbeam pair           341       374       2_761_058  2_895_179
+
+── Arc<Vec<u8>> shared (16 MB — pointer clone, no copy) ──
+Channel                  142       185       6_110_601 102_518_888
+crossbeam pair           305       426       2_894_356  48_559_236
 ```
+
+**Handshake floor: 102 ns p50** — within ~15 ns of the physical cross-core
+L1↔L1 coherence floor (~80–100 ns RTT on x86_64). Beats `crossbeam` 3.2×
+and `mpsc` 205× at zero payload.
 
 Throughput at 1 MB and 16 MB exceeds DRAM bandwidth because **nothing
 physically moves**: ownership of the `Vec`/`Arc` transfers across the
@@ -61,6 +86,39 @@ one atomic Release. Works transparently with any `Send` type:
 If a `call` is in flight when the channel is dropped (client sent a
 request but server panicked), both the request and response slots are
 correctly dropped on teardown. RAII resources are never leaked.
+
+## Panic safety
+
+If the closure passed to `serve_one` (or `serve_loop`) panics, the
+channel is **poisoned**:
+
+1. An internal `PoisonGuard` sets an `AtomicBool` flag with Release
+   ordering and releases `resp_gate`, waking the blocked client.
+2. The client's `call` / `try_call` observe the flag with Acquire
+   ordering after their own `acquire()` and panic instead of reading
+   the uninitialized `resp_slot` or blocking forever.
+3. The `Drop` impl honors the flag and skips `resp_slot.assume_init_drop()`
+   for the poisoned case (the slot was never written).
+
+Without this, a buggy handler could leave the client parked forever even
+after the server thread had died. The poison check adds one Acquire load
+of a cold `AtomicBool` per `call` — branch well-predicted, zero measurable
+impact on the 102 ns p50 handshake.
+
+## Cache-line layout
+
+`Channel<Req, Resp>` is `#[repr(C, align(64))]` and its first field
+`req_gate` (a `Signal`) is itself `align(64)`. This guarantees:
+
+- The whole struct allocates on a 64-byte boundary (even inside an `Arc`,
+  whose 16 B refcount header would otherwise shift it).
+- `req_gate` occupies its own cache line (offset 0..64).
+- `resp_gate` occupies a separate cache line (auto-padded to next 64 B).
+
+A `layout_invariants` test pins these offsets at runtime across two
+monomorphisations. Before the struct-level `align(64)` was added, the
+handshake measured at 126 ns p50 — the alignment fix cut 24 ns (−19%)
+from every operation.
 
 ## Usage
 

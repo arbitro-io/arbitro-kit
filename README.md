@@ -65,11 +65,14 @@ shows pool (recycled `Box<T>`) wins above 256 B by 2–54× vs inline,
 and fresh `Box::new` loses to inline below 16 KB because malloc cost
 exceeds memcpy. [→ ring.md](docs/ring.md)
 
-**`Channel<Req, Resp>`** — 137 ns p50 handshake round-trip. Zero-copy
-ownership transfer: `Vec<u8>` of 1 MB transfers at ~73 GB/s effective
-throughput (8-byte pointer + Release/Acquire, nothing physically
-moves). Beats `crossbeam::channel` 3× on handshake latency and
-`std::mpsc` 160×. [→ channel.md](docs/channel.md)
+**`Channel<Req, Resp>`** — **102 ns p50 handshake round-trip**, within
+~15 ns of the physical cross-core L1↔L1 coherence floor. Zero-copy
+ownership transfer: `Vec<u8>` of 1 MB transfers at ~67 GB/s effective
+throughput, `Arc<Vec<u8>>` of 16 MB at ~103 TB/s effective (pointer
+clone, nothing physically moves). Beats `crossbeam::channel` 3.2× on
+handshake latency and `std::mpsc` 205×. Panic-safe: a handler panic
+poisons the channel and wakes the blocked client cleanly.
+[→ channel.md](docs/channel.md)
 
 **`Hub<In, Out>`** — 12.5 ns/op send + drain local, 89 ns p50 full
 cross-thread RTT. N producers coalesce into one `AtomicU64` via
@@ -151,6 +154,9 @@ assert_eq!(p.recv(), 42);
 - **Panic-safe batch APIs.** `Ring::try_send_from` and `Ring::drain_into`
   are unwind-safe: partial-progress state stays consistent, no UB, no
   leaks.
+- **Panic-safe handlers.** `Channel::serve_one` / `serve_loop` poison
+  the channel on handler panic, wake the blocked client, and surface
+  the failure as a panic on the next `call` — no silent hangs.
 
 ---
 
@@ -176,7 +182,8 @@ Shipped today:
 - [x] `Pipe<T, H>` — SPSC single-slot with zero-cost observer hook
 - [x] `Ring<T, CAP>` — SPSC bounded ring with batch send + batch ack,
       panic-safe, payload-sweep-documented
-- [x] `Channel<Req, Resp>` — SPSC zero-copy request/response
+- [x] `Channel<Req, Resp>` — SPSC zero-copy request/response,
+      panic-safe, 64-byte aligned for sub-110 ns handshake
 - [x] `Hub<In, Out>` — N:1 multiplexer with per-port reply + shutdown
 
 Next:
