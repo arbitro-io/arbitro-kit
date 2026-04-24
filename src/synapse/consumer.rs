@@ -2,8 +2,19 @@
 //!
 //! Any of the `N` consumer threads may call these concurrently. Claims
 //! are serialized by a CAS loop on the shared `tail` cursor; once a
-//! consumer wins the CAS for index `t`, it owns `slot[t & MASK]` for
-//! that wrap and may read it safely.
+//! consumer wins the CAS for index `t`, it waits for the slot's `seq`
+//! to reach `t + 1` (written by the producer), reads, then stores
+//! `seq = t + CAP` to release the slot for the producer's next wrap.
+//!
+//! ## Vyukov per-slot handshake
+//!
+//! The check `seq[t & MASK] == t + 1` replaces `t < head` as the
+//! availability test. This matters because under a stale-`head` /
+//! stale-`tail` reading, we cannot distinguish "slot freshly written
+//! by producer" from "slot written two wraps ago and already consumed."
+//! `seq` disambiguates: each successful producer→consumer exchange
+//! advances the slot's seq by exactly `CAP`, so the match
+//! `seq == t + 1` is unique to the wrap `t` belongs to.
 //!
 //! ## Park protocol (park path of `recv`)
 //!
@@ -33,34 +44,54 @@ impl<T, const CAP: usize, const N: usize> Synapse<T, CAP, N> {
     pub fn try_recv(&self) -> Option<T> {
         loop {
             let t = self.tail.load(Ordering::Relaxed);
-            let h = self.head.load(Ordering::Acquire);
-            if t == h {
+            let slot = &self.slots[t & Self::MASK];
+            // Acquire-load the slot's seq. The producer publishes
+            // `seq = t + 1` with Release when it writes slot `t & MASK`
+            // at logical round `t`, so observing that value means the
+            // write is visible.
+            let seq = slot.seq.load(Ordering::Acquire);
+            let expected = t.wrapping_add(1);
+            if seq == expected {
+                // Slot is written and belongs to round `t`. Race with
+                // peer consumers: whoever wins the CAS owns this slot.
+                match self.tail.compare_exchange_weak(
+                    t,
+                    t.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // Safety: we observed `seq == t + 1` (producer's
+                        // Release) and won the CAS, so no other consumer
+                        // will read this slot at this wrap.
+                        let v = unsafe {
+                            (*slot.cell.get()).assume_init_read()
+                        };
+                        // Release the slot for the producer's next wrap:
+                        // producer at head = t + CAP will see seq matches
+                        // and may write again. Release pairs with the
+                        // producer's Acquire load in `try_send`.
+                        slot.seq
+                            .store(t.wrapping_add(CAP), Ordering::Release);
+                        // Wake a possibly-parked producer. Idempotent.
+                        self.not_full.release();
+                        return Some(v);
+                    }
+                    Err(_) => {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                }
+            } else if (seq.wrapping_sub(expected) as isize) < 0 {
+                // seq < expected → slot not yet written for round t
+                // (or this consumer's `t` is stale behind tail). Either
+                // way: nothing to claim right now.
                 return None;
-            }
-            // CAS-claim the slot: win (Ok) → we own `slot[t & MASK]`.
-            // Lose (Err) → another consumer took it; retry.
-            match self.tail.compare_exchange_weak(
-                t,
-                t.wrapping_add(1),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Safety: the Acquire load of `head` synchronized-with
-                    // the producer's Release, so `slot[t & MASK]` holds an
-                    // initialized T. We won the CAS so nobody else will
-                    // read this slot at this index this wrap.
-                    let v = unsafe {
-                        (*self.slots[t & Self::MASK].get()).assume_init_read()
-                    };
-                    // Wake a possibly-parked producer. Idempotent.
-                    self.not_full.release();
-                    return Some(v);
-                }
-                Err(_) => {
-                    std::hint::spin_loop();
-                    continue;
-                }
+            } else {
+                // seq > expected → another consumer already advanced
+                // past round t; our `t` is stale. Retry with fresh tail.
+                std::hint::spin_loop();
+                continue;
             }
         }
     }
@@ -94,7 +125,17 @@ impl<T, const CAP: usize, const N: usize> Synapse<T, CAP, N> {
             // sees our bit and wakes us, or we see the new head on
             // recheck and bail.
             self.idle_mask.fetch_or(bit, Ordering::SeqCst);
-            if !self.is_empty() || self.shutdown.load(Ordering::Acquire) {
+            // Recheck via the slot's own `seq` (not via head): head is
+            // Relaxed-stored under Vyukov and carries no ordering edge
+            // we could rely on here, but the producer Release-stores
+            // `seq` before the SeqCst fence, so a consumer that sees
+            // `seq >= t + 1` has seen the producer's publish. This is
+            // also one atomic load lighter than the old `is_empty` path
+            // (which loaded both head and tail).
+            let t = self.tail.load(Ordering::Relaxed);
+            let seq_here = self.slots[t & Self::MASK].seq.load(Ordering::Acquire);
+            let has_work = (seq_here.wrapping_sub(t.wrapping_add(1)) as isize) >= 0;
+            if has_work || self.shutdown.load(Ordering::Acquire) {
                 // Work or shutdown appeared — clear our idle bit (producer
                 // may have already cleared it, `fetch_and` is idempotent)
                 // and retry.

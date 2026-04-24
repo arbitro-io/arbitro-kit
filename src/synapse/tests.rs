@@ -102,16 +102,25 @@ fn spmc_fair_distribution() {
     // 4 consumers should each receive at least ~5% of messages under
     // a hot load (loose bound — fairness is best-effort, not strict
     // round-robin). Tests that no consumer starves entirely.
+    //
+    // A `Barrier` synchronizes startup so the producer does not race
+    // ahead of slow-to-schedule consumer threads — otherwise a consumer
+    // that enters its `recv` loop late would find the queue already
+    // drained by its peers and fail the 5 % threshold for reasons
+    // unrelated to fairness.
     const MSGS: u64 = 4_000;
     let s: Arc<Synapse<u64, 256, 4>> = Arc::new(Synapse::new());
     let counters: Arc<[AtomicUsize; 4]> = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+    let barrier = Arc::new(std::sync::Barrier::new(5)); // 4 consumers + producer
 
     let mut handles = vec![];
     for i in 0..4 {
         let s = s.clone();
         let counters = counters.clone();
+        let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
             s.bind_consumer(i);
+            barrier.wait();
             loop {
                 match s.recv(i) {
                     Ok(_) => { counters[i].fetch_add(1, Ordering::Relaxed); }
@@ -122,6 +131,7 @@ fn spmc_fair_distribution() {
     }
 
     s.set_producer(std::thread::current());
+    barrier.wait();
     for i in 0..MSGS { s.send(i); }
 
     let total_target = MSGS as usize;

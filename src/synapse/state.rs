@@ -69,9 +69,38 @@ pub struct Synapse<T, const CAP: usize, const N: usize> {
     /// cache lines.
     pub(super) signals: [Signal; N],
 
-    /// Slot storage. Each cell transitions empty → init → empty exactly
-    /// once per wrap, coordinated by `head`/`tail` + the signals.
-    pub(super) slots: [UnsafeCell<MaybeUninit<T>>; CAP],
+    /// Slot storage. Each slot bundles its `seq` and its `cell` so that
+    /// both atomics that the producer touches on a single `try_send`
+    /// (the seq Release store and the cell write) land on the same
+    /// cache line. This halves the producer's hot-path cache footprint
+    /// versus parallel `[AtomicUsize; CAP]` + `[UnsafeCell<_>; CAP]`
+    /// arrays.
+    ///
+    /// ### Vyukov per-slot sequence protocol
+    ///
+    /// Slot `i` is:
+    ///   - **empty, expected by producer at round `k`**  iff `seq == k`
+    ///     where `k ≡ i (mod CAP)` initially, then `k ≡ i + CAP·r (mod 2^W)`
+    ///     on the r-th wrap.
+    ///   - **written, expected by consumer at round `k`** iff `seq == k + 1`.
+    ///
+    /// The producer at `head` waits for `seq[head & MASK] == head`, writes,
+    /// then stores `seq = head + 1` with Release. A consumer at `t` waits
+    /// for `seq[t & MASK] == t + 1`, CAS-claims `tail`, reads, then stores
+    /// `seq = t + CAP` with Release — making the slot empty again for the
+    /// producer's next wrap.
+    ///
+    /// This per-slot handshake replaces the (incorrect) global rule
+    /// `head - tail < CAP`: `tail` advances at CAS-claim, not at read-
+    /// commit, so a stale `tail` cannot reliably tell the producer whether
+    /// a slot is actually free. `seq` tells it directly, per slot.
+    pub(super) slots: [Slot<T>; CAP],
+}
+
+/// Per-slot storage: Vyukov sequence number paired with its data cell.
+pub(super) struct Slot<T> {
+    pub(super) seq: AtomicUsize,
+    pub(super) cell: UnsafeCell<MaybeUninit<T>>,
 }
 
 // Safety: slot access is serialized by (head, tail, CAS claim). The
@@ -105,8 +134,14 @@ impl<T, const CAP: usize, const N: usize> Synapse<T, CAP, N> {
         assert!(N <= 64,               "Synapse N must be <= 64");
 
         let signals: [Signal; N] = std::array::from_fn(|_| Signal::new());
-        let slots: [UnsafeCell<MaybeUninit<T>>; CAP] =
-            std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit()));
+        // Each slot starts "empty, waiting for round i" — so producer at
+        // head == 0 sees slot[0].seq == 0, head == 1 sees slot[1].seq == 1,
+        // etc. `cell` starts uninitialized and is only read after its
+        // `seq` is advanced by the producer's Release store.
+        let slots: [Slot<T>; CAP] = std::array::from_fn(|i| Slot {
+            seq: AtomicUsize::new(i),
+            cell: UnsafeCell::new(MaybeUninit::uninit()),
+        });
 
         let not_full = Signal::new();
         not_full.release(); // empty ring has space
@@ -179,7 +214,7 @@ impl<T, const CAP: usize, const N: usize> Drop for Synapse<T, CAP, N> {
         while i != head {
             // Safety: slot[i & MASK] was published by the producer and
             // never claimed by a consumer.
-            unsafe { (*self.slots[i & Self::MASK].get()).assume_init_drop(); }
+            unsafe { (*self.slots[i & Self::MASK].cell.get()).assume_init_drop(); }
             i = i.wrapping_add(1);
         }
     }
