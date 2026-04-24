@@ -16,6 +16,7 @@
 //!   D. 1P/NC fan-out         (N = 2, 4, 8).
 //!   E. MP/NC symmetric       (M=N = 2, 4, 8).
 //!   F. vs crossbeam::channel::bounded (same C/D/E shapes).
+//!   G. Producer-batched MP/NC via `try_send_batch` (amortizes fetch_or).
 //!
 //! Conforms to bench_safety: BATCH = 1000, rounds capped, tee log expected
 //! from runner, no background work.
@@ -473,6 +474,95 @@ fn bench_crossbeam_mpmc<const M: usize, const N: usize>(label: &str) {
     for h in cons_handles { let _ = h.join().unwrap(); }
 }
 
+// ── G. MP/NC with `try_send_batch` on the producer side ───────────────
+//
+// Each producer refills a chunk buffer (≤ RING_CAP items) and drains it
+// via `try_send_batch`. One `fetch_or` per chunk instead of per item.
+// On stall (every shard full), falls back to blocking `send` of one
+// item so the producer parks cleanly on its backpressure gate.
+fn bench_mpmc_batched<const M: usize, const N: usize>(label: &str, chunk: usize) {
+    let (ps, cs, sd) = Mpmc::<u64>::new(M, N);
+
+    let consumer_handles: Vec<_> = cs
+        .into_iter()
+        .map(|c| thread::spawn(move || {
+            c.bind();
+            let mut count: u64 = 0;
+            loop {
+                match c.recv_batch(|v| { std::hint::black_box(v); count += 1; }) {
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            count
+        }))
+        .collect();
+
+    let per_prod = BATCH / M;
+    let work_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let done_round = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut prod_handles = Vec::new();
+    for p in ps.into_iter() {
+        let work_round = work_round.clone();
+        let done_round = done_round.clone();
+        let stop = stop.clone();
+        prod_handles.push(thread::spawn(move || {
+            p.bind();
+            let mut buf: Vec<u64> = Vec::with_capacity(chunk);
+            let mut last_round: u64 = 0;
+            loop {
+                loop {
+                    if stop.load(Ordering::Acquire) { return; }
+                    let r = work_round.load(Ordering::Acquire);
+                    if r > last_round { last_round = r; break; }
+                    std::hint::spin_loop();
+                }
+                let mut sent: usize = 0;
+                while sent < per_prod {
+                    let want = (per_prod - sent).min(chunk);
+                    buf.clear();
+                    for k in 0..want as u64 { buf.push(sent as u64 + k); }
+                    while !buf.is_empty() {
+                        let n = p.try_send_batch(&mut buf);
+                        if n == 0 {
+                            // Every shard full for this producer → park.
+                            let v = buf.remove(0);
+                            p.send(v);
+                        }
+                    }
+                    sent += want;
+                }
+                done_round.fetch_add(1, Ordering::AcqRel);
+            }
+        }));
+    }
+
+    for _ in 0..warmup_batches() {
+        done_round.store(0, Ordering::Release);
+        work_round.fetch_add(1, Ordering::AcqRel);
+        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+    }
+
+    let n = rounds();
+    let mut lats = Vec::with_capacity(n);
+    let wall = Instant::now();
+    for _ in 0..n {
+        done_round.store(0, Ordering::Release);
+        let t0 = Instant::now();
+        work_round.fetch_add(1, Ordering::AcqRel);
+        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    row(label, lats, wall.elapsed().as_nanos() as u64);
+
+    stop.store(true, Ordering::Release);
+    work_round.fetch_add(1, Ordering::AcqRel);
+    for h in prod_handles { let _ = h.join(); }
+    sd.signal();
+    for h in consumer_handles { let _ = h.join().unwrap(); }
+}
+
 fn main() {
     println!("=== arbitro-kit gate::Mpmc overhead bench ===");
     println!("rounds={} batches × BATCH={} ops each", rounds(), BATCH);
@@ -508,6 +598,11 @@ fn main() {
     bench_crossbeam_mpmc::<2, 2>("crossbeam 2P/2C");
     bench_crossbeam_mpmc::<4, 4>("crossbeam 4P/4C");
     bench_crossbeam_mpmc::<8, 8>("crossbeam 8P/8C");
+
+    header("G. MP/NC producer-batched via try_send_batch (chunk=64)");
+    bench_mpmc_batched::<2, 2>("mpmc 2P/2C batched-64", 64);
+    bench_mpmc_batched::<4, 4>("mpmc 4P/4C batched-64", 64);
+    bench_mpmc_batched::<8, 8>("mpmc 8P/8C batched-64", 64);
 
     println!("\nDone.");
 }
