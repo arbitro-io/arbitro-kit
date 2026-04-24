@@ -35,6 +35,15 @@
 //! Exactly **one consumer** may call `acquire()` / `set_worker()`. Any number
 //! of producers may call `release()` / `lock()` / `is_open()` concurrently
 //! from any thread without synchronization between them.
+//!
+//! ## State source abstraction
+//!
+//! The open/closed bit is read through the [`SignalSource`] trait. The
+//! default implementation [`OwnedBool`] owns an internal `AtomicBool` —
+//! this is the classical `Signal::new()` behaviour with identical layout
+//! and identical codegen (fully inlined, no vtable). Alternative sources
+//! (e.g. viewing a shared `AtomicU64` bit, or deriving openness from a
+//! data cursor) can be plugged in without modifying the park protocol.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,11 +56,66 @@ pub const DEFAULT_SPIN_ITERS: u32 = 512;
 /// coherence latency (~50–150 ns) without committing a single PAUSE.
 const TIGHT_SPIN: u32 = 64;
 
+// ─── SignalSource trait ───────────────────────────────────────────────────
+
+/// Pluggable backing for the open/closed state of a [`Signal`].
+///
+/// The trait is intentionally minimal: `Signal` only needs three operations
+/// from the state it guards. Every implementor is expected to be tiny and
+/// fully inline-able; the default [`OwnedBool`] compiles to the same
+/// instructions as the pre-generic `Signal`.
+///
+/// # Ordering contract
+///
+/// - [`is_open`](Self::is_open) must use `Acquire` so a `true` return
+///   synchronizes-with the producer's release.
+/// - [`open`](Self::open) must use at least `Release` so payload writes
+///   the producer performed before calling `release()` are published.
+/// - [`close`](Self::close) must use at least `Release` so payload reads
+///   the consumer performed before calling `lock()` are committed.
+pub trait SignalSource {
+    /// `true` if the gate is open (there is pending work).
+    fn is_open(&self) -> bool;
+    /// Open the gate (called by `Signal::release`).
+    fn open(&self);
+    /// Close the gate (called by `Signal::lock`).
+    fn close(&self);
+}
+
+/// The canonical [`SignalSource`]: an owned `AtomicBool`. Bit meaning:
+/// `true` = locked (no work), `false` = open. This inverted convention
+/// matches the pre-generic `Signal` layout byte-for-byte.
+#[repr(transparent)]
+pub struct OwnedBool(AtomicBool);
+
+impl OwnedBool {
+    #[inline]
+    pub const fn new_locked() -> Self { Self(AtomicBool::new(true)) }
+}
+
+impl SignalSource for OwnedBool {
+    #[inline(always)]
+    fn is_open(&self) -> bool {
+        !self.0.load(Ordering::Acquire)
+    }
+    #[inline(always)]
+    fn open(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+    #[inline(always)]
+    fn close(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+// ─── Signal ──────────────────────────────────────────────────────────────
+
 #[repr(align(64))]
-pub struct Signal {
-    /// `true` → gate is locked (no pending work). `false` → open (has work).
-    /// Named `locked` for historical reasons; `is_open()` inverts this.
-    locked: AtomicBool,
+pub struct Signal<S: SignalSource = OwnedBool> {
+    /// Pluggable backing for the "is the gate open?" bit. For the default
+    /// `Signal` this is an owned `AtomicBool`; layout and codegen match
+    /// the pre-generic version exactly.
+    source: S,
     /// Set by the consumer on the park path with `SeqCst`. Read by producers
     /// with `Relaxed` — the race window is closed by the consumer's SeqCst
     /// store + recheck (see module docs).
@@ -67,14 +131,20 @@ pub struct Signal {
 
 // Safety: `worker` is written once pre-share, then read only after the
 // consumer sets `parked = true` with SeqCst — which establishes a global
-// happens-before edge observable by every producer.
-unsafe impl Sync for Signal {}
+// happens-before edge observable by every producer. The `S: Sync` bound
+// is required so the source can be touched from any producer thread.
+unsafe impl<S: SignalSource + Sync> Sync for Signal<S> {}
 
 impl Default for Signal {
     fn default() -> Self { Self::new() }
 }
 
-impl Signal {
+// ─── Canonical constructors (OwnedBool backing) ──────────────────────────
+//
+// Calling `Signal::new()` still works because `Signal<S = OwnedBool>` has
+// `OwnedBool` as its default type parameter. These constructors keep the
+// pre-generic shape exactly.
+impl Signal<OwnedBool> {
     pub fn new() -> Self { Self::with_spin(DEFAULT_SPIN_ITERS) }
 
     /// Construct a `Signal` with a custom spin-iteration budget. Higher values
@@ -82,7 +152,22 @@ impl Signal {
     /// spin window; lower values park sooner (0% CPU idle). 0 = always park.
     pub fn with_spin(spin_iters: u32) -> Self {
         Self {
-            locked: AtomicBool::new(true),
+            source: OwnedBool::new_locked(),
+            parked: AtomicBool::new(false),
+            spin_iters,
+            worker: UnsafeCell::new(None),
+        }
+    }
+}
+
+// ─── Generic constructor for custom sources ──────────────────────────────
+
+impl<S: SignalSource> Signal<S> {
+    /// Build a `Signal` over an arbitrary [`SignalSource`]. The caller must
+    /// ensure `source` starts in a consistent state (typically "closed").
+    pub fn with_source(source: S, spin_iters: u32) -> Self {
+        Self {
+            source,
             parked: AtomicBool::new(false),
             spin_iters,
             worker: UnsafeCell::new(None),
@@ -100,7 +185,7 @@ impl Signal {
     /// Signal pending work. Lock-free, ~0.6 ns common case.
     #[inline]
     pub fn release(&self) {
-        self.locked.store(false, Ordering::Release);
+        self.source.open();
         if self.parked.load(Ordering::Relaxed) {
             // Safety: `parked == true` was published by the consumer with a
             // SeqCst store; its `worker` write is therefore also visible.
@@ -123,14 +208,14 @@ impl Signal {
     /// same `mov` as `Relaxed`; on ARM it adds one `dmb ish st`.
     #[inline]
     pub fn lock(&self) {
-        self.locked.store(true, Ordering::Release);
+        self.source.close();
     }
 
     /// `true` if there is pending work (i.e. `release()` was called since the
     /// last `lock()`).
     #[inline]
     pub fn is_open(&self) -> bool {
-        !self.locked.load(Ordering::Acquire)
+        self.source.is_open()
     }
 
     /// Block the calling thread until the gate is open. Must be called from
@@ -140,7 +225,7 @@ impl Signal {
     /// into `#[cold] acquire_slow` so the fast path stays compact in icache.
     #[inline]
     pub fn acquire(&self) {
-        if !self.locked.load(Ordering::Acquire) { return; }
+        if self.source.is_open() { return; }
         self.acquire_slow();
     }
 
@@ -150,36 +235,35 @@ impl Signal {
         // Every early-return from this function must synchronize-with the
         // producer's `release()` (Release store) so the caller sees any
         // payload the producer wrote before releasing. That means every
-        // exit-condition load of `locked` must be **Acquire**, not Relaxed.
-        // On x86 Acquire and Relaxed compile to the same plain `mov`; on
-        // ARM Acquire adds one `dmb ishld`. Cost: ~free, correctness: yes.
+        // exit-condition load must be **Acquire**, which the `SignalSource`
+        // contract requires of `is_open()`.
 
         // Phase 1: tight spin (~1-2 ns/iter). Catches intra-socket signals
         // (~100-200 ns coherence) without paying a single PAUSE.
         for _ in 0..TIGHT_SPIN {
-            if !self.locked.load(Ordering::Acquire) { return; }
+            if self.source.is_open() { return; }
             std::hint::black_box(());
         }
         // Phase 2: PAUSE spin (~20-40 ns/iter on x86). Covers the ~µs range.
         for _ in 0..self.spin_iters {
-            if !self.locked.load(Ordering::Acquire) { return; }
+            if self.source.is_open() { return; }
             std::hint::spin_loop();
         }
         // Phase 3: announce parking. SeqCst store = mfence on x86 / dmb ish
-        // on ARM → after this point our subsequent load of `locked` sees
+        // on ARM → after this point our subsequent load of the source sees
         // every globally-visible store from any producer. Pays ~20 ns, once
         // per park event.
         self.parked.store(true, Ordering::SeqCst);
-        if !self.locked.load(Ordering::Acquire) {
+        if self.source.is_open() {
             // Producer fired between spin-end and parked-set; no need to park.
             self.parked.store(false, Ordering::Relaxed);
             return;
         }
         // Phase 4: park loop — `park()` can wake spuriously per std's docs,
-        // so loop until we observe `locked` cleared.
+        // so loop until we observe the source open.
         loop {
             std::thread::park();
-            if !self.locked.load(Ordering::Acquire) {
+            if self.source.is_open() {
                 self.parked.store(false, Ordering::Relaxed);
                 return;
             }
