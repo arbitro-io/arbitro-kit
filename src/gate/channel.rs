@@ -88,7 +88,20 @@ struct CachePad([u8; 0]);
 ///
 /// Generic over `Req` (client → server) and `Resp` (server → client). Both
 /// must be `Send`.
-#[repr(C)]
+///
+/// ## Layout
+///
+/// `#[repr(C, align(64))]` forces the whole struct onto a 64-byte boundary
+/// when allocated (e.g., via `Arc::new`). Combined with `Signal` being
+/// internally `#[repr(align(64))]`, this guarantees:
+/// - `req_gate` occupies its own cache line (offset 0..64).
+/// - `resp_gate` occupies its own cache line (Rust layout rules auto-pad
+///   to the next 64-byte boundary because `Signal` is align-64).
+///
+/// The `_pad` field is kept for clarity and as belt-and-suspenders, even
+/// though `Signal`'s own alignment makes it technically redundant. A
+/// `layout_invariants` test verifies the guarantees at compile + run time.
+#[repr(C, align(64))]
 pub struct Channel<Req, Resp> {
     // ── request direction (client → server) ─────────────────────────────
     req_gate: Signal,
@@ -531,6 +544,33 @@ mod tests {
         assert!(res.is_err(), "client.call must panic when channel is poisoned");
 
         h.join().unwrap();
+    }
+
+    #[test]
+    fn layout_invariants() {
+        // Guard against accidental layout regression: `req_gate` and
+        // `resp_gate` must each occupy their own 64-byte cache line with
+        // no false sharing. We check a couple of concrete monomorphisations.
+
+        // Smallest case: u64 payloads.
+        let ch: Box<Channel<u64, u64>> = Box::new(Channel::new());
+        let base = (&*ch) as *const _ as usize;
+        let req_gate_off = (&ch.req_gate) as *const _ as usize - base;
+        let resp_gate_off = (&ch.resp_gate) as *const _ as usize - base;
+        assert_eq!(req_gate_off, 0, "req_gate must be at offset 0");
+        assert_eq!(req_gate_off % 64, 0, "req_gate must align to cache line");
+        assert_eq!(resp_gate_off % 64, 0, "resp_gate must align to cache line");
+        assert!(resp_gate_off >= 64, "resp_gate must be on a different line from req_gate");
+        assert_eq!(base % 64, 0, "Channel alloc must itself align to 64 B");
+
+        // Medium payload.
+        let ch2: Box<Channel<[u8; 256], [u8; 256]>> = Box::new(Channel::new());
+        let base = (&*ch2) as *const _ as usize;
+        let req_gate_off = (&ch2.req_gate) as *const _ as usize - base;
+        let resp_gate_off = (&ch2.resp_gate) as *const _ as usize - base;
+        assert_eq!(req_gate_off % 64, 0);
+        assert_eq!(resp_gate_off % 64, 0);
+        assert_eq!(base % 64, 0);
     }
 
     #[test]
