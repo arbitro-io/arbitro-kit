@@ -46,7 +46,7 @@
 //! data cursor) can be plugged in without modifying the park protocol.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Default spin iterations before parking. Covers producer→consumer
 /// latencies in the ~100–500 ns range on commodity x86_64.
@@ -108,6 +108,51 @@ impl SignalSource for OwnedBool {
     }
 }
 
+/// View over an externally-owned `AtomicBool`. Created by
+/// [`Signal::from_bool`]. Natural convention: `true` = open (has work),
+/// `false` = closed — matches the intuition most callers have when they
+/// manipulate the atomic themselves.
+pub struct BoolView<'a>(&'a AtomicBool);
+
+impl SignalSource for BoolView<'_> {
+    #[inline(always)]
+    fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    #[inline(always)]
+    fn open(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    #[inline(always)]
+    fn close(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// View over a single bit of an externally-owned `AtomicU64`. Created by
+/// [`Signal::from_bit`]. Bit set = open, bit clear = closed. Uses `fetch_or`
+/// / `fetch_and` so multiple `BitView`s over the same `AtomicU64` coexist
+/// safely — each touches only its own bit.
+pub struct BitView<'a> {
+    atomic: &'a AtomicU64,
+    mask: u64,
+}
+
+impl SignalSource for BitView<'_> {
+    #[inline(always)]
+    fn is_open(&self) -> bool {
+        (self.atomic.load(Ordering::Acquire) & self.mask) != 0
+    }
+    #[inline(always)]
+    fn open(&self) {
+        self.atomic.fetch_or(self.mask, Ordering::Release);
+    }
+    #[inline(always)]
+    fn close(&self) {
+        self.atomic.fetch_and(!self.mask, Ordering::Release);
+    }
+}
+
 // ─── Signal ──────────────────────────────────────────────────────────────
 
 #[repr(align(64))]
@@ -157,6 +202,45 @@ impl Signal<OwnedBool> {
             spin_iters,
             worker: UnsafeCell::new(None),
         }
+    }
+}
+
+// ─── Borrowed-source constructors ────────────────────────────────────────
+//
+// Ergonomic wiring for the common "I already own this atomic" case. Neither
+// constructor takes ownership of the atomic — the Signal is lifetime-bound
+// to the borrow so the caller keeps direct, zero-indirection access.
+
+impl<'a> Signal<BoolView<'a>> {
+    /// Build a `Signal` that observes an externally-owned `AtomicBool`.
+    /// The caller retains direct read/write access to the atomic; `Signal`
+    /// only handles park / unpark. Lifetime-bound: the atomic must outlive
+    /// the `Signal`.
+    ///
+    /// Convention: `true` = open (has work), `false` = closed.
+    #[inline]
+    pub fn from_bool(atomic: &'a AtomicBool) -> Self {
+        Self::with_source(BoolView(atomic), DEFAULT_SPIN_ITERS)
+    }
+}
+
+impl<'a> Signal<BitView<'a>> {
+    /// Build a `Signal` that observes one bit of an externally-owned
+    /// `AtomicU64`. Up to 64 independent `Signal`s can share the same
+    /// `AtomicU64` — each with its own parker and worker — packed into a
+    /// single cache line.
+    ///
+    /// Convention: bit set = open, bit clear = closed. `release` uses
+    /// `fetch_or` so other bits are preserved; `lock` uses `fetch_and`.
+    ///
+    /// Panics (debug) if `bit >= 64`.
+    #[inline]
+    pub fn from_bit(atomic: &'a AtomicU64, bit: u8) -> Self {
+        debug_assert!(bit < 64, "bit index must be < 64");
+        Self::with_source(
+            BitView { atomic, mask: 1u64 << bit },
+            DEFAULT_SPIN_ITERS,
+        )
     }
 }
 
@@ -403,5 +487,106 @@ mod tests {
         consumer.join().unwrap();
         assert_eq!(consumed.load(Ordering::Acquire), N,
                    "canonical pattern must consume every produced unit");
+    }
+
+    #[test]
+    fn from_bool_external_atomic() {
+        // Signal observes an AtomicBool owned by the caller; caller retains
+        // direct access and mutates it without going through the Signal.
+        let state = AtomicBool::new(false);
+        let sig = Signal::from_bool(&state);
+        assert!(!sig.is_open(), "starts closed (state=false)");
+
+        // Direct write to the caller's atomic — Signal must see it.
+        state.store(true, Ordering::Release);
+        assert!(sig.is_open(), "external open must be visible to Signal");
+
+        // Signal::lock closes the shared atomic.
+        sig.lock();
+        assert!(!sig.is_open());
+        assert!(!state.load(Ordering::Acquire),
+                "Signal::lock must clear the caller's atomic");
+
+        // Signal::release opens it.
+        sig.release();
+        assert!(state.load(Ordering::Acquire),
+                "Signal::release must set the caller's atomic");
+    }
+
+    #[test]
+    fn from_bit_multiple_signals_share_one_u64() {
+        use std::sync::atomic::AtomicU64;
+
+        let state = AtomicU64::new(0);
+        let sig0  = Signal::from_bit(&state, 0);
+        let sig3  = Signal::from_bit(&state, 3);
+        let sig63 = Signal::from_bit(&state, 63);
+
+        assert!(!sig0.is_open() && !sig3.is_open() && !sig63.is_open());
+
+        // Release bit 3 — only sig3 sees open.
+        sig3.release();
+        assert!(!sig0.is_open());
+        assert!( sig3.is_open());
+        assert!(!sig63.is_open());
+        assert_eq!(state.load(Ordering::Acquire), 1u64 << 3);
+
+        // Release bit 0 — sig0 and sig3 both open, sig63 still closed.
+        sig0.release();
+        assert!(sig0.is_open());
+        assert!(sig3.is_open());
+        assert!(!sig63.is_open());
+        assert_eq!(state.load(Ordering::Acquire), (1u64 << 3) | 1);
+
+        // Lock bit 3 — bit 0 must stay set.
+        sig3.lock();
+        assert!( sig0.is_open());
+        assert!(!sig3.is_open());
+        assert_eq!(state.load(Ordering::Acquire), 1);
+
+        // Release bit 63 (top bit, edge case).
+        sig63.release();
+        assert!(sig63.is_open());
+        assert_eq!(state.load(Ordering::Acquire), 1 | (1u64 << 63));
+    }
+
+    #[test]
+    fn from_bit_cross_thread_wake() {
+        // One Signal<BitView> shared between producer and consumer via
+        // scoped threads. release() must wake the parked consumer.
+        use std::sync::atomic::AtomicU64;
+
+        let state = AtomicU64::new(0);
+        let sig = Signal::from_bit(&state, 5);
+
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                sig.set_worker(std::thread::current());
+                sig.acquire();
+                assert!(sig.is_open());
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            sig.release();
+        });
+
+        assert_eq!(state.load(Ordering::Acquire) & (1u64 << 5), 1u64 << 5);
+    }
+
+    #[test]
+    fn from_bool_cross_thread_wake() {
+        let state = AtomicBool::new(false);
+        let sig = Signal::from_bool(&state);
+
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                sig.set_worker(std::thread::current());
+                sig.acquire();
+                assert!(sig.is_open());
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            sig.release();
+        });
+
+        assert!(state.load(Ordering::Acquire));
     }
 }
