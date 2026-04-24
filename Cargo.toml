@@ -13,6 +13,7 @@ readme = "README.md"
 # Only for benchmarks: compare Gate / GateSet against crossbeam's bounded(1).
 # Runtime crate itself stays dep-free.
 crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
 
 [[bench]]
 name = "signal_compare"
@@ -32,6 +33,10 @@ harness = false
 
 [[bench]]
 name = "ring_overhead"
+harness = false
+
+[[bench]]
+name = "synapse_overhead"
 harness = false
 
 [profile.release]
