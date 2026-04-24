@@ -31,6 +31,7 @@ mod channel;
 mod gate;
 mod gate_set;
 mod hub;
+mod mpmc;
 mod pipe;
 mod ring;
 
@@ -38,5 +39,6 @@ pub use channel::{Channel, Client, Server};
 pub use gate::{Signal, DEFAULT_SPIN_ITERS};
 pub use gate_set::{SignalId, SignalSet, MAX_GATES};
 pub use hub::{Hub, HubDrain, HubPort, HubReply, HubShutdown, Shutdown, MAX_HUB_PORTS};
+pub use mpmc::{Mpmc, MpmcConsumer, MpmcProducer, MpmcShutdown, MAX_MPMC_PRODUCERS};
 pub use pipe::{NoHook, Pipe, PipeHook};
 pub use ring::Ring;

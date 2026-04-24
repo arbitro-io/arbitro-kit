@@ -39,6 +39,18 @@ harness = false
 name = "synapse_overhead"
 harness = false
 
+[[bench]]
+name = "mpmc_overhead"
+harness = false
+
+[[bench]]
+name = "mpmc_ring_cap"
+harness = false
+
+[[bench]]
+name = "mpmc_ring_cap_batched"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
