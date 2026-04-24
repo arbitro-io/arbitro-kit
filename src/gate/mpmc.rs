@@ -358,17 +358,15 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
             unsafe {
                 (*ring.slots[h & PRing::<T, RING_CAP>::MASK].get()).write(value);
             }
-            // Was the ring empty before our write? Only on the empty→non-empty
-            // transition is a fetch_or required (consumer might be mid-park
-            // with our bit cleared; waking it is our job). On bursts where the
-            // ring already has items, the consumer's drain loop will see our
-            // new head.load(Acquire) and pick us up without a fresh bit set.
-            let was_empty = h == t;
             // Publish: consumer's head.load(Acquire) will see our write.
             ring.head.store(h.wrapping_add(1), Ordering::Release);
-            if was_empty {
-                shard.full_set.release(self.my_id);
-            }
+            // Level-triggered bit: "this ring has data". Always set after
+            // a push, even if the bit is already set. This honors the
+            // Signal contract (release on every message) and closes the
+            // park_or_drain Dekker cleanly: if the consumer cleared the
+            // bit between our head.store and our release, the release
+            // will re-set it and acquire_any will wake.
+            shard.full_set.release(self.my_id);
             self.cursor.set(((s + 1) % n) as u32);
             return Ok(());
         }
@@ -408,14 +406,10 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
                 }
                 h = h.wrapping_add(1);
             }
-            // Only fetch_or on empty→non-empty transition. See try_send
-            // for the full reasoning.
-            let was_empty = h0 == t;
             // Single Release publishing all `take` items at once.
             ring.head.store(h, Ordering::Release);
-            if was_empty {
-                shard.full_set.release(self.my_id);
-            }
+            // Level-triggered bit: always set. See try_send.
+            shard.full_set.release(self.my_id);
             self.cursor.set(((s + 1) % n) as u32);
             return take;
         }
@@ -486,8 +480,6 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
             let t = ring.tail.load(Ordering::Relaxed);
             let h = ring.head.load(Ordering::Acquire);
             if t == h { continue; } // stale bit; skip
-            // Only wake producer on full→non-full transition.
-            let was_full = PRing::<T, RING_CAP>::is_full(h, t);
             // Safety: SPSC — only this consumer reads from this ring.
             // h observed via Acquire ⇒ producer's slot write is visible.
             let v = unsafe {
@@ -495,9 +487,11 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                     .assume_init_read()
             };
             ring.tail.store(t.wrapping_add(1), Ordering::Release);
-            if was_full {
-                self.inner.producer_gates[p].release();
-            }
+            // Level-triggered wake: always release producer gate after a
+            // pop. Mirror of the producer-side change — keeps the Signal
+            // invariant "release on every advance" and eliminates the
+            // was_full optimization's implicit Dekker.
+            self.inner.producer_gates[p].release();
             return Some(v);
         }
         None
@@ -524,11 +518,13 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
         loop {
             let count = self.drain_all(&mut f);
             if count > 0 {
-                if self.inner.shutdown.load(Ordering::Acquire) {
-                    let shard = &self.inner.shards[self.shard_idx];
-                    shard.full_set.lock(shard.shutdown_id);
-                    return Err(Shutdown);
-                }
+                // Always return Ok on progress — even under shutdown. The
+                // caller loops back and calls us again; the next drain_all
+                // will either find more data (and we'll return Ok again) or
+                // return 0, at which point the shutdown path below fires.
+                // Returning Err too eagerly would abandon items still sitting
+                // in peer producer rings of this shard, causing Drop to
+                // silently destroy them.
                 return Ok(count);
             }
             if self.inner.shutdown.load(Ordering::Acquire) {
@@ -567,12 +563,6 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                 let mut t = ring.tail.load(Ordering::Relaxed);
                 let h = ring.head.load(Ordering::Acquire);
                 if t == h { continue; }
-                // Was this ring full *before* we start draining? A producer
-                // only parks on its backpressure gate when *every* one of
-                // its rings is full. Waking on any full→non-full transition
-                // is sufficient (and correct even if overly eager). Most
-                // drains happen on non-full rings and skip the wake entirely.
-                let was_full = PRing::<T, RING_CAP>::is_full(h, t);
                 // Drain [t, h).
                 while t != h {
                     let v = unsafe {
@@ -585,12 +575,11 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                     progress = true;
                 }
                 ring.tail.store(t, Ordering::Release);
-                // One wake per drain only when the ring was saturated. For
-                // steady-state (non-full) drains, the producer is not parked
-                // and the RMW on the Signal is pure overhead.
-                if was_full {
-                    self.inner.producer_gates[p].release();
-                }
+                // Level-triggered wake: one release per ring drained,
+                // always. Amortized over the whole batch, not per-item.
+                // Matches the Signal contract — the producer's gate
+                // invariant is "release whenever tail advances."
+                self.inner.producer_gates[p].release();
             }
             if !progress {
                 // Every set bit's ring was empty on inspection (stale).
@@ -640,10 +629,11 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
         // Truly empty. Park until producer's fetch_or or shutdown's release.
         shard.full_set.acquire_any(wake_mask);
 
-        if self.inner.shutdown.load(Ordering::Acquire) {
-            shard.full_set.lock(shard.shutdown_id);
-            return Err(Shutdown);
-        }
+        // Do NOT handle shutdown here. If we wake with *both* a producer
+        // bit and the shutdown bit set (producer wrote, then supervisor
+        // signaled), returning `Err(Shutdown)` now would skip the pending
+        // producer data. The caller's loop runs `drain_all` first, so
+        // shutdown is handled there — after the ring is empty.
         Ok(false)
     }
 }
