@@ -109,6 +109,54 @@ fn st_signal() -> Row {
     finish("Signal", lats, el)
 }
 
+fn st_signal_from_bool() -> Row {
+    // Zero-cost check: Signal<BoolView> over a local AtomicBool should
+    // compile to the same code as Signal::new() (OwnedBool backing) since
+    // both erase through monomorphization + #[inline(always)] on the trait.
+    let state = AtomicBool::new(false);
+    let s = Signal::from_bool(&state);
+    s.set_worker(thread::current());
+    for _ in 0..warmup() {
+        s.release(); s.acquire(); s.lock();
+    }
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for _ in 0..rounds() {
+        let t0 = Instant::now();
+        s.release();
+        s.acquire();
+        s.lock();
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    finish("Signal::from_bool (external AtomicBool)", lats, el)
+}
+
+fn st_signal_from_bit() -> Row {
+    // Zero-cost check: Signal<BitView> over a local AtomicU64.
+    // fetch_or/fetch_and are heavier than plain store/load, so this row
+    // is EXPECTED to be slower than Signal::new() — it measures the RMW
+    // cost we inherit from sharing storage with other bits.
+    use std::sync::atomic::AtomicU64;
+    let state = AtomicU64::new(0);
+    let s = Signal::from_bit(&state, 0);
+    s.set_worker(thread::current());
+    for _ in 0..warmup() {
+        s.release(); s.acquire(); s.lock();
+    }
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for _ in 0..rounds() {
+        let t0 = Instant::now();
+        s.release();
+        s.acquire();
+        s.lock();
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    finish("Signal::from_bit (bit of AtomicU64)", lats, el)
+}
+
 fn st_atomic_spin() -> Row {
     let flag = AtomicBool::new(false);
     for _ in 0..warmup() {
@@ -722,6 +770,8 @@ fn main() {
 
     print_scenario_header("Single-thread (release + acquire same thread)");
     print_row(st_signal());
+    print_row(st_signal_from_bool());
+    print_row(st_signal_from_bit());
     print_row(st_atomic_spin());
     print_row(st_atomic_park());
     print_row(st_condvar());
