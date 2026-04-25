@@ -64,6 +64,14 @@ harness = false
 name = "hub_multibit"
 harness = false
 
+[[bench]]
+name = "fanin_h2h"
+harness = false
+
+[[bench]]
+name = "ring_vs_crossbeam"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
