@@ -23,24 +23,46 @@ use arbitro_kit::gate::Hub;
 
 const BATCH: usize = 1000;
 const WARMUP: usize = 10;
-const ROUNDS: usize = 500;
+const WINDOWS: usize = 10;
 
-fn header() {
-    println!("\n{:<35} {:>12} {:>12} {:>12} {:>14}",
-             "scenario", "mean_ns/op", "p50_ns/op", "p99_ns/op", "ops/sec");
-    println!("{}", "─".repeat(87));
+// Configurable via env: BENCH_ROUNDS=<n>  (default 10_000 batches).
+// 500   ≈ snapshot (~10 ms / scenario)
+// 10000 ≈ thermal / drift (~150 ms)
+// 100000 ≈ long-run drift check (~1.5 s)
+fn rounds() -> usize {
+    std::env::var("BENCH_ROUNDS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(10_000)
 }
 
-fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
-    batch_ns.sort_unstable();
+fn header() {
+    println!("\n{:<35} {:>10} {:>10} {:>10} {:>10} {:>12}",
+             "scenario", "mean", "p50", "p99", "drift%", "ops/sec");
+    println!("{}", "─".repeat(93));
+}
+
+fn row(name: &str, batch_ns: Vec<u64>, total_elapsed_ns: u64) {
     let samples = batch_ns.len();
     let total_ops = samples * BATCH;
     let ops = (total_ops as f64) / (total_elapsed_ns as f64 / 1e9);
     let mean = total_elapsed_ns as f64 / total_ops as f64;
-    let p50 = batch_ns[samples / 2] as f64 / BATCH as f64;
-    let p99 = batch_ns[samples * 99 / 100] as f64 / BATCH as f64;
-    println!("{:<35} {:>12.2} {:>12.2} {:>12.2} {:>14}",
-             name, mean, p50, p99, ops as u64);
+
+    // Drift: compare mean ns/op of last window vs first window.
+    // +N% means the end of the run is N% slower than the start.
+    let w_size = samples / WINDOWS;
+    let window_mean_ns = |start: usize| -> f64 {
+        let slice = &batch_ns[start..start + w_size];
+        slice.iter().sum::<u64>() as f64 / (w_size * BATCH) as f64
+    };
+    let first = window_mean_ns(0);
+    let last  = window_mean_ns(samples - w_size);
+    let drift_pct = (last - first) / first * 100.0;
+
+    let mut sorted = batch_ns;
+    sorted.sort_unstable();
+    let p50 = sorted[samples / 2] as f64 / BATCH as f64;
+    let p99 = sorted[samples * 99 / 100] as f64 / BATCH as f64;
+    println!("{:<35} {:>10.2} {:>10.2} {:>10.2} {:>+10.2} {:>12}",
+             name, mean, p50, p99, drift_pct, ops as u64);
 }
 
 /// Run the sparse scenario: Hub with `n` ports, `active` ports firing
@@ -64,9 +86,10 @@ fn bench_sparse(name: &str, n: usize, active: usize) {
 
     for b in 0..WARMUP { do_batch((b * BATCH) as u64); }
 
-    let mut lats = Vec::with_capacity(ROUNDS);
+    let n = rounds();
+    let mut lats = Vec::with_capacity(n);
     let t_wall = Instant::now();
-    for b in 0..ROUNDS {
+    for b in 0..n {
         let t0 = Instant::now();
         do_batch((b * BATCH) as u64);
         lats.push(t0.elapsed().as_nanos() as u64);
@@ -76,7 +99,9 @@ fn bench_sparse(name: &str, n: usize, active: usize) {
 
 fn main() {
     println!("=== Hub sparse-drain overhead ===");
-    println!("BATCH={} rounds={} (single-thread, try_recv_batch)", BATCH, ROUNDS);
+    println!("BATCH={} rounds={} windows={} (single-thread, try_recv_batch)",
+             BATCH, rounds(), WINDOWS);
+    println!("Tune with: BENCH_ROUNDS=<n> (e.g. 500 = snapshot, 100000 = drift)");
 
     header();
     bench_sparse("N=1,  active=1  (baseline)",   1,  1);
