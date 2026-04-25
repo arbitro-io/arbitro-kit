@@ -52,6 +52,7 @@ state (used internally by `Ring` and `Mpmc`):
 | `Channel<Req, Resp>` | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
 | `Hub<In, Out>` | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
 | `Mpmc<T, RING_CAP>` | M:N sharded channel (N × `SignalSet` + M×N SPSC mini-rings) | high-throughput broker: M producers → N consumers with batched send | [mpmc.md](docs/mpmc.md) |
+| `Stream<T>`  | SPSC unbounded sequenced log (linked segments + `Park`) | fire-and-forget producer + `Receipt`-based delivery verification (3.5 ns/RT batched) | [stream.md](docs/stream.md) |
 
 ### Quick fragments
 
@@ -239,6 +240,9 @@ cargo bench --bench ring_vs_crossbeam    # SPSC apples-to-apples vs crossbeam
 cargo bench --bench hub_sparse           # Hub drain on sparse-bit fan-in
 cargo bench --bench hub_multibit         # Hub drain on multi-bit fan-in
 cargo bench --bench ring_byo_atomic      # Ring with `Signal::from_bit` BYO-atomic
+cargo bench --bench stream_overhead      # Stream send / send_iter / ack-RTT / lockstep
+cargo bench --bench rpc_patterns         # lockstep / busy-spin / batched / buffered / ack-RTT
+cargo bench --bench ring_vs_disruptor    # Ring vs LMAX-port disruptor SPSC
 ```
 
 For publication-grade numbers on Linux, pin the producer/consumer
