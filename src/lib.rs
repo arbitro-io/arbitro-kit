@@ -20,3 +20,4 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod gate;
+pub mod stream;

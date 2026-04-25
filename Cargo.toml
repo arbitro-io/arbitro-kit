@@ -15,6 +15,7 @@ readme = "README.md"
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 crossbeam-utils = "0.8"
+disruptor = "4.1"
 
 [[bench]]
 name = "signal_compare"
@@ -70,6 +71,18 @@ harness = false
 
 [[bench]]
 name = "ring_vs_crossbeam"
+harness = false
+
+[[bench]]
+name = "ring_vs_disruptor"
+harness = false
+
+[[bench]]
+name = "rpc_patterns"
+harness = false
+
+[[bench]]
+name = "stream_overhead"
 harness = false
 
 [profile.release]
