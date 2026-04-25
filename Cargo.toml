@@ -56,6 +56,10 @@ harness = false
 name = "ring_byo_atomic"
 harness = false
 
+[[bench]]
+name = "hub_sparse"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
