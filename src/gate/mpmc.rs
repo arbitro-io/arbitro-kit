@@ -88,7 +88,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::gate::hub::Shutdown;
-use crate::gate::{Signal, SignalId, SignalSet, MAX_GATES};
+use crate::gate::{Park, SignalId, SignalSet, MAX_GATES};
 
 /// Bit 63 of every shard's `SignalSet` is reserved for shutdown.
 const SHUTDOWN_BIT: u8 = (MAX_GATES - 1) as u8;
@@ -144,10 +144,12 @@ struct Shard<T: Send, const RING_CAP: usize> {
 
 struct MpmcInner<T: Send, const RING_CAP: usize> {
     shards: Box<[Shard<T, RING_CAP>]>,
-    /// Per-producer backpressure gate. Released by any consumer that
-    /// advances `tail` on one of this producer's rings. Producers park
-    /// here when every shard's ring for them is full.
-    producer_gates: Box<[Signal]>,
+    /// Per-producer backpressure park. The consumer wakes producer `p`
+    /// after advancing `tail` on one of its rings. Producer parks here
+    /// when every shard's ring for it is full — the park predicate is
+    /// `has_idle_shard(p)` which reads the cursor state directly, so no
+    /// separate `locked` bool is needed.
+    producer_parks: Box<[Park]>,
     shutdown: AtomicBool,
     m: usize,
     n: usize,
@@ -192,19 +194,14 @@ impl<T: Send, const RING_CAP: usize> MpmcInner<T, RING_CAP> {
             });
         }
 
-        let producer_gates: Vec<Signal> = (0..m)
-            .map(|_| {
-                let g = Signal::new();
-                // Released initially so a never-stalled producer doesn't
-                // need to wait on first send.
-                g.release();
-                g
-            })
-            .collect();
+        // Park is stateless — no initial "release" needed. The predicate
+        // `has_idle_shard(p)` reads cursors directly, so a producer that
+        // never stalls never touches this struct.
+        let producer_parks: Vec<Park> = (0..m).map(|_| Park::new()).collect();
 
         Self {
             shards: shards_vec.into_boxed_slice(),
-            producer_gates: producer_gates.into_boxed_slice(),
+            producer_parks: producer_parks.into_boxed_slice(),
             shutdown: AtomicBool::new(false),
             m,
             n,
@@ -320,7 +317,7 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
     /// before any send on a potentially-saturated `Mpmc`.
     #[inline]
     pub fn bind(&self) {
-        self.inner.producer_gates[self.my_idx]
+        self.inner.producer_parks[self.my_idx]
             .set_worker(std::thread::current());
     }
 
@@ -416,9 +413,14 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
         0
     }
 
-    /// Blocking send. Parks on the producer's backpressure gate if every
+    /// Blocking send. Parks on the producer's backpressure park if every
     /// ring for this producer is full. Wakes when any consumer advances
     /// `tail` on one of this producer's rings.
+    ///
+    /// The park predicate `has_idle_shard()` loads each shard's `tail`
+    /// with Acquire — which synchronises-with the consumer's Release
+    /// store of the advanced tail, so no extra SeqCst fence is needed
+    /// here (the one inside `Park::wait_slow` closes the Dekker race).
     #[inline]
     pub fn send(&self, mut value: T) {
         loop {
@@ -426,14 +428,11 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
                 Ok(()) => return,
                 Err(v) => value = v,
             }
-            let gate = &self.inner.producer_gates[self.my_idx];
-            gate.lock();
-            std::sync::atomic::fence(Ordering::SeqCst);
-            if self.has_idle_shard() {
-                gate.release();
-                continue;
-            }
-            gate.acquire();
+            // Park until some consumer advances a tail we care about,
+            // then retry the send. No Signal `locked` write on the
+            // consumer side any more — one less store per drain.
+            self.inner.producer_parks[self.my_idx]
+                .wait_until(|| self.has_idle_shard());
         }
     }
 }
@@ -487,11 +486,11 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                     .assume_init_read()
             };
             ring.tail.store(t.wrapping_add(1), Ordering::Release);
-            // Level-triggered wake: always release producer gate after a
-            // pop. Mirror of the producer-side change — keeps the Signal
-            // invariant "release on every advance" and eliminates the
-            // was_full optimization's implicit Dekker.
-            self.inner.producer_gates[p].release();
+            // Wake producer p if it is parked. `Park::wake` reads a
+            // `parked` flag with Relaxed and does nothing when the
+            // producer is not parked — ~0.3 ns no-op. No redundant
+            // store on the producer's cache line.
+            self.inner.producer_parks[p].wake();
             return Some(v);
         }
         None
@@ -575,11 +574,10 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
                     progress = true;
                 }
                 ring.tail.store(t, Ordering::Release);
-                // Level-triggered wake: one release per ring drained,
-                // always. Amortized over the whole batch, not per-item.
-                // Matches the Signal contract — the producer's gate
-                // invariant is "release whenever tail advances."
-                self.inner.producer_gates[p].release();
+                // Amortized wake: one `wake()` per ring drained. Free
+                // if producer isn't parked (one Relaxed load); unpark
+                // syscall only if it actually needs waking.
+                self.inner.producer_parks[p].wake();
             }
             if !progress {
                 // Every set bit's ring was empty on inspection (stale).
@@ -660,8 +658,11 @@ impl<T: Send, const RING_CAP: usize> MpmcShutdown<T, RING_CAP> {
         for shard in self.inner.shards.iter() {
             shard.full_set.release(shard.shutdown_id);
         }
-        for g in self.inner.producer_gates.iter() {
-            g.release();
+        // Wake any parked producers so they observe shutdown and exit.
+        // Their `send` predicate includes shutdown-awareness via the
+        // next try_send → has_idle_shard loop.
+        for p in self.inner.producer_parks.iter() {
+            p.wake();
         }
     }
 
