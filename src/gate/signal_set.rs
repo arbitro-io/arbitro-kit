@@ -29,7 +29,9 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Maximum number of gates a `SignalSet` can host.
+/// Maximum number of gates a `SignalSet` can host with the legacy
+/// (mask: u64) API. Sets with more than 64 bits must be created via
+/// [`SignalSet::with_capacity`] and use chunk-aware methods.
 pub const MAX_GATES: usize = 64;
 
 /// Handle for a gate registered in a `SignalSet`. Cheap to `Copy`.
@@ -65,9 +67,11 @@ pub const DEFAULT_SPIN_ITERS: u32 = 512;
 
 #[repr(align(64))]
 pub struct SignalSet {
-    /// Bit `i` set = gate `i` is open. Read with `Acquire`, mutated with
-    /// `fetch_or(Release)` / `fetch_and(Relaxed)`.
-    state: AtomicU64,
+    /// Chunked bitmap. `chunks[c]` bit `b` = gate `c*64 + b` is open. Read
+    /// with `Acquire`, mutated with `fetch_or(Release)` / `fetch_and(Release)`.
+    /// Default capacity is 1 chunk (64 bits) — same memory footprint as the
+    /// previous `AtomicU64` once factor in the heap pointer.
+    chunks: Box<[AtomicU64]>,
     /// Set by the consumer before parking, cleared after wake. Producers
     /// probe this flag to decide whether `unpark` is needed.
     parked: AtomicBool,
@@ -94,13 +98,30 @@ impl Default for SignalSet {
 }
 
 impl SignalSet {
-    pub const fn new() -> Self { Self::with_spin(DEFAULT_SPIN_ITERS) }
+    pub fn new() -> Self { Self::with_spin(DEFAULT_SPIN_ITERS) }
 
     /// Construct with a custom spin-iteration budget. See [`Signal::with_spin`]
     /// for semantics. 0 = always park immediately after the fast-path check.
-    pub const fn with_spin(spin_iters: u32) -> Self {
+    pub fn with_spin(spin_iters: u32) -> Self {
+        Self::with_capacity_and_spin(MAX_GATES, spin_iters)
+    }
+
+    /// Construct a SignalSet with explicit bit capacity. For `n_bits ≤ 64`
+    /// this is identical to `new()` (single AtomicU64 chunk). For larger
+    /// `n_bits`, allocates `ceil(n_bits / 64)` chunks. Mask-based methods
+    /// (`acquire_any(mask: u64)`, `lock_mask(mask: u64)`, `state()`) only
+    /// address the first chunk and remain backward-compatible for the
+    /// `≤64` case.
+    pub fn with_capacity(n_bits: usize) -> Self {
+        Self::with_capacity_and_spin(n_bits, DEFAULT_SPIN_ITERS)
+    }
+
+    fn with_capacity_and_spin(n_bits: usize, spin_iters: u32) -> Self {
+        let n_chunks = ((n_bits.max(1)) + 63) / 64;
+        let mut chunks: Vec<AtomicU64> = Vec::with_capacity(n_chunks);
+        for _ in 0..n_chunks { chunks.push(AtomicU64::new(0)); }
         Self {
-            state:   AtomicU64::new(0),
+            chunks:  chunks.into_boxed_slice(),
             parked:  AtomicBool::new(false),
             spin_iters,
             worker:  UnsafeCell::new(None),
@@ -108,6 +129,15 @@ impl SignalSet {
             next_id: UnsafeCell::new(0),
         }
     }
+
+    /// Number of `AtomicU64` chunks. `n_chunks() == 1` for the legacy
+    /// (≤64-bit) API.
+    #[inline]
+    pub fn n_chunks(&self) -> usize { self.chunks.len() }
+
+    /// Total bit capacity (= `n_chunks() * 64`).
+    #[inline]
+    pub fn capacity_bits(&self) -> usize { self.chunks.len() * 64 }
 
     /// Register a new gate. Returns its typed handle. Callable only while the
     /// set is unshared (`&mut self` enforces this at compile time).
@@ -159,10 +189,13 @@ impl SignalSet {
 
     /// Open one gate. Lock-free. Wakes the consumer iff it was parked and this
     /// call actually flipped the bit (coalesces repeated releases).
+    ///
+    /// Supports `id` in any chunk (≤ `capacity_bits()`).
     #[inline]
     pub fn release(&self, id: SignalId) {
-        let bit = id.mask();
-        let prev = self.state.fetch_or(bit, Ordering::Release);
+        let chunk = (id.0 as usize) / 64;
+        let bit = 1u64 << ((id.0 as usize) % 64);
+        let prev = self.chunks[chunk].fetch_or(bit, Ordering::Release);
         if (prev & bit) == 0 && self.parked.load(Ordering::Relaxed) {
             // Safety: `parked == true` implies the consumer's `set_worker`
             // write has happened-before.
@@ -178,44 +211,61 @@ impl SignalSet {
     ///
     /// Uses `Release` ordering so that any reads the consumer performed on
     /// payload memory (e.g. a `Hub` inbound slot) before calling `lock`
-    /// are published before the bit is cleared. Producers observing the
-    /// cleared bit via Acquire therefore see a committed consumer read.
-    /// Same cost as Relaxed on x86; one `dmb ish st` on ARM.
+    /// are published before the bit is cleared.
     #[inline]
     pub fn lock(&self, id: SignalId) {
-        self.state.fetch_and(!id.mask(), Ordering::Release);
+        let chunk = (id.0 as usize) / 64;
+        let bit = 1u64 << ((id.0 as usize) % 64);
+        self.chunks[chunk].fetch_and(!bit, Ordering::Release);
     }
 
-    /// Close every bit in `mask`. Useful to clear a subset in one op.
-    /// See [`lock`](Self::lock) for the `Release` ordering rationale.
+    /// Close every bit in `mask` (chunk 0 only — legacy API for ≤64 bits).
     #[inline]
     pub fn lock_mask(&self, mask: u64) {
-        self.state.fetch_and(!mask, Ordering::Release);
+        self.chunks[0].fetch_and(!mask, Ordering::Release);
     }
 
     /// `true` if this specific gate is open.
     #[inline]
     pub fn is_open(&self, id: SignalId) -> bool {
-        (self.state.load(Ordering::Acquire) & id.mask()) != 0
+        let chunk = (id.0 as usize) / 64;
+        let bit = 1u64 << ((id.0 as usize) % 64);
+        (self.chunks[chunk].load(Ordering::Acquire) & bit) != 0
     }
 
-    /// `true` if **any** bit in `mask` is open.
+    /// `true` if **any** bit in `mask` is open (chunk 0 only — legacy API).
     #[inline]
     pub fn any_open(&self, mask: u64) -> bool {
-        (self.state.load(Ordering::Acquire) & mask) != 0
+        (self.chunks[0].load(Ordering::Acquire) & mask) != 0
     }
 
-    /// `true` if **every** bit in `mask` is open.
+    /// `true` if **every** bit in `mask` is open (chunk 0 only — legacy API).
     #[inline]
     pub fn all_open(&self, mask: u64) -> bool {
-        let s = self.state.load(Ordering::Acquire);
+        let s = self.chunks[0].load(Ordering::Acquire);
         (s & mask) == mask
     }
 
-    /// Current raw state. Bit `i` = gate `i` open.
+    /// Current raw state of chunk 0 (legacy API for ≤64 bits).
+    /// For multi-chunk sets use [`state_chunk`](Self::state_chunk).
     #[inline]
     pub fn state(&self) -> u64 {
-        self.state.load(Ordering::Acquire)
+        self.chunks[0].load(Ordering::Acquire)
+    }
+
+    /// Raw state of a specific chunk (for `>64` bit sets).
+    #[inline]
+    pub fn state_chunk(&self, idx: usize) -> u64 {
+        self.chunks[idx].load(Ordering::Acquire)
+    }
+
+    /// `true` if any bit across ALL chunks is set.
+    #[inline]
+    pub fn any_chunk_open(&self) -> bool {
+        for c in self.chunks.iter() {
+            if c.load(Ordering::Acquire) != 0 { return true; }
+        }
+        false
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -241,12 +291,13 @@ impl SignalSet {
         self.wait_until(|s| s != 0);
     }
 
-    /// Generic spin-then-park wait. Predicate sees the raw state.
+    /// Generic spin-then-park wait over chunk 0 (legacy `u64` mask API).
+    /// For multi-chunk sets use [`Self::wait_until_chunks`].
     #[inline]
     fn wait_until(&self, pred: impl Fn(u64) -> bool) {
-        if pred(self.state.load(Ordering::Acquire)) { return; }
+        if pred(self.chunks[0].load(Ordering::Acquire)) { return; }
         for _ in 0..self.spin_iters {
-            if pred(self.state.load(Ordering::Acquire)) { return; }
+            if pred(self.chunks[0].load(Ordering::Acquire)) { return; }
             std::hint::spin_loop();
         }
         // `parked.store(true)` needs SeqCst for the same Dekker-race reason
@@ -258,7 +309,24 @@ impl SignalSet {
         self.parked.store(true, Ordering::SeqCst);
         // Recheck after setting `parked` so a release that sneaks in between
         // the spin exit and the flag store still wakes us.
-        while !pred(self.state.load(Ordering::Acquire)) {
+        while !pred(self.chunks[0].load(Ordering::Acquire)) {
+            std::thread::park();
+        }
+        self.parked.store(false, Ordering::Relaxed);
+    }
+
+    /// Block until any bit across ALL chunks is set (multi-chunk variant of
+    /// [`Self::acquire`]). For sets created via [`Self::with_capacity`] with
+    /// `n_bits > 64`, this is the correct way to park: the legacy
+    /// `acquire*(mask: u64)` only sees chunk 0.
+    pub fn acquire_any_chunk(&self) {
+        if self.any_chunk_open() { return; }
+        for _ in 0..self.spin_iters {
+            if self.any_chunk_open() { return; }
+            std::hint::spin_loop();
+        }
+        self.parked.store(true, Ordering::SeqCst);
+        while !self.any_chunk_open() {
             std::thread::park();
         }
         self.parked.store(false, Ordering::Relaxed);
