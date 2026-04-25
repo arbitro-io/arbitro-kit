@@ -6,6 +6,8 @@
 
 use std::sync::atomic::Ordering;
 
+use crate::gate::{Cancelled, Lifeline, WaiterId};
+
 use super::segment::Segment;
 use super::stream::Stream;
 
@@ -59,6 +61,35 @@ impl<T> Stream<T> {
             self.not_empty.wait_until(|| {
                 self.head_pos.load(Ordering::Relaxed)
                     < self.tail_pos.load(Ordering::Acquire)
+            });
+        }
+    }
+
+    /// Blocking dequeue with cancellation. Returns `Err(Cancelled)` if
+    /// the lifeline cancels this waiter while we are parked or before
+    /// we enter park. Otherwise behaves exactly like [`Stream::recv`].
+    ///
+    /// Performance: adopting this method costs ~1 extra atomic load
+    /// per spin iteration vs `recv()`. The plain `recv()` path is
+    /// **unchanged** — callers that don't use Lifeline pay nothing.
+    #[inline]
+    pub fn recv_or_cancel(
+        &self,
+        life: &Lifeline,
+        id: WaiterId,
+    ) -> Result<T, Cancelled> {
+        loop {
+            if let Some(v) = self.try_recv() { return Ok(v); }
+            if life.is_cancelled(id)        { return Err(Cancelled); }
+
+            // Park's predicate runs in spin and after the SeqCst
+            // `parked.store(true)`. Lifeline::cancel_* unparks the
+            // registered thread; on wake the predicate becomes true
+            // and `wait_until` returns.
+            self.not_empty.wait_until(|| {
+                self.head_pos.load(Ordering::Relaxed)
+                    < self.tail_pos.load(Ordering::Acquire)
+                    || life.is_cancelled(id)
             });
         }
     }

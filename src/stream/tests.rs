@@ -287,3 +287,76 @@ fn many_segments_then_drain_all() {
         assert_eq!(*v, i as u64);
     }
 }
+
+#[test]
+fn recv_or_cancel_returns_data_when_present() {
+    use crate::gate::Lifeline;
+    let s: Arc<Stream<u64>> = Arc::new(Stream::new());
+    let life = Arc::new(Lifeline::new());
+    s.send(7);
+    s.set_consumer(thread::current());
+    let id = life.register(thread::current());
+    assert_eq!(s.recv_or_cancel(&life, id).unwrap(), 7);
+}
+
+#[test]
+fn recv_or_cancel_aborts_when_cancelled_before_call() {
+    use crate::gate::Lifeline;
+    let s: Arc<Stream<u64>> = Arc::new(Stream::new());
+    let life = Arc::new(Lifeline::new());
+    s.set_consumer(thread::current());
+    let id = life.register(thread::current());
+    life.cancel_one(id);
+    assert!(s.recv_or_cancel(&life, id).is_err());
+}
+
+#[test]
+fn recv_or_cancel_unparks_blocked_worker() {
+    use crate::gate::Lifeline;
+    use std::time::Duration;
+    let s: Arc<Stream<u64>> = Arc::new(Stream::new());
+    let life = Arc::new(Lifeline::new());
+    let s2 = s.clone();
+    let l2 = life.clone();
+    let h = thread::spawn(move || {
+        s2.set_consumer(thread::current());
+        let id = l2.register(thread::current());
+        s2.recv_or_cancel(&l2, id)
+    });
+    thread::sleep(Duration::from_millis(30));
+    life.cancel_all();
+    let r = h.join().unwrap();
+    assert!(r.is_err());
+}
+
+#[test]
+fn recv_or_cancel_one_target_only() {
+    use crate::gate::Lifeline;
+    use std::time::Duration;
+    let s_a: Arc<Stream<u64>> = Arc::new(Stream::new());
+    let s_b: Arc<Stream<u64>> = Arc::new(Stream::new());
+    let life = Arc::new(Lifeline::new());
+
+    let sa = s_a.clone(); let la = life.clone();
+    let h_a = thread::spawn(move || {
+        sa.set_consumer(thread::current());
+        let id = la.register(thread::current());
+        sa.recv_or_cancel(&la, id).map(|_| ()).map_err(|_| ())
+    });
+    let sb = s_b.clone(); let lb = life.clone();
+    let h_b = thread::spawn(move || {
+        sb.set_consumer(thread::current());
+        let id = lb.register(thread::current());
+        sb.recv_or_cancel(&lb, id)
+    });
+
+    thread::sleep(Duration::from_millis(30));
+
+    // Cancel only worker 0.
+    life.cancel_one(crate::gate::WaiterId(0));
+    let _ = h_a.join().unwrap();   // Worker A returns Err.
+
+    // Worker B is still parked. Send data → returns Ok.
+    s_b.send(42);
+    assert_eq!(h_b.join().unwrap().unwrap(), 42);
+}

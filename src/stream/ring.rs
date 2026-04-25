@@ -273,6 +273,25 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         }
     }
 
+    /// Blocking dequeue with cancellation. Returns `Err(Cancelled)` if
+    /// the lifeline cancels this waiter while we are parked or before
+    /// we enter park. Otherwise behaves exactly like [`Ring::recv`].
+    ///
+    /// The plain [`Ring::recv`] path is unchanged — adopting Lifeline
+    /// costs nothing for callers that don't use it.
+    #[inline]
+    pub fn recv_or_cancel(
+        &self,
+        life: &crate::gate::Lifeline,
+        id: crate::gate::WaiterId,
+    ) -> Result<T, crate::gate::Cancelled> {
+        loop {
+            if let Some(v) = self.try_recv() { return Ok(v); }
+            if life.is_cancelled(id)        { return Err(crate::gate::Cancelled); }
+            self.not_empty.wait_until(|| !self.is_empty() || life.is_cancelled(id));
+        }
+    }
+
     /// Non-blocking batch enqueue. Moves up to
     /// `n = min(src.len(), free_slots)` items from the front of `src`
     /// into the ring, in FIFO order. Returns `n`. The drained prefix is

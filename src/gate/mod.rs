@@ -25,10 +25,12 @@
 //! one consumer thread may call `acquire*` (enforced by a single parked
 //! `Thread` handle registered via `set_worker`).
 
+mod lifeline;
 mod park;
 mod signal;
 mod signal_set;
 
+pub use lifeline::{Cancelled, Lifeline, WaiterId, MAX_WAITERS};
 pub use park::Park;
 pub use signal::{BitView, BoolView, OwnedBool, Signal, SignalSource, DEFAULT_SPIN_ITERS};
 pub use signal_set::{SignalId, SignalSet, MAX_GATES};

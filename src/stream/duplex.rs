@@ -122,6 +122,18 @@ impl<S, R> DuplexEnd<S, R> {
         self.inbox.recv()
     }
 
+    /// Blocking receive with cancellation. Returns `Err(Cancelled)` if
+    /// the lifeline fires before data arrives. Plain `recv()` is
+    /// unchanged.
+    #[inline]
+    pub fn recv_or_cancel(
+        &self,
+        life: &crate::gate::Lifeline,
+        id: crate::gate::WaiterId,
+    ) -> Result<R, crate::gate::Cancelled> {
+        self.inbox.recv_or_cancel(life, id)
+    }
+
     /// Drain up to `max` items into `buf`. Non-blocking.
     pub fn recv_bulk(&self, buf: &mut Vec<R>, max: usize) -> usize {
         self.inbox.recv_bulk(buf, max)

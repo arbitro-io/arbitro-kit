@@ -57,6 +57,7 @@ by what's under the hood:
 | `Signal`     | gate   | single-bit M:1 signal                     | the primitive itself; BYO-atomic via `from_bool` / `from_bit`        | [signal.md](docs/signal.md) |
 | `Park`       | gate   | stateless park/unpark                     | wait on caller-owned readiness state (no duplicated `AtomicBool`)   | (used by `Ring`, `Mpmc`) |
 | `SignalSet`  | gate   | up to 64 bits in one `AtomicU64`          | wait for any / all / subset of named signals                        | [signalset.md](docs/signalset.md) |
+| `Lifeline`   | gate   | up to 64 indexed waiters, fire-and-forget | external cancellation: `cancel_one` / `cancel_mask` / `cancel_all`; `recv_or_cancel` opt-in across transports (+0.7 ns vs baseline) | [lifeline.md](docs/lifeline.md) |
 | `Pipe<T, H>` | slot   | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks             | [pipe.md](docs/pipe.md) |
 | `Channel<Req, Resp>` | slot | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
 | `Ring<T, CAP>` | stream | SPSC bounded ring (2 × `Park`)          | burst absorption, pipelined throughput, batch send + batch ack      | [ring.md](docs/ring.md) |
@@ -283,6 +284,10 @@ Shipped today:
 - [x] `Duplex<A, B>` — bidirectional unbounded SPSC over two `Stream`s
       with type-safe direction; built on `strict_wake` so 1M-scale
       lockstep RPC is deadlock-free
+- [x] `Lifeline` — fire-and-forget cancellation scope (up to 64 waiters
+      per scope), with `recv_or_cancel` on `Stream` / `Ring` / `Duplex`;
+      opt-in (+0.7 ns vs baseline `recv`), zero impact on existing
+      `recv()` callers
 
 Next:
 
