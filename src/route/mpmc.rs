@@ -349,6 +349,72 @@ impl<T: Send, const RING_CAP: usize> MpmcProducer<T, RING_CAP> {
         false
     }
 
+    // ── Capacity introspection (snapshot, non-consistent) ────────────────
+    //
+    // These methods return a point-in-time view of available space and
+    // pending fill. The result is **not** linearizable — a peer thread may
+    // push or drain between when the snapshot is taken and when the caller
+    // acts on it. Use for metrics, heuristic backpressure, and saturation
+    // alerts; never as a correctness gate. The send-or-fail decision must
+    // still go through `try_send` / `try_send_batch`.
+    //
+    // Cost: 2 atomic loads (Acquire + Relaxed) per shard scanned. Hot-path
+    // operations (`try_send`, `recv_batch`) are unaffected.
+
+    /// Per-shard ring capacity for any producer (compile-time constant).
+    /// Equivalent to the type-level `RING_CAP`.
+    #[inline]
+    pub const fn capacity_per_shard(&self) -> usize { RING_CAP }
+
+    /// Total slot capacity reachable from this producer = `N × RING_CAP`,
+    /// where `N` is the consumer count.
+    #[inline]
+    pub fn total_capacity(&self) -> usize {
+        self.inner.n * RING_CAP
+    }
+
+    /// Free slots in shard `s` for this producer. Returns `RING_CAP - len`
+    /// where `len = head - tail`. Saturates at 0 (never negative).
+    ///
+    /// # Panics
+    /// If `s >= N`.
+    #[inline]
+    pub fn available_in_shard(&self, s: usize) -> usize {
+        let ring = &self.inner.shards[s].rings[self.my_idx];
+        let h = ring.head.load(Ordering::Relaxed);
+        let t = ring.tail.load(Ordering::Acquire);
+        let used = h.wrapping_sub(t);
+        RING_CAP.saturating_sub(used)
+    }
+
+    /// Total free slots across all shards for this producer. Sum of
+    /// `available_in_shard(s)` for `s in 0..N`. Cost: `2N` atomic loads.
+    #[inline]
+    pub fn available(&self) -> usize {
+        let mut total = 0;
+        for s in 0..self.inner.n {
+            let ring = &self.inner.shards[s].rings[self.my_idx];
+            let h = ring.head.load(Ordering::Relaxed);
+            let t = ring.tail.load(Ordering::Acquire);
+            let used = h.wrapping_sub(t);
+            total += RING_CAP.saturating_sub(used);
+        }
+        total
+    }
+
+    /// Pending items in shard `s` from this producer = `head - tail`.
+    /// Useful for symmetry with `available_in_shard`.
+    ///
+    /// # Panics
+    /// If `s >= N`.
+    #[inline]
+    pub fn pending_in_shard(&self, s: usize) -> usize {
+        let ring = &self.inner.shards[s].rings[self.my_idx];
+        let h = ring.head.load(Ordering::Acquire);
+        let t = ring.tail.load(Ordering::Relaxed);
+        h.wrapping_sub(t)
+    }
+
     /// Non-blocking send. Scans shards from the adaptive cursor, writes
     /// into the first ring that isn't full, advances the cursor. Returns
     /// `Err(value)` if every ring for this producer is full.
@@ -473,6 +539,79 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
         self.inner.shards[self.shard_idx]
             .full_set
             .set_worker(std::thread::current());
+    }
+
+    // ── Capacity introspection (snapshot, non-consistent) ────────────────
+    //
+    // Same caveat as the producer-side methods: snapshot only, not a
+    // correctness gate. Useful for `pending` gauges and saturation
+    // alarms. Hot-path drain (`recv` / `recv_batch`) is unaffected.
+
+    /// Per-producer ring capacity (compile-time constant).
+    #[inline]
+    pub const fn capacity_per_producer(&self) -> usize { RING_CAP }
+
+    /// Total slot capacity feeding this consumer = `M × RING_CAP`.
+    #[inline]
+    pub fn total_capacity(&self) -> usize {
+        self.inner.m * RING_CAP
+    }
+
+    /// Pending items currently sitting in this shard's rings, summed
+    /// across all `M` producers. Cost: `2M` atomic loads.
+    #[inline]
+    pub fn pending(&self) -> usize {
+        let shard = &self.inner.shards[self.shard_idx];
+        let m = self.inner.m;
+        let mut total = 0;
+        for p in 0..m {
+            let ring = &shard.rings[p];
+            let h = ring.head.load(Ordering::Acquire);
+            let t = ring.tail.load(Ordering::Relaxed);
+            total += h.wrapping_sub(t);
+        }
+        total
+    }
+
+    /// Free slots across this shard's rings, summed across all `M`
+    /// producers. Cost: `2M` atomic loads.
+    #[inline]
+    pub fn available(&self) -> usize {
+        let shard = &self.inner.shards[self.shard_idx];
+        let m = self.inner.m;
+        let mut total = 0;
+        for p in 0..m {
+            let ring = &shard.rings[p];
+            let h = ring.head.load(Ordering::Relaxed);
+            let t = ring.tail.load(Ordering::Acquire);
+            let used = h.wrapping_sub(t);
+            total += RING_CAP.saturating_sub(used);
+        }
+        total
+    }
+
+    /// Pending items from a specific producer in this shard.
+    ///
+    /// # Panics
+    /// If `p >= M`.
+    #[inline]
+    pub fn pending_from(&self, p: usize) -> usize {
+        let ring = &self.inner.shards[self.shard_idx].rings[p];
+        let h = ring.head.load(Ordering::Acquire);
+        let t = ring.tail.load(Ordering::Relaxed);
+        h.wrapping_sub(t)
+    }
+
+    /// Cheap fast-path: any producer's ring has data on this shard?
+    /// Single Acquire load per chunk + chunk-mask AND. O(chunks), not O(M).
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        let shard = &self.inner.shards[self.shard_idx];
+        for c in 0..shard.full_mask_chunks.len() {
+            let state = shard.full_set.state_chunk(c) & shard.full_mask_chunks[c];
+            if state != 0 { return true; }
+        }
+        false
     }
 
     /// Non-blocking single-item take. Reads one item from the first ring
@@ -945,6 +1084,47 @@ mod tests {
         }
         assert_eq!(sum, expected);
         assert_eq!(got, total);
+    }
+
+    #[test]
+    fn capacity_introspection_reports_correct_state() {
+        // 2 producers × 3 shards × RING_CAP=8 = 24 slot total per producer,
+        // 16 slots per shard from the consumer side.
+        let (mut ps, mut cs, _sd) = Mpmc::<u32, 8>::new(2, 3);
+        let p0 = ps.remove(0);
+        let p1 = ps.remove(0);
+
+        // Consumers: shard 0 / 1 / 2.
+        let c0 = cs.remove(0);
+        let c1 = cs.remove(0);
+        let c2 = cs.remove(0);
+
+        // Pristine state.
+        assert_eq!(p0.capacity_per_shard(), 8);
+        assert_eq!(p0.total_capacity(), 24);
+        assert_eq!(p0.available(), 24);
+        assert_eq!(p0.pending_in_shard(0), 0);
+
+        assert_eq!(c0.capacity_per_producer(), 8);
+        assert_eq!(c0.total_capacity(), 16);
+        assert_eq!(c0.pending(), 0);
+        assert_eq!(c0.available(), 16);
+        assert_eq!(c0.has_pending(), false);
+
+        // Push from p0 — adaptive routing fills shards in order.
+        for v in 0..5u32 { p0.try_send(v).unwrap(); }
+        assert_eq!(p0.available(), 24 - 5);
+        // Some consumer now has pending from p0.
+        let pending_from_p0 = c0.pending_from(0) + c1.pending_from(0) + c2.pending_from(0);
+        assert_eq!(pending_from_p0, 5);
+
+        // Push from p1 — independent counters.
+        p1.try_send(1000).unwrap();
+        assert_eq!(p1.available(), 24 - 1);
+
+        // has_pending fast-path is true on whichever shard got a value.
+        let any_has = c0.has_pending() || c1.has_pending() || c2.has_pending();
+        assert!(any_has);
     }
 
     #[test]
