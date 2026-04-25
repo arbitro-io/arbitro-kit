@@ -45,20 +45,25 @@ impl SignalId {
     /// Construct a `SignalId` from a raw index. Exposed for tests and for
     /// users who prefer compile-time `const` ids over runtime `create`.
     ///
-    /// # Panics
-    /// Panics at compile-time (when used in `const`) or runtime if
-    /// `idx >= MAX_GATES`.
-    pub const fn new(idx: u8) -> Self {
-        assert!((idx as usize) < MAX_GATES, "SignalId index out of range");
-        Self(idx)
-    }
+    /// `SignalId` is `u8`-typed, capping the index at 255. The legacy
+    /// `mask()` API only makes sense for `idx < 64` (chunk 0); higher
+    /// indices are valid for chunk-aware methods (`release`, `lock`,
+    /// `is_open`) on a `SignalSet` built with [`SignalSet::with_capacity`].
+    pub const fn new(idx: u8) -> Self { Self(idx) }
 
     #[inline]
     pub const fn index(self) -> u8 { self.0 }
 
     /// Bit mask with only this gate's bit set.
+    ///
+    /// # Panics
+    /// `idx >= 64`. The mask-based API is chunk-0 only; for higher
+    /// indices use the chunk-aware methods directly.
     #[inline]
-    pub const fn mask(self) -> u64 { 1u64 << self.0 }
+    pub const fn mask(self) -> u64 {
+        assert!((self.0 as usize) < 64, "SignalId::mask: only valid for idx < 64");
+        1u64 << self.0
+    }
 }
 
 /// Default spin iterations before parking. Same rationale as
@@ -82,9 +87,10 @@ pub struct SignalSet {
     /// `parked == true`.
     worker: UnsafeCell<Option<std::thread::Thread>>,
     /// Optional debug names, indexed by `SignalId.0`. Never read in hot path.
-    names: UnsafeCell<[Option<&'static str>; MAX_GATES]>,
+    /// Sized to `capacity_bits()` at construction.
+    names: UnsafeCell<Vec<Option<&'static str>>>,
     /// Next free slot for `create()`. Mutated only pre-share via `&mut self`.
-    next_id: UnsafeCell<u8>,
+    next_id: UnsafeCell<u32>,
 }
 
 // Safety: `worker` / `names` / `next_id` obey the same discipline as
@@ -118,14 +124,16 @@ impl SignalSet {
 
     fn with_capacity_and_spin(n_bits: usize, spin_iters: u32) -> Self {
         let n_chunks = ((n_bits.max(1)) + 63) / 64;
+        let cap_bits = n_chunks * 64;
         let mut chunks: Vec<AtomicU64> = Vec::with_capacity(n_chunks);
         for _ in 0..n_chunks { chunks.push(AtomicU64::new(0)); }
+        let names: Vec<Option<&'static str>> = vec![None; cap_bits];
         Self {
             chunks:  chunks.into_boxed_slice(),
             parked:  AtomicBool::new(false),
             spin_iters,
             worker:  UnsafeCell::new(None),
-            names:   UnsafeCell::new([None; MAX_GATES]),
+            names:   UnsafeCell::new(names),
             next_id: UnsafeCell::new(0),
         }
     }
@@ -143,15 +151,18 @@ impl SignalSet {
     /// set is unshared (`&mut self` enforces this at compile time).
     ///
     /// # Panics
-    /// Panics if more than [`MAX_GATES`] are registered.
+    /// Panics if `capacity_bits()` gates have already been registered, or if
+    /// the next index would exceed `u8::MAX` (the `SignalId` representation).
     pub fn create(&mut self, name: &'static str) -> SignalId {
         // Safety: `&mut self` guarantees exclusive access; no concurrent reads.
         let id = unsafe {
             let next = &mut *self.next_id.get();
-            assert!((*next as usize) < MAX_GATES, "SignalSet: MAX_GATES exceeded");
-            let id = *next;
+            let cap = self.chunks.len() * 64;
+            assert!((*next as usize) < cap, "SignalSet: capacity_bits exceeded");
+            assert!(*next < 256, "SignalSet: SignalId is u8; max 256 gates");
+            let id = *next as u8;
             *next += 1;
-            (*self.names.get())[id as usize] = Some(name);
+            (&mut *self.names.get())[id as usize] = Some(name);
             id
         };
         SignalId(id)
@@ -162,7 +173,7 @@ impl SignalSet {
         // Safety: `names` is only mutated through `&mut self`; here we only
         // read, which is sound as long as `create` is not in flight — which
         // `&mut self` rules out anyway.
-        unsafe { (*self.names.get())[id.0 as usize] }
+        unsafe { (&*self.names.get()).get(id.0 as usize).copied().flatten() }
     }
 
     /// Look up a `SignalId` by its registered name. O(N) over registered gates.
@@ -177,6 +188,14 @@ impl SignalSet {
             }
         }
         None
+    }
+
+    /// Number of gates registered so far via `create()`.
+    #[inline]
+    pub fn registered(&self) -> usize {
+        // Safety: `next_id` is mutated only through `&mut self` (pre-share);
+        // a Relaxed read is sufficient post-share since registration is done.
+        unsafe { *self.next_id.get() as usize }
     }
 
     /// Register the consumer thread. Must be called before the set is shared
@@ -223,6 +242,14 @@ impl SignalSet {
     #[inline]
     pub fn lock_mask(&self, mask: u64) {
         self.chunks[0].fetch_and(!mask, Ordering::Release);
+    }
+
+    /// Close every bit in `mask` for a specific chunk. Multi-chunk variant
+    /// of [`Self::lock_mask`] — used by chunked consumers (`Mpmc`) when the
+    /// full producer mask spans more than 64 bits.
+    #[inline]
+    pub fn lock_chunk_mask(&self, chunk: usize, mask: u64) {
+        self.chunks[chunk].fetch_and(!mask, Ordering::Release);
     }
 
     /// `true` if this specific gate is open.

@@ -56,7 +56,7 @@ by what's under the hood:
 | :----------- | :----- | :---------------------------------------- | :------------------------------------------------------------------ | :--- |
 | `Signal`     | gate   | single-bit M:1 signal                     | the primitive itself; BYO-atomic via `from_bool` / `from_bit`        | [signal.md](docs/signal.md) |
 | `Park`       | gate   | stateless park/unpark                     | wait on caller-owned readiness state (no duplicated `AtomicBool`)   | (used by `Ring`, `Mpmc`) |
-| `SignalSet`  | gate   | up to 64 bits in one `AtomicU64`          | wait for any / all / subset of named signals                        | [signalset.md](docs/signalset.md) |
+| `SignalSet`  | gate   | up to 256 bits over a chunked `Box<[AtomicU64]>` | wait for any / all / subset of named signals; ≤64-bit case stays a single `AtomicU64` | [signalset.md](docs/signalset.md) |
 | `Lifeline`   | gate   | up to 64 indexed waiters, fire-and-forget | external cancellation: `cancel_one` / `cancel_mask` / `cancel_all`; `recv_or_cancel` opt-in across transports (+0.7 ns vs baseline) | [lifeline.md](docs/lifeline.md) |
 | `Pipe<T, H>` | slot   | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks             | [pipe.md](docs/pipe.md) |
 | `Channel<Req, Resp>` | slot | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
@@ -103,10 +103,15 @@ Max 63 ports; shard across multiple Hubs for higher throughput.
 ~33 ns p50 (`8P/1C`) and ~22 ns p50 (`8P/8C`). With the `try_send_batch`
 path amortizing one `fetch_or` over up to `RING_CAP` items:
 **0.74 ns/op p50 at `8P/8C` → ~1.03 G ops/sec, 116× faster than
-`crossbeam::channel::bounded(1024)` at the same shape**. Level-triggered
-bits mean the Signal contract is honored — a stray `lock_mask` can
-never strand a pending message. Drop-safe, shutdown-safe,
-backpressure per producer. [→ mpmc.md](docs/mpmc.md)
+`crossbeam::channel::bounded(1024)` at the same shape**. Supports
+**`M ≤ 255` producers** via a chunked `SignalSet` — the shard bitmap
+grows from one to four `AtomicU64` chunks as needed, with one
+Acquire load per chunk on the drain scan. Beats `tokio::mpsc` by
+**2.15×–2.33× sustained** in TCP-loaded broker benches from `M = 16`
+to `M = 150`. Level-triggered bits mean the Signal contract is
+honored — a stray `lock_mask` can never strand a pending message.
+Drop-safe, shutdown-safe, backpressure per producer.
+[→ mpmc.md](docs/mpmc.md)
 
 **`Stream<T>`** — SPSC unbounded sequenced log. **3.0 ns/op
 cross-thread** send (per-item, no backpressure check), **2.9 ns/op**
@@ -268,7 +273,9 @@ its own outbound by mistake.
 Shipped today:
 
 - [x] `Signal` — M:1 single-bit signal with Dekker-safe park
-- [x] `SignalSet` — up to 64 coalesced signals in one `AtomicU64`
+- [x] `SignalSet` — up to 256 coalesced signals over a chunked
+      `Box<[AtomicU64]>`; the `≤64`-bit case still uses a single
+      `AtomicU64` chunk with zero measurable overhead
 - [x] `Pipe<T, H>` — SPSC single-slot with zero-cost observer hook
 - [x] `Ring<T, CAP>` — SPSC bounded ring with batch send + batch ack,
       panic-safe, payload-sweep-documented
@@ -277,7 +284,9 @@ Shipped today:
 - [x] `Hub<In, Out>` — N:1 multiplexer with per-port reply + shutdown
 - [x] `Mpmc<T, RING_CAP>` — M:N sharded channel with per-(producer,shard)
       mini-rings, level-triggered bits, batched `try_send_batch` path,
-      panic-safe Drop, built-in shutdown
+      panic-safe Drop, built-in shutdown; supports `M ≤ 255` producers
+      via the chunked `SignalSet`, 2× sustained over `tokio::mpsc` in
+      TCP-loaded broker benches up to `M = 150`
 - [x] `Stream<T>` — SPSC unbounded sequenced log with `Receipt`-based
       delivery verification; `BufferedSender` accumulator; opt-in
       `strict_wake` mode for bidirectional patterns

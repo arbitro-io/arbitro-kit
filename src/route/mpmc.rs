@@ -75,8 +75,13 @@
 //!
 //! ## Limits
 //!
-//! - `M ≤ 63` producers (bit 63 of every shard's `SignalSet` is reserved
-//!   for [`MpmcShutdown`]).
+//! - `M ≤ 255` producers. The shard's `SignalSet` is sized to `M+1` bits
+//!   (one extra reserved for [`MpmcShutdown`]). For `M ≤ 63` the bitmap
+//!   fits in a single `AtomicU64` chunk; for higher `M` the SignalSet
+//!   transparently uses a chunked `Box<[AtomicU64]>` and the consumer
+//!   walks chunks during drain. Hot-path cost per chunk is one `Acquire`
+//!   load — at `M = 255` (4 chunks) the drain scan is still 4 loads
+//!   regardless of how many bits are set.
 //! - `N ≥ 1`, no upper bound (runtime-sized).
 //! - `M == 0` or `N == 0` is rejected.
 //! - `RING_CAP` must be a power of two ≥ 1.
@@ -87,15 +92,12 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::gate::{Park, SignalId, SignalSet, MAX_GATES};
+use crate::gate::{Park, SignalId, SignalSet};
 use crate::route::hub::Shutdown;
 
-/// Bit 63 of every shard's `SignalSet` is reserved for shutdown.
-const SHUTDOWN_BIT: u8 = (MAX_GATES - 1) as u8;
-
-/// Maximum number of producers in an [`Mpmc`]. One bit per shard is
-/// reserved for [`MpmcShutdown`], so this is `MAX_GATES - 1 = 63`.
-pub const MAX_MPMC_PRODUCERS: usize = MAX_GATES - 1;
+/// Maximum number of producers in an [`Mpmc`]. Limited by the `u8` index
+/// in `SignalId` minus one bit reserved for [`MpmcShutdown`], so `255`.
+pub const MAX_MPMC_PRODUCERS: usize = 255;
 
 // ─── Per-(producer, shard) mini-Ring (SPSC) ───────────────────────────────
 
@@ -130,13 +132,16 @@ impl<T: Send, const RING_CAP: usize> PRing<T, RING_CAP> {
 // ─── Shard ────────────────────────────────────────────────────────────────
 
 struct Shard<T: Send, const RING_CAP: usize> {
-    /// Bit `p` = "ring[p] possibly has data". Bit 63 = shutdown.
+    /// Bit `p` = "ring[p] possibly has data". Bit `m` = shutdown.
     /// Cleared only at consumer-park time (with Dekker recheck).
+    /// SignalSet has `ceil((m+1)/64)` chunks; for `m ≤ 63` that is 1.
     full_set: SignalSet,
     /// `rings[p]` owned by producer `p`.
     rings: Box<[PRing<T, RING_CAP>]>,
-    /// Cached mask covering bits `0..m` (excludes shutdown bit).
-    full_mask: u64,
+    /// Per-chunk mask covering producer bits `0..m` only (shutdown bit
+    /// excluded). `full_mask_chunks[c]` is the bitmask of producer bits
+    /// inside chunk `c`. Length = `full_set.n_chunks()`.
+    full_mask_chunks: Box<[u64]>,
     shutdown_id: SignalId,
 }
 
@@ -173,23 +178,32 @@ impl<T: Send, const RING_CAP: usize> MpmcInner<T, RING_CAP> {
 
         let mut shards_vec = Vec::with_capacity(n);
         for s in 0..n {
-            let mut full_set = SignalSet::new();
+            // m producers + 1 shutdown bit. SignalSet rounds up to chunks.
+            let mut full_set = SignalSet::with_capacity(m + 1);
             for p in 0..m {
                 let name: &'static str =
                     Box::leak(format!("mpmc_s{s}_p{p}").into_boxed_str());
                 let _ = full_set.create(name);
             }
-            let shutdown_id = SignalId::new(SHUTDOWN_BIT);
+            // Shutdown is registered last → bit `m`.
+            let shutdown_name: &'static str =
+                Box::leak(format!("mpmc_s{s}_shutdown").into_boxed_str());
+            let shutdown_id = full_set.create(shutdown_name);
+            debug_assert_eq!(shutdown_id.index() as usize, m);
 
-            let full_mask: u64 = if m == 64 { !0u64 } else { (1u64 << m) - 1 };
-
+            let n_chunks = full_set.n_chunks();
+            let mut full_mask_chunks: Vec<u64> = vec![0; n_chunks];
+            for p in 0..m {
+                let c = p / 64;
+                full_mask_chunks[c] |= 1u64 << (p % 64);
+            }
             let rings: Vec<PRing<T, RING_CAP>> =
                 (0..m).map(|_| PRing::new()).collect();
 
             shards_vec.push(Shard {
                 full_set,
                 rings: rings.into_boxed_slice(),
-                full_mask,
+                full_mask_chunks: full_mask_chunks.into_boxed_slice(),
                 shutdown_id,
             });
         }
@@ -466,32 +480,36 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
     #[inline]
     pub fn try_recv(&self) -> Option<T> {
         let shard = &self.inner.shards[self.shard_idx];
-        let state = shard.full_set.state() & shard.full_mask;
-        if state == 0 { return None; }
         let m = self.inner.m;
-        let mut remaining = state;
-        while remaining != 0 {
-            let p = remaining.trailing_zeros() as usize;
-            let bit = 1u64 << p;
-            remaining &= !bit;
-            if p >= m { break; }
-            let ring = &shard.rings[p];
-            let t = ring.tail.load(Ordering::Relaxed);
-            let h = ring.head.load(Ordering::Acquire);
-            if t == h { continue; } // stale bit; skip
-            // Safety: SPSC — only this consumer reads from this ring.
-            // h observed via Acquire ⇒ producer's slot write is visible.
-            let v = unsafe {
-                (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                    .assume_init_read()
-            };
-            ring.tail.store(t.wrapping_add(1), Ordering::Release);
-            // Wake producer p if it is parked. `Park::wake` reads a
-            // `parked` flag with Relaxed and does nothing when the
-            // producer is not parked — ~0.3 ns no-op. No redundant
-            // store on the producer's cache line.
-            self.inner.producer_parks[p].wake();
-            return Some(v);
+        let n_chunks = shard.full_mask_chunks.len();
+        // Walk chunks in order; for each, mask producer bits and scan.
+        for c in 0..n_chunks {
+            let state = shard.full_set.state_chunk(c) & shard.full_mask_chunks[c];
+            if state == 0 { continue; }
+            let mut remaining = state;
+            while remaining != 0 {
+                let bit_in_chunk = remaining.trailing_zeros() as usize;
+                let bit = 1u64 << bit_in_chunk;
+                remaining &= !bit;
+                let p = c * 64 + bit_in_chunk;
+                if p >= m { break; }
+                let ring = &shard.rings[p];
+                let t = ring.tail.load(Ordering::Relaxed);
+                let h = ring.head.load(Ordering::Acquire);
+                if t == h { continue; } // stale bit; skip
+                // Safety: SPSC — only this consumer reads from this ring.
+                // h observed via Acquire ⇒ producer's slot write is visible.
+                let v = unsafe {
+                    (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
+                        .assume_init_read()
+                };
+                ring.tail.store(t.wrapping_add(1), Ordering::Release);
+                // Wake producer p if it is parked. `Park::wake` reads a
+                // `parked` flag with Relaxed and does nothing when the
+                // producer is not parked — ~0.3 ns no-op.
+                self.inner.producer_parks[p].wake();
+                return Some(v);
+            }
         }
         None
     }
@@ -548,63 +566,72 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
     fn drain_all<F: FnMut(T)>(&self, f: &mut F) -> usize {
         let shard = &self.inner.shards[self.shard_idx];
         let m = self.inner.m;
+        let n_chunks = shard.full_mask_chunks.len();
         let mut count = 0;
         loop {
-            let state = shard.full_set.state() & shard.full_mask;
-            if state == 0 { return count; }
+            // Snapshot: any producer bit set across any chunk?
+            let mut any_state = false;
             let mut progress = false;
-            let mut remaining = state;
-            while remaining != 0 {
-                let p = remaining.trailing_zeros() as usize;
-                remaining &= remaining - 1; // clear lowest set bit
-                if p >= m { break; }
-                let ring = &shard.rings[p];
-                let mut t = ring.tail.load(Ordering::Relaxed);
-                let h = ring.head.load(Ordering::Acquire);
-                if t == h { continue; }
-                // Drain [t, h).
-                while t != h {
-                    let v = unsafe {
-                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                            .assume_init_read()
-                    };
-                    t = t.wrapping_add(1);
-                    f(v);
-                    count += 1;
-                    progress = true;
+            for c in 0..n_chunks {
+                let state = shard.full_set.state_chunk(c)
+                    & shard.full_mask_chunks[c];
+                if state == 0 { continue; }
+                any_state = true;
+                let mut remaining = state;
+                while remaining != 0 {
+                    let bit_in_chunk = remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1; // clear lowest set bit
+                    let p = c * 64 + bit_in_chunk;
+                    if p >= m { break; }
+                    let ring = &shard.rings[p];
+                    let mut t = ring.tail.load(Ordering::Relaxed);
+                    let h = ring.head.load(Ordering::Acquire);
+                    if t == h { continue; }
+                    // Drain [t, h).
+                    while t != h {
+                        let v = unsafe {
+                            (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
+                                .assume_init_read()
+                        };
+                        t = t.wrapping_add(1);
+                        f(v);
+                        count += 1;
+                        progress = true;
+                    }
+                    ring.tail.store(t, Ordering::Release);
+                    // Amortized wake: one `wake()` per ring drained.
+                    self.inner.producer_parks[p].wake();
                 }
-                ring.tail.store(t, Ordering::Release);
-                // Amortized wake: one `wake()` per ring drained. Free
-                // if producer isn't parked (one Relaxed load); unpark
-                // syscall only if it actually needs waking.
-                self.inner.producer_parks[p].wake();
             }
+            if !any_state { return count; }
             if !progress {
                 // Every set bit's ring was empty on inspection (stale).
-                // Don't spin — return and let the caller decide to park.
                 return count;
             }
         }
     }
 
-    /// Park path: atomically clear all producer bits, SeqCst fence,
-    /// recheck every ring. If any ring has pending data, re-set that
-    /// bit and return `Ok(true)` so caller loops back to drain. Otherwise
-    /// `acquire_any` and return `Ok(false)`.
+    /// Park path: atomically clear all producer bits (across every chunk),
+    /// SeqCst fence, recheck every ring. If any ring has pending data,
+    /// re-set that bit and return `Ok(true)` so caller loops back to drain.
+    /// Otherwise park on the SignalSet (any chunk bit) and return `Ok(false)`.
     ///
     /// Returns `Err(Shutdown)` if shutdown is observed during park.
     fn park_or_drain(&self) -> Result<bool, Shutdown> {
         let shard = &self.inner.shards[self.shard_idx];
         let m = self.inner.m;
-        let wake_mask = shard.full_mask | shard.shutdown_id.mask();
+        let n_chunks = shard.full_mask_chunks.len();
 
-        // Clear all producer bits (keep shutdown bit alone).
-        shard.full_set.lock_mask(shard.full_mask);
+        // Clear all producer bits in every chunk (keep shutdown bit alone).
+        for c in 0..n_chunks {
+            shard.full_set.lock_chunk_mask(c, shard.full_mask_chunks[c]);
+        }
         // Dekker: ensure our clear is ordered before the recheck loads.
         std::sync::atomic::fence(Ordering::SeqCst);
 
         // Recheck every ring. If a producer raced (wrote and fetch_or'd
-        // before our lock_mask), its ring has data with the bit now clear.
+        // before our lock_chunk_mask), its ring has data with the bit
+        // now clear — re-set so drain_all picks it up.
         let mut any_raced = false;
         for p in 0..m {
             let ring = &shard.rings[p];
@@ -624,8 +651,10 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
             return Err(Shutdown);
         }
 
-        // Truly empty. Park until producer's fetch_or or shutdown's release.
-        shard.full_set.acquire_any(wake_mask);
+        // Truly empty. Park until any bit gets set anywhere — that
+        // covers both producer fetch_or (in any chunk) and shutdown's
+        // release (last chunk).
+        shard.full_set.acquire_any_chunk();
 
         // Do NOT handle shutdown here. If we wake with *both* a producer
         // bit and the shutdown bit set (producer wrote, then supervisor
@@ -879,9 +908,43 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "m must be <= 63")]
+    #[should_panic(expected = "m must be <=")]
     fn rejects_too_many_producers() {
-        let _ = Mpmc::<u8>::new(64, 1);
+        let _ = Mpmc::<u8>::new(MAX_MPMC_PRODUCERS + 1, 1);
+    }
+
+    #[test]
+    fn high_producer_count_above_64_works() {
+        // Regression: before the chunked SignalSet refactor the limit was
+        // 63. With chunks the cap is 255 and we can wire arbitrary M.
+        const M: usize = 100;
+        let (mut ps, mut cs, _sd) = Mpmc::<u32>::new(M, 1);
+        let consumer = cs.remove(0);
+        consumer.bind();
+
+        let producers: Vec<_> = ps.drain(..).collect();
+        let handles: Vec<_> = producers.into_iter().enumerate().map(|(i, p)| {
+            std::thread::spawn(move || {
+                for v in 0..50u32 {
+                    p.send((i as u32) * 1000 + v);
+                }
+            })
+        }).collect();
+
+        let mut got = 0usize;
+        let total = M * 50;
+        let mut sum = 0u64;
+        while got < total {
+            consumer.recv_batch(|v| { sum += v as u64; got += 1; }).unwrap();
+        }
+        for h in handles { h.join().unwrap(); }
+
+        let mut expected = 0u64;
+        for i in 0..M {
+            for v in 0..50u32 { expected += ((i as u32) * 1000 + v) as u64; }
+        }
+        assert_eq!(sum, expected);
+        assert_eq!(got, total);
     }
 
     #[test]

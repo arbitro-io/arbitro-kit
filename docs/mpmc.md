@@ -22,10 +22,18 @@ pool, with `0%` CPU when idle and zero heap allocation on the hot path.
   producer M-1 ┘                  shard N-1 ─► consumer N-1
 
   shard s
-  ├── full_set: SignalSet          (M bits "ring p has data" + bit 63 shutdown)
+  ├── full_set: SignalSet          (M bits "ring p has data" + 1 shutdown bit)
   ├── rings[0..M]: PRing           (each is SPSC, RING_CAP slots)
   └── drained by consumer s
 ```
+
+The shard's `SignalSet` is allocated with `with_capacity(M + 1)` —
+`ceil((M+1) / 64)` chunks of 64 bits each. Producer bits are at
+indices `0..M`, the shutdown bit is at index `M` (can sit in any
+chunk). For `M ≤ 63` everything fits in chunk 0 and the cost is
+identical to the previous monolithic-`AtomicU64` design; for higher
+`M` the consumer walks one Acquire load per chunk in the drain
+scan — still O(chunks), not O(M).
 
 - **Per-pair SPSC ring.** `shards[s].rings[p]` is owned by producer `p`
   writing head, consumer `s` reading tail.
@@ -156,17 +164,38 @@ are never leaked, even if the channel drops with unconsumed messages.
 
 ## Shutdown
 
-`MpmcShutdown::signal()` sets a flag + releases bit 63 on every
-shard's `SignalSet` + releases every producer's backpressure gate.
-Consumers return `Err(Shutdown)` from `recv` / `recv_batch` **after**
-draining any pending messages. Producers observing a full send path
-during shutdown complete normally if space becomes available (rings
-don't refuse writes on shutdown — drain priority is the consumer's).
+`MpmcShutdown::signal()` sets a flag + releases the shutdown bit
+(index `M`) on every shard's `SignalSet` + releases every producer's
+backpressure gate. Consumers return `Err(Shutdown)` from `recv` /
+`recv_batch` **after** draining any pending messages. Producers
+observing a full send path during shutdown complete normally if
+space becomes available (rings don't refuse writes on shutdown —
+drain priority is the consumer's).
+
+## High-M throughput (TCP-loaded broker scenario)
+
+End-to-end throughput sweep on a `mpsc_overhead` bench (M conns →
+TCP → `Mpmc` → 1 sync decoder), comparing against `tokio::mpsc`.
+The chunked SignalSet activates transparently from `M = 64`:
+
+| M     | tokio::mpsc | `Mpmc` shared | speedup | chunks |
+| ----: | ----------: | ------------: | ------: | -----: |
+| 16    |     16.0 ms |      8.1 ms   |  1.97×  |    1   |
+| 32    |     46.2 ms |     20.6 ms   |  2.24×  |    1   |
+| 60    |     88.6 ms |     38.8 ms   |  2.29×  |    1   |
+| 100   |    148.0 ms |     63.4 ms   |  2.33×  |    2   |
+| 150   |    213.7 ms |     99.5 ms   |  2.15×  |    3   |
+
+Speedup holds at ~2× sustained from `M = 16` through `M = 150`
+(rounds reduced for the high-M points to avoid TCP TIME_WAIT
+exhaustion on `localhost`).
 
 ## Limits
 
-- `M ≤ 63` producers (bit 63 of each shard's `SignalSet` is reserved
-  for shutdown).
+- `M ≤ 255` producers. The shard's `SignalSet` is sized to `M + 1`
+  bits; chunks are added as needed (`ceil((M+1)/64)`). The cap comes
+  from `SignalId` being a `u8` — high enough for any realistic
+  fan-in and small enough to keep the producer struct cache-friendly.
 - `N ≥ 1`, no upper bound (runtime-sized).
 - `RING_CAP` must be a power of two ≥ 1. Default: 64.
 - Backing storage: `M × N × RING_CAP × sizeof(T)` bytes. Defaults

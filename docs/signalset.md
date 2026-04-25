@@ -1,14 +1,22 @@
-# `SignalSet` — up to 64 coalesced signals in one `AtomicU64`
+# `SignalSet` — coalesced signals over a chunked `AtomicU64` bitmap
 
 [← back to README](../README.md)
 
-`SignalSet` packs up to 64 named signals into a single `AtomicU64` plus
-the same park/unpark machinery as `Signal`. Producers set named bits
+`SignalSet` packs named signals into a `Box<[AtomicU64]>` chunked bitmap
+plus the same park/unpark machinery as `Signal`. Producers set named bits
 lock-free; the consumer waits for **any**, **all**, or a **subset** of
-signals to fire, then drains the whole bitfield in one load.
+signals to fire, then drains the bitfield with one Acquire load per chunk.
 
-Bit 63 is reserved for the shutdown/control bit used by composites like
-`Hub`; user-visible ports have 63 bits maximum.
+By default a fresh `SignalSet::new()` allocates a single 64-bit chunk —
+identical layout and cost to the previous monolithic `AtomicU64`
+implementation. Use `SignalSet::with_capacity(n_bits)` to host more bits;
+the bitmap is split into `ceil(n_bits / 64)` chunks of 64 bits each.
+Composites like `Mpmc` already do this transparently for `M > 63`.
+
+`SignalId` is `u8` internally, so the per-set ceiling is **256 bits**
+(four chunks). Hub still reserves bit 63 of chunk 0 for shutdown by
+design; `Mpmc` places its shutdown bit at index `M` (which can sit in
+any chunk) and lifts the limit to `M ≤ 255` producers.
 
 ## Why
 
@@ -56,9 +64,39 @@ flow.release(g_store);
 
 See the `Signal` numbers — `SignalSet` adds one atomic OR over that
 path, plus one mask-AND + compare on the consumer side. Within a
-couple of ns of raw `Signal`. Reproduce with:
+couple of ns of raw `Signal`. Chunked storage adds **zero measurable
+overhead** for the ≤64-bit case (the `Box` pointer stays L1-resident):
+
+| Scenario           | pre-chunked | chunked  |  delta |
+| ------------------ | ----------: | -------: | -----: |
+| Uncontended 1-bit  |    7.10 ns  | 7.12 ns  | +0.3%  |
+| Shared `M=1`       |    3.57 ns  | 3.51 ns  | -1.7%  |
+| Shared `M=8`       |    8.57 ns  | 8.83 ns  | +2.2%  |
+
+Reproduce with:
 
 ```bash
 cargo bench --bench signalset_factory
 cargo bench --bench signalset_vs_signals
 ```
+
+## Chunked API surface
+
+For sets with `> 64` bits, the legacy `u64`-mask methods (`state()`,
+`acquire_any(mask)`, `lock_mask(mask)`, `any_open(mask)`,
+`all_open(mask)`) operate on **chunk 0 only** — preserved for
+backward compatibility with low-N callers. Multi-chunk callers use:
+
+| Method                              | Purpose                                 |
+| ----------------------------------- | --------------------------------------- |
+| `with_capacity(n_bits)`             | Allocate `ceil(n_bits / 64)` chunks     |
+| `n_chunks()` / `capacity_bits()`    | Inspect the chunk topology              |
+| `state_chunk(c)`                    | Acquire-load chunk `c`                  |
+| `lock_chunk_mask(c, mask)`          | Clear bits in chunk `c`                 |
+| `any_chunk_open()`                  | True if any bit is set in any chunk     |
+| `acquire_any_chunk()`               | Park until any bit lights up anywhere   |
+
+Hot-path `release(id)` / `lock(id)` / `is_open(id)` are chunk-aware
+already — `chunk = id/64`, `bit = 1 << (id%64)`. You don't need to
+choose between APIs unless you want to drain or wait on more than 64
+bits at once.
