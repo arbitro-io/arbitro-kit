@@ -177,7 +177,7 @@ don't refuse writes on shutdown — drain priority is the consumer's).
 ### Per-item
 
 ```rust
-use arbitro_kit::gate::Mpmc;
+use arbitro_kit::route::Mpmc;
 
 let (mut producers, mut consumers, shutdown) = Mpmc::<u64>::new(4, 2);
 
@@ -203,7 +203,7 @@ for h in handles { let _ = h.join(); }
 ### Batched (high-throughput broker)
 
 ```rust
-use arbitro_kit::gate::Mpmc;
+use arbitro_kit::route::Mpmc;
 
 let (mut producers, _cs, _sd) = Mpmc::<u64>::new(1, 1);
 let p = producers.remove(0);

@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use arbitro_kit::gate::{Pipe, PipeHook, Signal};
+use arbitro_kit::gate::Signal;
+use arbitro_kit::slot::{Pipe, PipeHook};
 
 // We batch K operations per timing sample because Instant::now() on Windows
 // has ~100 ns granularity — timing a single RTT rounds to 0 or 100. With

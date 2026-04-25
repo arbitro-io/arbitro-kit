@@ -1,6 +1,8 @@
 //! # gate
 //!
-//! Signal primitives for low-latency producer→consumer coordination.
+//! **Synchronization primitives.** No payload, no buffer — just the
+//! mechanisms by which producers tell consumers "go" and consumers tell
+//! the OS "park me".
 //!
 //! ## Types
 //!
@@ -10,12 +12,8 @@
 //!   by a single `AtomicU64` bitmap. Release one, wait for any / all / subset.
 //! - [`SignalId`] — typed handle returned by `SignalSet::create()` for O(1)
 //!   hot-path ops (no string lookup).
-//! - [`Pipe`] — SPSC single-slot transport built on one [`Signal`]. The
-//!   minimal atom between a raw `Signal` and higher-level composites. Carries
-//!   an optional zero-cost observer [`PipeHook`].
-//! - [`Channel`] — SPSC request/response channel built on two [`Signal`]s.
-//!   Zero-copy ownership transfer; see [`Client`] / [`Server`] for the typed
-//!   split API.
+//! - [`Park`] — stateless park/unpark. Lower-level than `Signal`: callers
+//!   carry their own readiness predicate, `Park` only handles the wake.
 //!
 //! ## Semantics (shared by `Signal` and `SignalSet`)
 //!
@@ -27,20 +25,10 @@
 //! one consumer thread may call `acquire*` (enforced by a single parked
 //! `Thread` handle registered via `set_worker`).
 
-mod channel;
-mod gate;
-mod gate_set;
-mod hub;
-mod mpmc;
 mod park;
-mod pipe;
-mod ring;
+mod signal;
+mod signal_set;
 
-pub use channel::{Channel, Client, Server};
-pub use gate::{BitView, BoolView, OwnedBool, Signal, SignalSource, DEFAULT_SPIN_ITERS};
 pub use park::Park;
-pub use gate_set::{SignalId, SignalSet, MAX_GATES};
-pub use hub::{Hub, HubDrain, HubPort, HubReply, HubShutdown, Shutdown, MAX_HUB_PORTS};
-pub use mpmc::{Mpmc, MpmcConsumer, MpmcProducer, MpmcShutdown, MAX_MPMC_PRODUCERS};
-pub use pipe::{NoHook, Pipe, PipeHook};
-pub use ring::Ring;
+pub use signal::{BitView, BoolView, OwnedBool, Signal, SignalSource, DEFAULT_SPIN_ITERS};
+pub use signal_set::{SignalId, SignalSet, MAX_GATES};

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use arbitro_kit::gate::Channel;
+use arbitro_kit::slot::Channel;
 
 fn rounds() -> usize {
     std::env::var("BENCH_ROUNDS").ok()

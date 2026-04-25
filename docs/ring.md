@@ -207,7 +207,7 @@ default owned-atomic `Ring`.
 ## Usage
 
 ```rust
-use arbitro_kit::gate::Ring;
+use arbitro_kit::stream::Ring;
 use std::sync::Arc;
 
 let r: Arc<Ring<u64, 256>> = Arc::new(Ring::new());

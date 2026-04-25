@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use arbitro_kit::gate::Ring;
+use arbitro_kit::stream::Ring;
 
 // Keep totals small per bench_safety: max ~1000 msgs per measurement.
 const MSGS:   usize = 1000;

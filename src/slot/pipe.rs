@@ -35,7 +35,7 @@
 //! paid only by the subscriber, and only on the paths you care about.
 //!
 //! ```no_run
-//! use arbitro_kit::gate::{Pipe, PipeHook};
+//! use arbitro_kit::slot::{Pipe, PipeHook};
 //!
 //! struct Counting(std::sync::atomic::AtomicU64);
 //! impl PipeHook<u64> for Counting {

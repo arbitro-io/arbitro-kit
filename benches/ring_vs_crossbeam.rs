@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use arbitro_kit::gate::Ring;
+use arbitro_kit::stream::Ring;
 
 const MSGS: usize = 1000;
 const ROUNDS: usize = 300;

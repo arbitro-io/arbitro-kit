@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread::{self, Thread};
 use std::time::Instant;
 
-use arbitro_kit::gate::Ring as ArbitroRing;
+use arbitro_kit::stream::Ring as ArbitroRing;
 
 const CAP: usize = 256;
 const ROUNDS: usize = 1000;

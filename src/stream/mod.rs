@@ -1,62 +1,35 @@
 //! # stream
 //!
-//! `Stream<T>` — unbounded sequenced log primitive.
+//! **FIFO transports.** Continuous flow of payloads from one producer to
+//! one consumer, with order preserved. Two flavors live here:
 //!
-//! ## What
+//! - [`Ring<T, CAP>`] — **bounded** SPSC. Fixed-capacity ring; producer
+//!   blocks (or returns `Err`) when full. Use when memory must stay
+//!   constant and backpressure is desired.
+//! - [`Stream<T>`] — **unbounded** SPSC sequenced log. Linked segments
+//!   grow on demand; producer never blocks while RAM is available.
+//!   Each `send` returns a [`Receipt`] for O(1) delivery verification.
+//! - [`Duplex<A, B>`] — **bidirectional** pair of `Stream`s. Type-safe
+//!   send / recv per direction.
+//! - [`BufferedSender`] — wrapper that exposes a single-send API on top
+//!   of `Stream::send_iter` for batched throughput.
 //!
-//! An append-only SPSC log. The producer `send`s items and gets a
-//! [`Receipt`] carrying a monotonic sequence number; the consumer
-//! drains in order. Storage is a linked list of fixed-size segments
-//! allocated on demand — **the producer never blocks** while RAM is
-//! available. The consumer parks via `Park` (phased backoff, ~0%
-//! idle CPU) when the stream is empty.
+//! For **single-message** transports (no buffer, one in flight) see
+//! [`crate::slot`]. For **multiplexed** transports (N→1, 1→N, M→N with
+//! routing) see [`crate::route`].
 //!
-//! ## Why
+//! ## Concurrency contract (shared by `Ring` and `Stream`)
 //!
-//! Higher-level patterns (request/response, broadcast, work-stealing)
-//! all want the same thing under the hood: identity (a seq), ordering,
-//! and an O(1) "did it arrive?" check. `Stream<T>` is exactly that and
-//! nothing more. RPC, correlation, routing, fan-out — those compose on
-//! top in caller code.
-//!
-//! ## Layout
-//!
-//! ```text
-//!                 producer ─send─►        consumer ─recv─►
-//!                         │                       │
-//!                ┌────────▼─────────┬─────────────▼────────┐
-//!                │  tail_seg        │  head_seg            │
-//!                │  (writing here)  │  (reading here)      │
-//!                ├──────┬──────┬────┴──┬──────┬──────┬─────┤
-//!                │ seg0 │ seg1 │  …    │ segM │ segN │ ... │
-//!                └──────┴──────┴───────┴──────┴──────┴─────┘
-//!                                              ▲
-//!                                       freed once head
-//!                                       cursor passes them
-//! ```
-//!
-//! ## Topology and patterns
-//!
-//! - **Fire-and-forget**: `stream.send(v)`, ignore the receipt.
-//! - **Verified send**: `let r = stream.send(v); ... r.is_delivered()`.
-//! - **Bidirectional**: pair two streams (one per direction). Caller
-//!   correlates replies if needed.
-//! - **Bulk transport**: `send_iter` + `recv_bulk` to amortize the
-//!   cursor publish over a batch.
-//!
-//! ## Concurrency contract
-//!
-//! - Exactly **one producer** thread calls `send` / `send_iter`.
-//! - Exactly **one consumer** thread calls `recv` / `try_recv` /
-//!   `recv_bulk`. Register it via [`Stream::set_consumer`] before
-//!   the first blocking recv.
+//! - Exactly **one producer** thread calls `send` / `send_iter` / `try_send`.
+//! - Exactly **one consumer** thread calls `recv` / `try_recv` / `recv_bulk`.
 //! - Any thread may hold a [`Receipt`] and call `is_delivered` /
-//!   `wait_delivered`.
+//!   `wait_delivered` (Stream-only).
 
 mod buffered;
 mod duplex;
 mod receipt;
 mod recv;
+mod ring;
 mod segment;
 mod send;
 #[allow(clippy::module_inception)]
@@ -68,4 +41,5 @@ mod tests;
 pub use buffered::BufferedSender;
 pub use duplex::{Duplex, DuplexEnd};
 pub use receipt::Receipt;
+pub use ring::Ring;
 pub use stream::Stream;

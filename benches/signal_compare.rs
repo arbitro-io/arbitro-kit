@@ -35,7 +35,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arbitro_kit::gate::{Signal, Channel, SignalSet};
+use arbitro_kit::gate::{Signal, SignalSet};
+use arbitro_kit::slot::Channel;
 
 /// Cross-thread rounds per primitive. Override with env `BENCH_CROSS_ROUNDS`
 /// (useful for smoke tests: `BENCH_CROSS_ROUNDS=50` keeps the run under the

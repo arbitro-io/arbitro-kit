@@ -61,7 +61,8 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
-use crate::gate::{Pipe, SignalId, SignalSet, MAX_GATES};
+use crate::gate::{SignalId, SignalSet, MAX_GATES};
+use crate::slot::Pipe;
 
 /// Index of the reserved shutdown bit in the coordinator `SignalSet`.
 /// User ports occupy `0..MAX_GATES - 1`.

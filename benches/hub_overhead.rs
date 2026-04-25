@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use arbitro_kit::gate::{Hub, Shutdown, SignalSet};
+use arbitro_kit::gate::SignalSet;
+use arbitro_kit::route::{Hub, Shutdown};
 
 const BATCH: usize = 1000;
 

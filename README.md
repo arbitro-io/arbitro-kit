@@ -42,18 +42,28 @@ A second low-level primitive, `Park`, exposes the stateless park/unpark
 half of `Signal` for callers that already track readiness in their own
 state (used internally by `Ring` and `Mpmc`):
 
-| Type         | Shape                                     | What it adds                                                        | Docs |
-| :----------- | :---------------------------------------- | :------------------------------------------------------------------ | :--- |
-| `Signal`     | single-bit M:1 signal                     | the primitive itself; BYO-atomic via `from_bool` / `from_bit`        | [signal.md](docs/signal.md) |
-| `Park`       | stateless park/unpark                     | wait on caller-owned readiness state (no duplicated `AtomicBool`)   | (used by `Ring`, `Mpmc`) |
-| `SignalSet`  | up to 64 bits in one `AtomicU64`          | wait for any / all / subset of named signals                        | [signalset.md](docs/signalset.md) |
-| `Pipe<T, H>` | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks             | [pipe.md](docs/pipe.md) |
-| `Ring<T, CAP>` | SPSC N-slot pipelined queue (2 × `Signal`) | burst absorption, pipelined throughput, batch send + batch ack      | [ring.md](docs/ring.md) |
-| `Channel<Req, Resp>` | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
-| `Hub<In, Out>` | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
-| `Mpmc<T, RING_CAP>` | M:N sharded channel (N × `SignalSet` + M×N SPSC mini-rings) | high-throughput broker: M producers → N consumers with batched send | [mpmc.md](docs/mpmc.md) |
-| `Stream<T>`  | SPSC unbounded sequenced log (linked segments + `Park`) | fire-and-forget producer + `Receipt`-based delivery verification (3.5 ns/RT batched) | [stream.md](docs/stream.md) |
-| `Duplex<A, B>` | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
+The crate is organized in four modules by **what the user wants**, not
+by what's under the hood:
+
+| Module | Question it answers | Types |
+| :----- | :------------------ | :---- |
+| [`gate`](src/gate/)     | "How do I synchronize?" (no payload)            | `Signal`, `SignalSet`, `Park` |
+| [`slot`](src/slot/)     | "1 message in flight, no buffer?"               | `Pipe`, `Channel` |
+| [`stream`](src/stream/) | "FIFO of messages?"                             | `Ring`, `Stream`, `Duplex`, `BufferedSender` |
+| [`route`](src/route/)   | "N→M with topology?"                            | `Hub`, `Mpmc` |
+
+| Type         | Module | Shape                                     | What it adds                                                        | Docs |
+| :----------- | :----- | :---------------------------------------- | :------------------------------------------------------------------ | :--- |
+| `Signal`     | gate   | single-bit M:1 signal                     | the primitive itself; BYO-atomic via `from_bool` / `from_bit`        | [signal.md](docs/signal.md) |
+| `Park`       | gate   | stateless park/unpark                     | wait on caller-owned readiness state (no duplicated `AtomicBool`)   | (used by `Ring`, `Mpmc`) |
+| `SignalSet`  | gate   | up to 64 bits in one `AtomicU64`          | wait for any / all / subset of named signals                        | [signalset.md](docs/signalset.md) |
+| `Pipe<T, H>` | slot   | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks             | [pipe.md](docs/pipe.md) |
+| `Channel<Req, Resp>` | slot | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
+| `Ring<T, CAP>` | stream | SPSC bounded ring (2 × `Park`)          | burst absorption, pipelined throughput, batch send + batch ack      | [ring.md](docs/ring.md) |
+| `Stream<T>`  | stream | SPSC unbounded sequenced log (linked segments + `Park`) | fire-and-forget producer + `Receipt`-based delivery verification (3.5 ns/RT batched) | [stream.md](docs/stream.md) |
+| `Duplex<A, B>` | stream | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
+| `Hub<In, Out>` | route  | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
+| `Mpmc<T, RING_CAP>` | route | M:N sharded channel (N × `SignalSet` + M×N SPSC mini-rings) | high-throughput broker: M producers → N consumers with batched send | [mpmc.md](docs/mpmc.md) |
 
 ### Quick fragments
 
@@ -145,7 +155,7 @@ sig.release();
 ### SPSC round-trip channel
 
 ```rust
-use arbitro_kit::gate::Channel;
+use arbitro_kit::slot::Channel;
 
 let (client, server) = Channel::<u64, u64>::spsc();
 
@@ -164,7 +174,7 @@ Works transparently with `Box<T>`, `Vec<T>`, `Arc<T>`, `File` — any
 ### Single-slot pipe
 
 ```rust
-use arbitro_kit::gate::Pipe;
+use arbitro_kit::slot::Pipe;
 
 let p: Pipe<u64> = Pipe::new();
 p.send(42);

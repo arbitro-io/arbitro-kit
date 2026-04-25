@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use arbitro_kit::gate::{Mpmc, MpmcConsumer, MpmcProducer, MpmcShutdown};
+use arbitro_kit::route::{Mpmc, MpmcConsumer, MpmcProducer, MpmcShutdown};
 use crossbeam_channel::bounded;
 
 const BATCH: usize = 1000;

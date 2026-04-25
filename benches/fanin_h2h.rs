@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use arbitro_kit::gate::{Hub, Mpmc, Shutdown as HubShutdown};
+use arbitro_kit::route::{Hub, Mpmc, Shutdown as HubShutdown};
 
 fn duration_ms() -> u64 {
     std::env::var("BENCH_DURATION_MS").ok()

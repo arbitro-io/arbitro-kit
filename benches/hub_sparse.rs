@@ -19,7 +19,7 @@
 
 use std::time::Instant;
 
-use arbitro_kit::gate::Hub;
+use arbitro_kit::route::Hub;
 
 const BATCH: usize = 1000;
 const WARMUP: usize = 10;

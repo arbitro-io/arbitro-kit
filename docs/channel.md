@@ -123,7 +123,7 @@ from every operation.
 ## Usage
 
 ```rust
-use arbitro_kit::gate::Channel;
+use arbitro_kit::slot::Channel;
 
 let (client, server) = Channel::<u64, u64>::spsc();
 

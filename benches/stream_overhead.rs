@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use arbitro_kit::gate::Ring;
+use arbitro_kit::stream::Ring;
 use arbitro_kit::stream::{BufferedSender, Stream};
 
 const N_MSGS: u64 = 10_000;

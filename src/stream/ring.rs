@@ -1,6 +1,6 @@
 //! SPSC bounded ring buffer — N-slot pipelined queue.
 //!
-//! [`Ring<T, CAP>`] is the multi-slot sibling of [`Pipe<T>`](super::Pipe).
+//! [`Ring<T, CAP>`] is the multi-slot sibling of [`Pipe<T>`](crate::slot::Pipe).
 //! Same SPSC contract (one producer, one consumer), but with `CAP` slots
 //! preallocated inline, so producer and consumer can overlap in time.
 //!
@@ -17,8 +17,8 @@
 //! - **Graduated backpressure.** `try_send` returns `Err(value)` without
 //!   blocking; caller can drop / coalesce / downsample per policy.
 //!
-//! For 1:1 request/response, prefer [`Channel`](super::Channel). For simple
-//! 1:1 fire-and-forget with no buffering, prefer [`Pipe`](super::Pipe).
+//! For 1:1 request/response, prefer [`Channel`](crate::slot::Channel). For simple
+//! 1:1 fire-and-forget with no buffering, prefer [`Pipe`](crate::slot::Pipe).
 //!
 //! ## Wire model
 //!

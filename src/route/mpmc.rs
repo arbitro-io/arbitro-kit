@@ -87,8 +87,8 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::gate::hub::Shutdown;
 use crate::gate::{Park, SignalId, SignalSet, MAX_GATES};
+use crate::route::hub::Shutdown;
 
 /// Bit 63 of every shard's `SignalSet` is reserved for shutdown.
 const SHUTDOWN_BIT: u8 = (MAX_GATES - 1) as u8;
