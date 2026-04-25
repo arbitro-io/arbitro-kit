@@ -5,11 +5,8 @@
 //!
 //! ## Modules
 //!
-//! - [`gate`] — low-latency M:1 signal primitives and SPSC round-trip channel.
-//! - [`synapse`] — SPMC (1 producer → N consumers) work-stealing ring built
-//!   on top of `gate::Signal`. Sibling module, not part of `gate` — the
-//!   wire model and concurrency contract are different enough that it
-//!   earns its own namespace.
+//! - [`gate`] — low-latency M:1 signal primitives, SPSC round-trip channel,
+//!   hub, ring, and MPMC primitives built on top of `Signal`.
 //!
 //! ## Quick start
 //!
@@ -23,4 +20,3 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod gate;
-pub mod synapse;

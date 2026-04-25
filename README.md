@@ -47,6 +47,7 @@ wrapper — most of the cost model carries over unchanged:
 | `Ring<T, CAP>` | SPSC N-slot pipelined queue (2 × `Signal`) | burst absorption, pipelined throughput, batch send + batch ack      | [ring.md](docs/ring.md) |
 | `Channel<Req, Resp>` | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
 | `Hub<In, Out>` | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
+| `Mpmc<T, RING_CAP>` | M:N sharded channel (N × `SignalSet` + M×N SPSC mini-rings) | high-throughput broker: M producers → N consumers with batched send | [mpmc.md](docs/mpmc.md) |
 
 ### Quick fragments
 
@@ -80,6 +81,15 @@ cross-thread RTT. N producers coalesce into one `AtomicU64` via
 shutdown bit wakes the drain cleanly without external signaling.
 Max 63 ports; shard across multiple Hubs for higher throughput.
 [→ hub.md](docs/hub.md)
+
+**`Mpmc<T, RING_CAP>`** — M:N sharded channel. Per-item `send` at
+~33 ns p50 (`8P/1C`) and ~22 ns p50 (`8P/8C`). With the `try_send_batch`
+path amortizing one `fetch_or` over up to `RING_CAP` items:
+**0.74 ns/op p50 at `8P/8C` → ~1.03 G ops/sec, 116× faster than
+`crossbeam::channel::bounded(1024)` at the same shape**. Level-triggered
+bits mean the Signal contract is honored — a stray `lock_mask` can
+never strand a pending message. Drop-safe, shutdown-safe,
+backpressure per producer. [→ mpmc.md](docs/mpmc.md)
 
 ---
 
@@ -162,8 +172,6 @@ assert_eq!(p.recv(), 42);
 
 ## Non-goals
 
-- **N consumers.** Everything here is M producers : 1 consumer. Fan-out
-  to multiple consumers is a different primitive.
 - **Async.** Primitives are synchronous; `acquire*` parks the OS thread.
   The lock-free producer side is compatible with any async runtime, but
   `Future`-based waits are not provided.
@@ -185,6 +193,9 @@ Shipped today:
 - [x] `Channel<Req, Resp>` — SPSC zero-copy request/response,
       panic-safe, 64-byte aligned for sub-110 ns handshake
 - [x] `Hub<In, Out>` — N:1 multiplexer with per-port reply + shutdown
+- [x] `Mpmc<T, RING_CAP>` — M:N sharded channel with per-(producer,shard)
+      mini-rings, level-triggered bits, batched `try_send_batch` path,
+      panic-safe Drop, built-in shutdown
 
 Next:
 
@@ -216,8 +227,9 @@ Every number in the docs is reproducible:
 cargo bench --bench signal_compare       # Signal vs raw AtomicBool
 cargo bench --bench pipe_overhead        # Pipe ST/XT + hook zero-cost claim
 cargo bench --bench ring_overhead        # Ring FLOW / ROUND-TRIP / payload sweep
-cargo bench --bench gate_channel_focus   # Channel vs crossbeam vs mpsc
+cargo bench --bench gate_overhead        # Channel vs crossbeam vs mpsc
 cargo bench --bench hub_overhead         # Hub throughput + RTT
+cargo bench --bench mpmc_overhead        # Mpmc MP/NC sweep + batched + crossbeam
 ```
 
 For publication-grade numbers on Linux, pin the producer/consumer

@@ -66,7 +66,7 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::gate::Signal;
+use crate::gate::Park;
 
 /// Cache-line padding to keep `head` (written by producer) and `tail`
 /// (written by consumer) on separate 64 B lines. Without this, every
@@ -88,14 +88,17 @@ struct CachePad([u8; 0]);
 /// - Usually shared across threads via `Arc<Ring<T, CAP>>`.
 #[repr(C)]
 pub struct Ring<T, const CAP: usize> {
-    /// Signal: open ↔ "ring has at least one item". Consumer parks on this.
-    not_empty: Signal,
+    /// Park primitive on which the consumer waits when the ring is empty.
+    /// Open/closed state is derived directly from `head != tail` — no
+    /// duplicated `locked` bit. Saves one Release store per `try_send`.
+    not_empty: Park,
     /// Write cursor. Monotonic, wraps via `& MASK` at use. Producer owns.
     head: AtomicUsize,
     _pad0: CachePad,
 
-    /// Signal: open ↔ "ring has at least one free slot". Producer parks on this.
-    not_full: Signal,
+    /// Park primitive on which the producer waits when the ring is full.
+    /// Openness derived from `head - tail < CAP` — same reasoning as above.
+    not_full: Park,
     /// Read cursor. Monotonic, wraps via `& MASK` at use. Consumer owns.
     tail: AtomicUsize,
     _pad1: CachePad,
@@ -126,11 +129,10 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         assert!(CAP > 0,                "Ring CAP must be > 0");
         assert!(CAP.is_power_of_two(),  "Ring CAP must be a power of two");
 
-        // `not_empty` starts locked (empty ring has nothing to consume).
-        // `not_full`  starts released (empty ring has space for producer).
-        let not_empty = Signal::new();       // starts locked
-        let not_full  = Signal::new();
-        not_full.release();                  // start with space available
+        // Park has no state of its own — "is it ready to proceed?" is
+        // answered by the predicate that `wait_until` evaluates over head/tail.
+        let not_empty = Park::new();
+        let not_full  = Park::new();
 
         // Safety: creating an array of `UnsafeCell<MaybeUninit<T>>` is sound;
         // MaybeUninit::uninit() is always valid, UnsafeCell is a transparent
@@ -201,10 +203,13 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         }
         // Safety: slot is empty (head - tail < CAP). We own the write.
         unsafe { (*self.slots[head & Self::MASK].get()).write(value); }
-        // Release on head publishes the slot write to the consumer.
+        // Release on head publishes the slot write to the consumer AND is
+        // what opens the `not_empty` Park (the predicate reads head/tail).
+        // No separate `locked` store — eliminating it halves the cache-line
+        // traffic of a send on steady-state.
         self.head.store(head.wrapping_add(1), Ordering::Release);
         // Wake a possibly-parked consumer. Idempotent if already awake.
-        self.not_empty.release();
+        self.not_empty.wake();
         Ok(())
     }
 
@@ -212,21 +217,10 @@ impl<T, const CAP: usize> Ring<T, CAP> {
     ///
     /// Must only be called from the registered producer thread.
     ///
-    /// ## Park protocol (lock → re-check → acquire)
-    ///
-    /// The canonical Signal park dance. `try_send` never closes `not_full`
-    /// (keeping it a pure non-blocking op). Only the waiter — this method —
-    /// is allowed to lock, and it does so just before parking:
-    ///
-    /// 1. Observe full via `try_send`.
-    /// 2. `not_full.lock()` — commit to sleeping.
-    /// 3. Re-check `is_full()` — did the consumer drain in the window?
-    ///    - If not full anymore: `release()` (we closed a signal that was
-    ///      about to open) and retry.
-    /// 4. `not_full.acquire()` — park. `Signal` handles the final Dekker
-    ///    race (SeqCst `parked` store + recheck of `locked`) internally,
-    ///    so a consumer release between step 3 and the inner park will
-    ///    still wake us.
+    /// With `Park`, the dance collapses to a single `wait_until` — the
+    /// predicate reads head/tail directly, so the Dekker race between our
+    /// spin-exit and the consumer's drain is closed by `Park`'s internal
+    /// SeqCst store on `parked` + re-check of the predicate.
     #[inline]
     pub fn send(&self, mut value: T) {
         loop {
@@ -234,13 +228,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
                 Ok(()) => return,
                 Err(v) => value = v,
             }
-            self.not_full.lock();
-            std::sync::atomic::fence(Ordering::SeqCst);
-            if !self.is_full() {
-                self.not_full.release();
-                continue;
-            }
-            self.not_full.acquire();
+            self.not_full.wait_until(|| !self.is_full());
         }
     }
 
@@ -261,44 +249,27 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         // Safety: head > tail ⇒ slot[tail & MASK] holds an initialized T
         // published by the producer with Release.
         let v = unsafe { (*self.slots[tail & Self::MASK].get()).assume_init_read() };
-        // Release on tail publishes the slot-now-free to the producer.
+        // Release on tail publishes the slot-now-free to the producer AND
+        // is what opens the `not_full` Park for a waiting producer.
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         // Wake a possibly-parked producer. Idempotent.
-        self.not_full.release();
-        // Note: we deliberately do NOT lock `not_empty` here. Locking from
-        // the hot path creates a missed-wakeup race — if the producer's
-        // `release` happens between our snapshot and our `lock`, we erase
-        // the wakeup. Only the waiter (see `recv`) locks, via the canonical
-        // lock-check-acquire pattern, which closes the race internally.
+        self.not_full.wake();
         Some(v)
     }
 
     /// Blocking dequeue. Parks until an item is available, then takes it.
     ///
     /// Must only be called from the registered consumer thread.
+    ///
+    /// With `Park`, the dance collapses to a single `wait_until`. Readiness
+    /// is `head != tail`, evaluated inside `Park::wait_until`; any producer
+    /// `head.store(Release)` during the park path will be observed because
+    /// `Park` re-checks the predicate after setting `parked = true (SeqCst)`.
     #[inline]
     pub fn recv(&self) -> T {
-        // Symmetric to `send`: canonical lock-check-acquire park dance.
-        //
-        // 1. Try non-blocking `try_recv`.
-        // 2. Observed empty → `not_empty.lock()` — commit to sleeping.
-        // 3. Re-check `is_empty()` with a SeqCst fence between the lock store
-        //    and the load — on x86 TSO the fence drains the store buffer so
-        //    we observe any producer Release on `head` that happened before
-        //    our lock.
-        //    - If not empty anymore: `release()` (undo our close) and retry.
-        // 4. `not_empty.acquire()` — park. Signal's own Dekker protocol
-        //    (SeqCst `parked` store + recheck of `locked`) closes the final
-        //    race window with a concurrent producer `release()`.
         loop {
             if let Some(v) = self.try_recv() { return v; }
-            self.not_empty.lock();
-            std::sync::atomic::fence(Ordering::SeqCst);
-            if !self.is_empty() {
-                self.not_empty.release();
-                continue;
-            }
-            self.not_empty.acquire();
+            self.not_empty.wait_until(|| !self.is_empty());
         }
     }
 
@@ -334,7 +305,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
                 self.ring
                     .head
                     .store(self.head_start.wrapping_add(self.written), Ordering::Release);
-                self.ring.not_empty.release();
+                self.ring.not_empty.wake();
             }
         }
         let mut guard = Guard::<T, CAP> {
@@ -355,7 +326,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         // Single Release publishes all n slots at once.
         self.head.store(head.wrapping_add(n), Ordering::Release);
         // Single wake covers the whole batch.
-        self.not_empty.release();
+        self.not_empty.wake();
         n
     }
 
@@ -393,7 +364,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         // Single Release publishes all n freed slots at once (batch ack).
         self.tail.store(tail.wrapping_add(n), Ordering::Release);
         // Single wake covers the whole batch.
-        self.not_full.release();
+        self.not_full.wake();
         n
     }
 }

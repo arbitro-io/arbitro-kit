@@ -67,7 +67,7 @@ equal this."
 Reproduce with:
 
 ```bash
-cargo bench --bench gate_channel_focus
+cargo bench --bench gate_overhead
 ```
 
 ## Zero-copy semantics

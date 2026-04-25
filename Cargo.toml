@@ -10,17 +10,22 @@ readme = "README.md"
 # No runtime dependencies. std-only.
 
 [dev-dependencies]
-# Only for benchmarks: compare Gate / GateSet against crossbeam's bounded(1).
+# Only for benchmarks: compare our primitives against crossbeam equivalents.
 # Runtime crate itself stays dep-free.
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
 
 [[bench]]
 name = "signal_compare"
 harness = false
 
 [[bench]]
-name = "gate_channel_focus"
+name = "gate_overhead"
+harness = false
+
+[[bench]]
+name = "channel_overhead"
 harness = false
 
 [[bench]]
@@ -36,7 +41,35 @@ name = "ring_overhead"
 harness = false
 
 [[bench]]
-name = "synapse_overhead"
+name = "mpmc_overhead"
+harness = false
+
+[[bench]]
+name = "signalset_vs_signals"
+harness = false
+
+[[bench]]
+name = "signalset_factory"
+harness = false
+
+[[bench]]
+name = "ring_byo_atomic"
+harness = false
+
+[[bench]]
+name = "hub_sparse"
+harness = false
+
+[[bench]]
+name = "hub_multibit"
+harness = false
+
+[[bench]]
+name = "fanin_h2h"
+harness = false
+
+[[bench]]
+name = "ring_vs_crossbeam"
 harness = false
 
 [profile.release]
