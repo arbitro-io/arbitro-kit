@@ -59,7 +59,6 @@
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::gate::{Pipe, SignalId, SignalSet, MAX_GATES};
@@ -77,25 +76,33 @@ pub const MAX_HUB_PORTS: usize = MAX_GATES - 1;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Shutdown;
 
+/// Per-port inbound slot, padded to a full cache line so two ports
+/// firing concurrently don't false-share their slot writes (each producer
+/// writes its slot before the bitmap `fetch_or`; if N slots fit in one
+/// 64 B line, multiple producers ping-pong the line).
+#[repr(C, align(64))]
+struct InboundSlot<In>(UnsafeCell<MaybeUninit<In>>);
+
 /// Shared state of a hub. Users interact via [`HubPort`] / [`HubDrain`].
 #[repr(C)]
 pub struct Hub<In, Out> {
     /// N-bit multiplexor: bit `i` set ⇔ `inbound[i]` holds a value.
+    /// Bit 63 (`shutdown_id`) doubles as the shutdown latch — once set
+    /// it is never cleared, so every subsequent `recv_batch` returns
+    /// `Err(Shutdown)` immediately.
     coordinator: SignalSet,
     /// `ids[i]` is the `SignalId` for port `i`.
     ids: Vec<SignalId>,
-    /// Per-port inbound slot. Bare — the coordinator bit is its "has data" flag.
-    inbound: Vec<UnsafeCell<MaybeUninit<In>>>,
+    /// Per-port inbound slot. Cache-line padded (see [`InboundSlot`]).
+    inbound: Vec<InboundSlot<In>>,
     /// Per-port outbound: full `Pipe<Out>`, since the port thread may park
     /// waiting for its reply.
     outbound: Vec<Pipe<Out>>,
     /// Bitmask with one bit per registered port. Cached for `acquire_any`.
     full_mask: u64,
-    /// Reserved bit for shutdown wake.
+    /// Reserved bit for shutdown wake. Bit 63 of `coordinator` is the
+    /// single source of truth for shutdown state.
     shutdown_id: SignalId,
-    /// Shutdown flag. Set by [`HubShutdown::signal`]; checked by the drain
-    /// after each wake to convert spurious-ish wakes into a `Shutdown` return.
-    shutdown: AtomicBool,
 }
 
 // Safety: inbound slot access is serialized by the coordinator bit handshake
@@ -134,7 +141,7 @@ impl<In: Send, Out: Send> Hub<In, Out> {
         let mut inbound = Vec::with_capacity(n);
         let mut outbound = Vec::with_capacity(n);
         for _ in 0..n {
-            inbound.push(UnsafeCell::new(MaybeUninit::uninit()));
+            inbound.push(InboundSlot(UnsafeCell::new(MaybeUninit::uninit())));
             outbound.push(Pipe::new());
         }
 
@@ -145,7 +152,6 @@ impl<In: Send, Out: Send> Hub<In, Out> {
             outbound,
             full_mask,
             shutdown_id,
-            shutdown: AtomicBool::new(false),
         });
 
         let ports: Vec<HubPort<In, Out>> = (0..n)
@@ -185,7 +191,7 @@ impl<In, Out> Drop for Hub<In, Out> {
             let bit = 1u64 << i;
             if state & bit != 0 {
                 // Safety: exclusive access via &mut self; bit set ⇒ slot init.
-                unsafe { (*self.inbound[i].get()).assume_init_drop(); }
+                unsafe { (*self.inbound[i].0.get()).assume_init_drop(); }
             }
         }
     }
@@ -235,7 +241,7 @@ impl<In: Send, Out: Send> HubPort<In, Out> {
         // Safety: SPSC contract: exclusive producer for this slot, and the
         // slot is empty (coordinator bit was clear). The subsequent
         // `release` uses Release ordering, publishing this write.
-        unsafe { (*self.hub.inbound[self.idx].get()).write(v); }
+        unsafe { (*self.hub.inbound[self.idx].0.get()).write(v); }
         self.hub.coordinator.release(self.id);
     }
 
@@ -244,7 +250,7 @@ impl<In: Send, Out: Send> HubPort<In, Out> {
     pub fn try_send(&self, v: In) -> Result<(), In> {
         if !self.is_idle() { return Err(v); }
         // Safety: same as `send`.
-        unsafe { (*self.hub.inbound[self.idx].get()).write(v); }
+        unsafe { (*self.hub.inbound[self.idx].0.get()).write(v); }
         self.hub.coordinator.release(self.id);
         Ok(())
     }
@@ -314,20 +320,19 @@ impl<In: Send, Out: Send> HubDrain<In, Out> {
         let n = self.hub.ids.len();
         // Include the shutdown bit in the wait mask so a `HubShutdown::signal`
         // wakes us even when no port has pending work.
-        let wake_mask = self.hub.full_mask | self.hub.shutdown_id.mask();
+        let shutdown_mask = self.hub.shutdown_id.mask();
+        let wake_mask = self.hub.full_mask | shutdown_mask;
         self.hub.coordinator.acquire_any(wake_mask);
 
-        if self.hub.shutdown.load(Ordering::Acquire) {
-            // Drain any in-flight messages before returning so we don't
-            // strand values that producers already published.
+        let state = self.hub.coordinator.state();
+        if state & shutdown_mask != 0 {
+            // Bit 63 is the latch — left set so subsequent recv_batch calls
+            // also return Err(Shutdown) immediately. Drain in-flight first
+            // so producers' values aren't stranded.
             self.drain_available(&mut f);
-            // Clear the shutdown bit so a re-used drain (rare) can wake
-            // normally — though in practice the Hub is about to go away.
-            self.hub.coordinator.lock(self.hub.shutdown_id);
             return Err(Shutdown);
         }
 
-        let state = self.hub.coordinator.state();
         let start = self.cursor.get() as usize % n;
         // Iterate only set bits in round-robin order from `start`.
         // Split the active mask into [start..n) and [0..start), then scan
@@ -344,7 +349,7 @@ impl<In: Send, Out: Send> HubDrain<In, Out> {
                 m &= m.wrapping_sub(1);
                 // Safety: bit set ⇒ producer wrote the slot before the
                 // Release that we observed via `state()` (Acquire).
-                let v = unsafe { (*self.hub.inbound[i].get()).assume_init_read() };
+                let v = unsafe { (*self.hub.inbound[i].0.get()).assume_init_read() };
                 // Clear the bit **before** running the user callback: the
                 // callback likely calls `reply.send`, which will wake the
                 // port, and a fast port may re-send on the same slot before
@@ -370,7 +375,7 @@ impl<In: Send, Out: Send> HubDrain<In, Out> {
             let i = active.trailing_zeros() as usize;
             let bit = 1u64 << i;
             active &= active.wrapping_sub(1);
-            let v = unsafe { (*self.hub.inbound[i].get()).assume_init_read() };
+            let v = unsafe { (*self.hub.inbound[i].0.get()).assume_init_read() };
             self.hub.coordinator.lock_mask(bit);
             let reply = HubReply { pipe: &self.hub.outbound[i] };
             f(i, v, reply);
@@ -395,7 +400,7 @@ impl<In: Send, Out: Send> HubDrain<In, Out> {
                 let i = m.trailing_zeros() as usize;
                 let bit = 1u64 << i;
                 m &= m.wrapping_sub(1);
-                let v = unsafe { (*self.hub.inbound[i].get()).assume_init_read() };
+                let v = unsafe { (*self.hub.inbound[i].0.get()).assume_init_read() };
                 // See rationale in `recv_batch`.
                 self.hub.coordinator.lock_mask(bit);
                 let reply = HubReply { pipe: &self.hub.outbound[i] };
@@ -421,16 +426,18 @@ impl<In: Send, Out: Send> Clone for HubShutdown<In, Out> {
 
 impl<In: Send, Out: Send> HubShutdown<In, Out> {
     /// Flag the hub as shutting down and wake the drain. Idempotent.
+    /// Bit 63 of the coordinator is the single source of truth — once set
+    /// it is never cleared, so the latch is correctly observed by every
+    /// future `recv_batch`.
     #[inline]
     pub fn signal(&self) {
-        self.hub.shutdown.store(true, Ordering::Release);
         self.hub.coordinator.release(self.hub.shutdown_id);
     }
 
     /// `true` if `signal` has been called on any clone of this handle.
     #[inline]
     pub fn is_signaled(&self) -> bool {
-        self.hub.shutdown.load(Ordering::Acquire)
+        self.hub.coordinator.is_open(self.hub.shutdown_id)
     }
 }
 
