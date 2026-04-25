@@ -79,6 +79,15 @@ pub struct Stream<T> {
     /// drains past a segment boundary; the consumer also frees the
     /// old segment in the same step.
     pub(crate) head_seg: AtomicPtr<Segment<T>>,
+
+    /// When `true`, `send` / `send_iter` insert a `fence(SeqCst)`
+    /// between `tail_pos.store(Release)` and `not_empty.wake()`. This
+    /// closes the Dekker race between this stream's `tail.store +
+    /// parked.load` and the *peer* stream's `parked.store + tail.load`
+    /// in bidirectional patterns where the same thread is producer
+    /// here AND consumer on another stream (e.g. `Duplex`). The fence
+    /// adds ~3-5 ns per send on x86; opt-in only.
+    pub(crate) strict_wake: bool,
 }
 
 // Safety: slot access is partitioned by `head_pos` and `tail_pos`. The
@@ -100,6 +109,23 @@ impl<T> Stream<T> {
     /// Create an empty stream with one pre-allocated segment.
     /// Both cursors start at 0; `tail_seg == head_seg == first`.
     pub fn new() -> Self {
+        Self::new_inner(false)
+    }
+
+    /// Like [`new`](Self::new) but enables strict cross-thread ordering
+    /// in `send` / `send_iter`. Use this when the same thread acts as
+    /// producer on this stream AND as consumer on another stream
+    /// (the classic bidirectional pattern in `Duplex`). Adds an
+    /// `mfence` per send on x86 (~3-5 ns).
+    ///
+    /// For purely unidirectional use (one thread always sends, a
+    /// different thread always recvs), prefer [`new`](Self::new) — the
+    /// race this guards against cannot fire there.
+    pub fn new_strict() -> Self {
+        Self::new_inner(true)
+    }
+
+    fn new_inner(strict_wake: bool) -> Self {
         let first = Segment::<T>::new_boxed(0);
         Self {
             not_empty: Park::new(),
@@ -109,6 +135,7 @@ impl<T> Stream<T> {
             _pad1: CachePad([]),
             tail_seg: AtomicPtr::new(first),
             head_seg: AtomicPtr::new(first),
+            strict_wake,
         }
     }
 

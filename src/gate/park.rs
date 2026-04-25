@@ -95,8 +95,9 @@ impl Park {
     #[inline]
     pub fn wake(&self) {
         if self.parked.load(Ordering::Relaxed) {
-            // Safety: `parked == true` was published by the consumer with
-            // a SeqCst store; its `worker` write is therefore visible.
+            // Safety: `parked == true` was published by the consumer
+            // with a SeqCst store; its `worker` UnsafeCell write is
+            // therefore visible.
             unsafe {
                 if let Some(t) = &*self.worker.get() {
                     t.unpark();

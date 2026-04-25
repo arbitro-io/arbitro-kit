@@ -33,6 +33,13 @@ impl<T> Stream<T> {
         // to make the slot write visible cross-thread.
         self.tail_pos.store(seq + 1, Ordering::Release);
 
+        // Strict streams (Duplex) need an SC fence here to close the
+        // Dekker race against the peer-stream's parked.store + recheck.
+        // Cheap branch on a const-during-stream-lifetime field.
+        if self.strict_wake {
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
+
         // Wake consumer if parked. The wake call itself does an early
         // Relaxed-load of the parked flag; no syscall in the common
         // case where the consumer is already running.
@@ -74,6 +81,11 @@ impl<T> Stream<T> {
 
         // One Release for the whole batch.
         self.tail_pos.store(current_seq, Ordering::Release);
+
+        if self.strict_wake {
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
+
         self.not_empty.wake();
 
         Some(Receipt::new(current_seq - 1))

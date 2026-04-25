@@ -54,6 +54,7 @@
 //!   `wait_delivered`.
 
 mod buffered;
+mod duplex;
 mod receipt;
 mod recv;
 mod segment;
@@ -65,5 +66,6 @@ mod stream;
 mod tests;
 
 pub use buffered::BufferedSender;
+pub use duplex::{Duplex, DuplexEnd};
 pub use receipt::Receipt;
 pub use stream::Stream;

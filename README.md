@@ -53,6 +53,7 @@ state (used internally by `Ring` and `Mpmc`):
 | `Hub<In, Out>` | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
 | `Mpmc<T, RING_CAP>` | M:N sharded channel (N × `SignalSet` + M×N SPSC mini-rings) | high-throughput broker: M producers → N consumers with batched send | [mpmc.md](docs/mpmc.md) |
 | `Stream<T>`  | SPSC unbounded sequenced log (linked segments + `Park`) | fire-and-forget producer + `Receipt`-based delivery verification (3.5 ns/RT batched) | [stream.md](docs/stream.md) |
+| `Duplex<A, B>` | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
 
 ### Quick fragments
 
@@ -95,6 +96,22 @@ path amortizing one `fetch_or` over up to `RING_CAP` items:
 bits mean the Signal contract is honored — a stray `lock_mask` can
 never strand a pending message. Drop-safe, shutdown-safe,
 backpressure per producer. [→ mpmc.md](docs/mpmc.md)
+
+**`Stream<T>`** — SPSC unbounded sequenced log. **3.0 ns/op
+cross-thread** send (per-item, no backpressure check), **2.9 ns/op**
+batched via `send_iter K=256`. The producer never blocks; segments
+grow on demand. Each `send` returns a `Receipt` for O(1) delivery
+verification (`is_delivered` = one Acquire load) or blocking wait
+(`wait_delivered`). `BufferedSender` wraps the per-item API to give
+batched throughput via a local accumulator. [→ stream.md](docs/stream.md)
+
+**`Duplex<A, B>`** — bidirectional unbounded SPSC over two `Stream`s.
+**Zero-overhead wrapper** (3.0 vs 3.0 ns vs raw `Stream`). Each end
+sends one type and receives the other, type-checked at compile time.
+Fire-and-forget + `is_delivered` poll: **1.7 ns/op** = 585 M ops/s.
+`send_iter` + `wait_delivered` at K=512: **2.0 ns per verified
+round-trip** = 488 M RT/s — the fastest verified-RT number in the
+crate. [→ duplex.md](docs/duplex.md)
 
 ---
 
@@ -154,6 +171,55 @@ p.send(42);
 assert_eq!(p.recv(), 42);
 ```
 
+### Unbounded sequenced log (`Stream<T>`)
+
+```rust
+use arbitro_kit::stream::Stream;
+use std::sync::Arc;
+
+let stream: Arc<Stream<u64>> = Arc::new(Stream::new());
+
+// Producer: never blocks. Receipt carries the seq for verification.
+let r = stream.send(42);
+
+// Consumer (separate thread): set_consumer first, then recv.
+let s2 = stream.clone();
+std::thread::spawn(move || {
+    s2.set_consumer(std::thread::current());
+    while let Some(v) = s2.try_recv() {
+        // process v
+        let _ = v;
+    }
+});
+
+// Verify delivery from any thread holding the receipt — one Acquire load.
+if r.is_delivered(&stream) { /* peer drained past seq */ }
+```
+
+For batched throughput with a single-send API, wrap with
+`BufferedSender::new(stream.clone(), 64)` and call `tx.send(v)` —
+the wrapper accumulates locally and flushes via `send_iter` every K.
+
+### Bidirectional duplex (`Duplex<A, B>`)
+
+```rust
+use arbitro_kit::stream::Duplex;
+
+// Each end has a fixed direction: left sends `Req` and receives `Resp`.
+let (client, server) = Duplex::<Request, Response>::pair();
+
+// Fire and forget; keep the receipt for later verification.
+let r = client.send(req);
+
+// Or send a batch and verify delivery once.
+let r = client.send_iter(many_reqs).unwrap();
+client.wait_delivered(r);   // blocks until peer drained the whole batch
+```
+
+`Duplex` is a zero-overhead wrapper over two `Stream`s; the
+direction is enforced at compile time, so the producer can't drain
+its own outbound by mistake.
+
 ---
 
 ## Guarantees
@@ -201,6 +267,12 @@ Shipped today:
 - [x] `Mpmc<T, RING_CAP>` — M:N sharded channel with per-(producer,shard)
       mini-rings, level-triggered bits, batched `try_send_batch` path,
       panic-safe Drop, built-in shutdown
+- [x] `Stream<T>` — SPSC unbounded sequenced log with `Receipt`-based
+      delivery verification; `BufferedSender` accumulator; opt-in
+      `strict_wake` mode for bidirectional patterns
+- [x] `Duplex<A, B>` — bidirectional unbounded SPSC over two `Stream`s
+      with type-safe direction; built on `strict_wake` so 1M-scale
+      lockstep RPC is deadlock-free
 
 Next:
 
@@ -241,6 +313,7 @@ cargo bench --bench hub_sparse           # Hub drain on sparse-bit fan-in
 cargo bench --bench hub_multibit         # Hub drain on multi-bit fan-in
 cargo bench --bench ring_byo_atomic      # Ring with `Signal::from_bit` BYO-atomic
 cargo bench --bench stream_overhead      # Stream send / send_iter / ack-RTT / lockstep
+cargo bench --bench duplex_overhead      # Duplex zero-overhead check + RPC patterns + fire-and-forget
 cargo bench --bench rpc_patterns         # lockstep / busy-spin / batched / buffered / ack-RTT
 cargo bench --bench ring_vs_disruptor    # Ring vs LMAX-port disruptor SPSC
 ```

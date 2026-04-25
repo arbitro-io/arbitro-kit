@@ -164,6 +164,17 @@ cargo bench --bench ring_vs_crossbeam     # SPSC reference vs crossbeam_channel
   are `AtomicU64` on separate cache lines. The producer's Release on
   `tail_pos` after a slot write makes the slot visible; the consumer's
   Acquire load establishes the happens-before.
+- **`strict_wake` opt-in (`Stream::new_strict()`)** — adds a single
+  `fence(SeqCst)` between `tail_pos.store(Release)` and the consumer
+  wake-up call. This closes the Dekker race between `tail_pos` and
+  `parked` that becomes visible at very high message rates in
+  bidirectional / lockstep patterns (each thread is producer of one
+  Stream and consumer of another). Cost: ~3–5 ns extra per `send` on
+  x86 (a single `mfence`). The default `Stream::new()` does **not**
+  emit the fence — keep using it for one-way pipelines where the
+  producer never converges on the empty/full boundary with its own
+  recv. `Duplex<A, B>` uses `new_strict()` internally, which is why
+  its lockstep RPC at 1M+ messages is deadlock-free.
 - **Segment links** (`next: AtomicPtr<Segment<T>>`) are published with
   Release by the producer and followed with Acquire by the consumer.
   Old segments are freed by the consumer once it drains past them.
@@ -172,12 +183,16 @@ cargo bench --bench ring_vs_crossbeam     # SPSC reference vs crossbeam_channel
 
 `Stream<T>` is intentionally minimal so higher-level patterns compose:
 
-- **Bidirectional (Nexo-style)**: pair two streams, one per direction.
-  Caller correlates replies if needed.
-- **RPC**: producer sends, consumer processes, replies on a reverse
-  stream. Caller handles correlation. See `benches/rpc_patterns.rs`
-  for the lockstep vs batched comparison that established 3.5 ns/RT
-  as the practical floor.
+- **Bidirectional**: use [`Duplex<A, B>`](duplex.md). It is a
+  zero-overhead wrapper over two `Stream`s with type-safe direction
+  enforcement and convenience methods for receipt verification. The
+  fastest verified-RT pattern in the crate (2.0 ns/RT at K=512) lives
+  there.
+- **RPC**: producer sends on one direction, consumer processes,
+  replies on the reverse direction. Caller handles correlation. See
+  `benches/rpc_patterns.rs` for the lockstep vs batched comparison
+  that established 3.5 ns/RT as the Stream-only floor and `Duplex`'s
+  own bench for the bidirectional patterns built on it.
 - **Fan-out / broadcast**: not yet built. Two architectures sketched
   in `docs/research/stream_brainstorm.md`: multi-SPSC tee for low N,
   shared-log + per-consumer cursors for high N.
