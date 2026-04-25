@@ -87,9 +87,8 @@ exceeds memcpy. [→ ring.md](docs/ring.md)
 ~15 ns of the physical cross-core L1↔L1 coherence floor. Zero-copy
 ownership transfer: `Vec<u8>` of 1 MB transfers at ~67 GB/s effective
 throughput, `Arc<Vec<u8>>` of 16 MB at ~103 TB/s effective (pointer
-clone, nothing physically moves). Beats `crossbeam::channel` 3.2× on
-handshake latency and `std::mpsc` 205×. Panic-safe: a handler panic
-poisons the channel and wakes the blocked client cleanly.
+clone, nothing physically moves). Panic-safe: a handler panic poisons
+the channel and wakes the blocked client cleanly.
 [→ channel.md](docs/channel.md)
 
 **`Hub<In, Out>`** — 12.5 ns/op send + drain local, 89 ns p50 full
@@ -102,16 +101,13 @@ Max 63 ports; shard across multiple Hubs for higher throughput.
 **`Mpmc<T, RING_CAP>`** — M:N sharded channel. Per-item `send` at
 ~33 ns p50 (`8P/1C`) and ~22 ns p50 (`8P/8C`). With the `try_send_batch`
 path amortizing one `fetch_or` over up to `RING_CAP` items:
-**0.74 ns/op p50 at `8P/8C` → ~1.03 G ops/sec, 116× faster than
-`crossbeam::channel::bounded(1024)` at the same shape**. Supports
+**0.74 ns/op p50 at `8P/8C` → ~1.03 G ops/sec**. Supports
 **`M ≤ 255` producers** via a chunked `SignalSet` — the shard bitmap
 grows from one to four `AtomicU64` chunks as needed, with one
-Acquire load per chunk on the drain scan. Beats `tokio::mpsc` by
-**2.15×–2.33× sustained** in TCP-loaded broker benches from `M = 16`
-to `M = 150`. Level-triggered bits mean the Signal contract is
-honored — a stray `lock_mask` can never strand a pending message.
-Drop-safe, shutdown-safe, backpressure per producer.
-[→ mpmc.md](docs/mpmc.md)
+Acquire load per chunk on the drain scan. Level-triggered bits mean
+the Signal contract is honored — a stray `lock_mask` can never
+strand a pending message. Drop-safe, shutdown-safe, backpressure
+per producer. [→ mpmc.md](docs/mpmc.md)
 
 **`Stream<T>`** — SPSC unbounded sequenced log. **3.0 ns/op
 cross-thread** send (per-item, no backpressure check), **2.9 ns/op**
@@ -285,8 +281,7 @@ Shipped today:
 - [x] `Mpmc<T, RING_CAP>` — M:N sharded channel with per-(producer,shard)
       mini-rings, level-triggered bits, batched `try_send_batch` path,
       panic-safe Drop, built-in shutdown; supports `M ≤ 255` producers
-      via the chunked `SignalSet`, 2× sustained over `tokio::mpsc` in
-      TCP-loaded broker benches up to `M = 150`
+      via the chunked `SignalSet`
 - [x] `Stream<T>` — SPSC unbounded sequenced log with `Receipt`-based
       delivery verification; `BufferedSender` accumulator; opt-in
       `strict_wake` mode for bidirectional patterns

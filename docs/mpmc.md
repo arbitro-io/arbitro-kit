@@ -51,66 +51,52 @@ scan — still O(chunks), not O(M).
   consumer that advances `tail` on one of this producer's rings wakes
   it.
 
-## Head-to-head — `Mpmc` vs `crossbeam::channel::bounded(1024)`
+## Cost — `Mpmc` numbers
 
 Measured on WSL x86_64, 500 rounds × 1000 ops, `RING_CAP = 64`.
 
 ```
 ── A. Single-thread 1P/1C (hot path, no park) ──
-primitive                              p50_ns/op   p99_ns/op       ops/sec
+shape                                 p50_ns/op   p99_ns/op       ops/sec
 ────────────────────────────────────────────────────────────────────────
-Mpmc 1P/1C single-thread                    10.84       23.21    88_299_331
+Mpmc 1P/1C single-thread                  10.84       23.21    88_299_331
 
 ── B. 1P/1C cross-thread ──
-Mpmc 1P/1C cross-thread                     81.27      169.41    12_154_020
+Mpmc 1P/1C cross-thread                   81.27      169.41    12_154_020
 
 ── C. MP/1C fan-in (producer wall-time per round, 1000 ops split across M) ──
-primitive                              p50_ns/op   p99_ns/op       ops/sec
-────────────────────────────────────────────────────────────────────────
-Mpmc    2P/1C                               57.37      176.73    16_290_605
-crossbeam 2P/1C                             15.44       29.51    63_084_127
-Mpmc    4P/1C                               38.40      154.54    23_519_381
-crossbeam 4P/1C                             21.56       66.59    42_316_073
-Mpmc    8P/1C                               33.05      758.80    15_892_315
-crossbeam 8P/1C                             44.51      135.69    20_212_976
+Mpmc 2P/1C                                57.37      176.73    16_290_605
+Mpmc 4P/1C                                38.40      154.54    23_519_381
+Mpmc 8P/1C                                33.05      758.80    15_892_315
 
 ── D. 1P/NC fan-out ──
-Mpmc    1P/2C                               85.34      103.83    11_667_064
-crossbeam 1P/2C                             13.57       18.51    74_800_089
-Mpmc    1P/4C                               49.48       74.38    19_479_972
-crossbeam 1P/4C                             20.01       37.30    48_613_140
-Mpmc    1P/8C                               45.40    7_244.32     2_103_546
-crossbeam 1P/8C                             64.94      571.55    11_285_877
+Mpmc 1P/2C                                85.34      103.83    11_667_064
+Mpmc 1P/4C                                49.48       74.38    19_479_972
+Mpmc 1P/8C                                45.40    7_244.32     2_103_546
 
 ── E. MP/NC symmetric (per-item send) ──
-Mpmc    2P/2C                               56.84       99.46    17_000_544
-crossbeam 2P/2C                             13.78       43.57    68_186_647
-Mpmc    4P/4C                               32.95      137.53    26_290_811
-crossbeam 4P/4C                             22.32      147.44    35_389_714
-Mpmc    8P/8C                               21.57    2_328.70     5_953_160
-crossbeam 8P/8C                             86.11    4_988.45     3_996_447
+Mpmc 2P/2C                                56.84       99.46    17_000_544
+Mpmc 4P/4C                                32.95      137.53    26_290_811
+Mpmc 8P/8C                                21.57    2_328.70     5_953_160
 
 ── G. MP/NC producer-batched (try_send_batch, chunk=64) ──
-primitive                              p50_ns/op   p99_ns/op       ops/sec
-────────────────────────────────────────────────────────────────────────
-Mpmc    2P/2C batched-64                     1.89        3.78   503_892_062
-Mpmc    4P/4C batched-64                     0.95        1.67   721_022_120
-Mpmc    8P/8C batched-64                     0.74        7.26 1_032_543_712
+Mpmc 2P/2C batched-64                      1.89        3.78   503_892_062
+Mpmc 4P/4C batched-64                      0.95        1.67   721_022_120
+Mpmc 8P/8C batched-64                      0.74        7.26 1_032_543_712
 ```
 
 **At `8P/8C` with batched sends, `Mpmc` sustains ~1.03 G ops/sec** —
-116× `crossbeam::channel::bounded` at the same shape, and 29× the
-per-item `send` path on the same primitive. The batch win isn't
-algorithmic magic: it's amortizing one `fetch_or` (the only
-cache-line-contended op) and one `head.store` over up to 64 messages.
-Per-item `send` pays one atomic RMW on a cross-core cache line per
-message; batched pays one per chunk.
+about 29× the per-item `send` path on the same primitive. The batch
+win isn't algorithmic magic: it's amortizing one `fetch_or` (the
+only cache-line-contended op) and one `head.store` over up to 64
+messages. Per-item `send` pays one atomic RMW on a cross-core cache
+line per message; batched pays one per chunk.
 
 Reproduce with:
 
 ```bash
-cargo bench --bench mpmc_overhead   # full MP/NC sweep + batched + crossbeam
-cargo bench --bench fanin_h2h       # Hub vs Mpmc vs crossbeam_channel fan-in
+cargo bench --bench mpmc_overhead
+cargo bench --bench fanin_h2h
 ```
 
 ## When to use per-item vs batched
@@ -175,20 +161,20 @@ drain priority is the consumer's).
 ## High-M throughput (TCP-loaded broker scenario)
 
 End-to-end throughput sweep on a `mpsc_overhead` bench (M conns →
-TCP → `Mpmc` → 1 sync decoder), comparing against `tokio::mpsc`.
-The chunked SignalSet activates transparently from `M = 64`:
+TCP → `Mpmc` → 1 sync decoder). The chunked SignalSet activates
+transparently from `M = 64`:
 
-| M     | tokio::mpsc | `Mpmc` shared | speedup | chunks |
-| ----: | ----------: | ------------: | ------: | -----: |
-| 16    |     16.0 ms |      8.1 ms   |  1.97×  |    1   |
-| 32    |     46.2 ms |     20.6 ms   |  2.24×  |    1   |
-| 60    |     88.6 ms |     38.8 ms   |  2.29×  |    1   |
-| 100   |    148.0 ms |     63.4 ms   |  2.33×  |    2   |
-| 150   |    213.7 ms |     99.5 ms   |  2.15×  |    3   |
+| M     | `Mpmc` shared | chunks |
+| ----: | ------------: | -----: |
+| 16    |       8.1 ms  |    1   |
+| 32    |      20.6 ms  |    1   |
+| 60    |      38.8 ms  |    1   |
+| 100   |      63.4 ms  |    2   |
+| 150   |      99.5 ms  |    3   |
 
-Speedup holds at ~2× sustained from `M = 16` through `M = 150`
-(rounds reduced for the high-M points to avoid TCP TIME_WAIT
-exhaustion on `localhost`).
+Throughput per producer stays roughly constant as `M` and the
+chunk count grow (rounds reduced for the high-M points to avoid
+TCP TIME_WAIT exhaustion on `localhost`).
 
 ## Limits
 
