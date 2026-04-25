@@ -111,6 +111,62 @@ The batch API trades a little caller complexity (manage a `Vec<T>`,
 loop until drained, fall back to `send()` on a full stall) for ~30×
 less CPU on bursty workloads.
 
+## Capacity introspection
+
+Both handles expose snapshot-only inspection methods for metrics,
+saturation alarms, and heuristic backpressure. Each returns a
+**point-in-time** view: a peer thread may push or drain between when
+the snapshot is taken and when the caller reads the result. Use them
+for observability, never as a correctness gate — the actual
+"can I send?" question is still answered by `try_send` /
+`try_send_batch` returning `Ok` or `Err`.
+
+| Producer side                  | Returns                                       |
+| :----------------------------- | :-------------------------------------------- |
+| `capacity_per_shard()`         | `RING_CAP` (compile-time)                     |
+| `total_capacity()`             | `N × RING_CAP`                                |
+| `available_in_shard(s)`        | free slots in shard `s` for this producer     |
+| `available()`                  | sum of `available_in_shard(s)` over `0..N`    |
+| `pending_in_shard(s)`          | `head − tail` for this producer in shard `s`  |
+| `has_idle_shard()`             | `bool` — already existed; cheaper fast path   |
+
+| Consumer side                  | Returns                                       |
+| :----------------------------- | :-------------------------------------------- |
+| `capacity_per_producer()`      | `RING_CAP` (compile-time)                     |
+| `total_capacity()`             | `M × RING_CAP`                                |
+| `pending()`                    | sum of `head − tail` across all `M` rings     |
+| `available()`                  | sum of free slots across all `M` rings        |
+| `pending_from(p)`              | per-producer pending in this shard            |
+| `has_pending()`                | O(chunks) fast path — any bit set anywhere    |
+
+### Cost
+
+Each non-`const` method is a small fixed number of atomic loads
+(one `Acquire` + one `Relaxed` per ring inspected). They never
+modify state and never compete with `try_send` / `recv` for cache
+lines, so the hot path is byte-identical with or without these
+calls in the program. At `M = 150` consumers, `pending()` reads
+`2 × 150 = 300` atomic loads ≈ 50 ns from L1 — well below any
+metric scrape interval.
+
+`has_pending()` is the cheapest signal: one `Acquire` load per
+chunk plus a chunk-mask AND. For `M ≤ 64` that's one load total.
+
+### Example: gauge + saturation alarm
+
+```rust
+// Periodic metrics task (run on a timer, not in the hot path).
+loop {
+    metrics.gauge("mpmc.pending",   consumer.pending() as f64);
+    metrics.gauge("mpmc.available", consumer.available() as f64);
+
+    if consumer.pending() > consumer.total_capacity() * 9 / 10 {
+        warn!("Mpmc shard {} above 90% fill", consumer.shard());
+    }
+    sleep(Duration::from_secs(1)).await;
+}
+```
+
 ## Level-triggered bits (why this doesn't deadlock)
 
 Earlier drafts optimized the `fetch_or` to fire **only on the
