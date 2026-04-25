@@ -50,6 +50,31 @@ signal primitive exists in safe Rust.
   consumer's `SeqCst` store on `parked` + recheck of `locked` is what
   guarantees forward progress. Do not weaken it.
 
+## BYO-atomic via `SignalSource`
+
+`Signal` is generic over a `SignalSource` trait that provides the
+open/closed bit. The default `OwnedBool` carries its own `AtomicBool`,
+but two view types let you bind a `Signal` over an atomic the caller
+already owns:
+
+- `Signal::from_bool(&AtomicBool)` — wraps a borrowed `AtomicBool`
+  (`BoolView`). `true` = open.
+- `Signal::from_bit(&AtomicU64, bit)` — wraps a single bit of a shared
+  `AtomicU64` (`BitView`). Multiple `Signal`s can coexist over the same
+  `AtomicU64`; updates use `fetch_or` / `fetch_and`.
+
+Use these when readiness is already encoded in your own state and
+duplicating it into a private `AtomicBool` would just add cache traffic.
+
+## `Signal` vs `Park`
+
+`Signal` = `Park` + an owned `SignalSource`. When the readiness state
+*already* lives in the caller's data (e.g. a ring's head/tail cursors),
+prefer `Park` directly: the consumer's predicate reads the existing
+state, the producer's `wake()` only touches the parked flag, and one
+Release store on the hot path disappears. `Ring` and `Mpmc` are built
+on `Park` for exactly this reason.
+
 ## Concurrency model
 
 Exactly **one consumer** may call `acquire()` / `set_worker()`. Any

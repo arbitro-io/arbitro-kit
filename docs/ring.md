@@ -6,10 +6,19 @@
 producer, one consumer), but with `CAP` slots pre-allocated inline so
 producer and consumer can **overlap in time** instead of alternating.
 
-Two `Signal`s coordinate the two wait states:
+Two `Park` primitives coordinate the two wait states:
 
 - `not_empty` — consumer parks here when ring is empty.
 - `not_full`  — producer parks here when ring is full.
+
+`Ring` uses `Park` rather than full `Signal`s because the readiness
+predicate (`head != tail`, or `head - tail < CAP`) is fully determined
+by the cursors that producer and consumer already publish. `Park`'s
+`wait_until(predicate)` reads them directly, eliminating the redundant
+Release store on a separate `locked: AtomicBool` that a `Signal` would
+require. Hot-path cost drops accordingly — see the cross-thread
+per-item numbers below and `benches/ring_vs_crossbeam.rs` for an
+apples-to-apples SPSC comparison vs `crossbeam_channel::bounded`.
 
 Both sides follow the canonical **lock-check-acquire** park protocol:
 only the waiter closes its signal, never the hot path — so `try_send`
@@ -176,6 +185,14 @@ Payload size     │ Best strategy
 **Pool always wins above 256 B**, often by 2–15×. If your payload is
 bigger than a handful of bytes, recycle buffers. A `BufferPool<T>`
 utility shipping with the crate is on the roadmap.
+
+## BYO-atomic readiness
+
+For callers that want to share a coordination word across multiple
+primitives, `Signal::from_bool` and `Signal::from_bit` let an external
+`AtomicBool` or a single bit of an `AtomicU64` drive a `Signal`. See
+`benches/ring_byo_atomic.rs` for a measured comparison against the
+default owned-atomic `Ring`.
 
 ## Safety
 

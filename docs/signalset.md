@@ -56,4 +56,9 @@ flow.release(g_store);
 
 See the `Signal` numbers — `SignalSet` adds one atomic OR over that
 path, plus one mask-AND + compare on the consumer side. Within a
-couple of ns of raw `Signal`.
+couple of ns of raw `Signal`. Reproduce with:
+
+```bash
+cargo bench --bench signalset_factory
+cargo bench --bench signalset_vs_signals
+```

@@ -8,8 +8,15 @@
 outbound `Pipe<Out>` for the drain's reply. Round-robin fairness across
 ports prevents starvation.
 
-Max **63 user ports** (bit 63 is reserved for `HubShutdown`, which wakes
-the drain out of a blocked `recv_batch` for clean teardown).
+Max **63 user ports** (bit 63 of the coordinator `SignalSet` is reserved
+for `HubShutdown`, which wakes the drain out of a blocked `recv_batch`
+for clean teardown — and is the *single* source of truth for shutdown,
+no shadow `AtomicBool`).
+
+The drain iterates only the **set bits** of the coordinator state via
+`trailing_zeros`, so cost scales with the number of active ports per
+wake, not with the configured `N`. Inbound slots are 64-byte padded so
+two adjacent ports never share a cache line.
 
 ## Wire model
 
@@ -43,7 +50,10 @@ multiple `Hub`s.
 Reproduce with:
 
 ```bash
-cargo bench --bench hub_overhead
+cargo bench --bench hub_overhead   # Hub send + drain + RTT
+cargo bench --bench hub_sparse     # drain cost on sparse-bit fan-in
+cargo bench --bench hub_multibit   # drain cost when many bits fire per wake
+cargo bench --bench fanin_h2h      # Hub vs Mpmc vs crossbeam_channel
 ```
 
 ## Shutdown

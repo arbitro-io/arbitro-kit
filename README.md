@@ -36,12 +36,16 @@ correctness notes across x86/ARM, and the concurrency model.
 
 ## What you can build on top
 
-`Signal` is the atom. Six composites ship in the crate, each a thin
-wrapper — most of the cost model carries over unchanged:
+`Signal` is the atom. A small family of composites ships in the crate,
+each a thin wrapper — most of the cost model carries over unchanged.
+A second low-level primitive, `Park`, exposes the stateless park/unpark
+half of `Signal` for callers that already track readiness in their own
+state (used internally by `Ring` and `Mpmc`):
 
 | Type         | Shape                                     | What it adds                                                        | Docs |
 | :----------- | :---------------------------------------- | :------------------------------------------------------------------ | :--- |
-| `Signal`     | single-bit M:1 signal                     | the primitive itself                                                | [signal.md](docs/signal.md) |
+| `Signal`     | single-bit M:1 signal                     | the primitive itself; BYO-atomic via `from_bool` / `from_bit`        | [signal.md](docs/signal.md) |
+| `Park`       | stateless park/unpark                     | wait on caller-owned readiness state (no duplicated `AtomicBool`)   | (used by `Ring`, `Mpmc`) |
 | `SignalSet`  | up to 64 bits in one `AtomicU64`          | wait for any / all / subset of named signals                        | [signalset.md](docs/signalset.md) |
 | `Pipe<T, H>` | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks             | [pipe.md](docs/pipe.md) |
 | `Ring<T, CAP>` | SPSC N-slot pipelined queue (2 × `Signal`) | burst absorption, pipelined throughput, batch send + batch ack      | [ring.md](docs/ring.md) |
@@ -230,6 +234,11 @@ cargo bench --bench ring_overhead        # Ring FLOW / ROUND-TRIP / payload swee
 cargo bench --bench gate_overhead        # Channel vs crossbeam vs mpsc
 cargo bench --bench hub_overhead         # Hub throughput + RTT
 cargo bench --bench mpmc_overhead        # Mpmc MP/NC sweep + batched + crossbeam
+cargo bench --bench fanin_h2h            # Hub vs Mpmc vs crossbeam_channel fan-in
+cargo bench --bench ring_vs_crossbeam    # SPSC apples-to-apples vs crossbeam
+cargo bench --bench hub_sparse           # Hub drain on sparse-bit fan-in
+cargo bench --bench hub_multibit         # Hub drain on multi-bit fan-in
+cargo bench --bench ring_byo_atomic      # Ring with `Signal::from_bit` BYO-atomic
 ```
 
 For publication-grade numbers on Linux, pin the producer/consumer

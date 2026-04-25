@@ -101,7 +101,8 @@ message; batched pays one per chunk.
 Reproduce with:
 
 ```bash
-cargo bench --bench mpmc_overhead
+cargo bench --bench mpmc_overhead   # full MP/NC sweep + batched + crossbeam
+cargo bench --bench fanin_h2h       # Hub vs Mpmc vs crossbeam_channel fan-in
 ```
 
 ## When to use per-item vs batched
