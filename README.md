@@ -50,7 +50,7 @@ by what's under the hood:
 | [`gate`](src/gate/)     | "How do I synchronize?" (no payload)            | `Signal`, `SignalSet`, `Park` |
 | [`slot`](src/slot/)     | "1 message in flight, no buffer?"               | `Pipe`, `Channel` |
 | [`stream`](src/stream/) | "FIFO of messages?"                             | `Ring`, `Stream`, `Duplex`, `BufferedSender` |
-| [`route`](src/route/)   | "N→M with topology?"                            | `Hub`, `Mpmc` |
+| [`route`](src/route/)   | "N→M with topology?"                            | `Hub`, `Mpmc`, `Mpsc` |
 
 | Type         | Module | Shape                                     | What it adds                                                        | Docs |
 | :----------- | :----- | :---------------------------------------- | :------------------------------------------------------------------ | :--- |
@@ -65,6 +65,7 @@ by what's under the hood:
 | `Duplex<A, B>` | stream | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
 | `Hub<In, Out>` | route  | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
 | `Mpmc<T, RING_CAP>` | route | M:N sharded channel (N × `SignalSet` + M×N SPSC mini-rings) | high-throughput broker: M producers → N consumers with batched send | [mpmc.md](docs/mpmc.md) |
+| `Mpsc<T, RING_CAP>` | route | M:1 fan-in channel (1 × `SignalSet` + M SPSC mini-rings) | single-consumer specialisation of `Mpmc`: no shard scan, no producer cursor, ~10% faster `try_send` | [mpsc.md](docs/mpsc.md) |
 
 ### Quick fragments
 
@@ -108,6 +109,16 @@ Acquire load per chunk on the drain scan. Level-triggered bits mean
 the Signal contract is honored — a stray `lock_mask` can never
 strand a pending message. Drop-safe, shutdown-safe, backpressure
 per producer. [→ mpmc.md](docs/mpmc.md)
+
+**`Mpsc<T, RING_CAP>`** — single-consumer specialisation of `Mpmc`.
+Same per-producer SPSC mini-ring + bitmap aggregator design, with
+`N = 1` hardcoded so the `Shard` indirection collapses, the producer
+cursor disappears, and the `try_send` hot path becomes a direct ring
+write (no shard scan, no modulo). **~7-12% faster `try_send` than
+`Mpmc::new(M, 1)`** in single-thread microbenches; cross-thread is
+within noise or slightly faster. Use it whenever the topology is
+permanently M:1 — same drop-safety, shutdown, and backpressure
+guarantees as `Mpmc`. [→ mpsc.md](docs/mpsc.md)
 
 **`Stream<T>`** — SPSC unbounded sequenced log. **3.0 ns/op
 cross-thread** send (per-item, no backpressure check), **2.9 ns/op**
@@ -282,6 +293,10 @@ Shipped today:
       mini-rings, level-triggered bits, batched `try_send_batch` path,
       panic-safe Drop, built-in shutdown; supports `M ≤ 255` producers
       via the chunked `SignalSet`
+- [x] `Mpsc<T, RING_CAP>` — M:1 fan-in specialisation of `Mpmc` (N=1
+      collapsed). No shard scan, no producer cursor; ~10% faster
+      `try_send` than `Mpmc::new(M, 1)` in microbenches. Same drop /
+      shutdown / backpressure guarantees as `Mpmc`
 - [x] `Stream<T>` — SPSC unbounded sequenced log with `Receipt`-based
       delivery verification; `BufferedSender` accumulator; opt-in
       `strict_wake` mode for bidirectional patterns
@@ -326,6 +341,7 @@ cargo bench --bench ring_overhead        # Ring FLOW / ROUND-TRIP / payload swee
 cargo bench --bench gate_overhead        # Channel vs crossbeam vs mpsc
 cargo bench --bench hub_overhead         # Hub throughput + RTT
 cargo bench --bench mpmc_overhead        # Mpmc MP/NC sweep + batched + crossbeam
+cargo bench --bench mpsc_vs_mpmc         # Mpsc vs Mpmc(M,1) head-to-head
 cargo bench --bench fanin_h2h            # Hub vs Mpmc vs crossbeam_channel fan-in
 cargo bench --bench ring_vs_crossbeam    # SPSC apples-to-apples vs crossbeam
 cargo bench --bench hub_sparse           # Hub drain on sparse-bit fan-in

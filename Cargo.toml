@@ -46,6 +46,10 @@ name = "mpmc_overhead"
 harness = false
 
 [[bench]]
+name = "mpsc_vs_mpmc"
+harness = false
+
+[[bench]]
 name = "signalset_vs_signals"
 harness = false
 
