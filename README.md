@@ -114,9 +114,11 @@ per producer. [→ mpmc.md](docs/mpmc.md)
 Same per-producer SPSC mini-ring + bitmap aggregator design, with
 `N = 1` hardcoded so the `Shard` indirection collapses, the producer
 cursor disappears, and the `try_send` hot path becomes a direct ring
-write (no shard scan, no modulo). **~7-12% faster `try_send` than
-`Mpmc::new(M, 1)`** in single-thread microbenches; cross-thread is
-within noise or slightly faster. Use it whenever the topology is
+write (no shard scan, no modulo). After cache-line padding on
+`head` / `tail`: **per-item ~32-44 ns p50** cross-thread (M=4-16),
+**13-21% faster** than `Mpmc::new(M, 1)` in single-thread; with
+`try_send_batch(K=64)` the producer hot path drops to **~15-18 ns/op
+p50 — ~2-2.5× over per-item**. Use it whenever the topology is
 permanently M:1 — same drop-safety, shutdown, and backpressure
 guarantees as `Mpmc`. [→ mpsc.md](docs/mpsc.md)
 

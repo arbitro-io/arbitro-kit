@@ -7,9 +7,11 @@
 //! The hot-path difference is in `try_send`: Mpsc skips the adaptive
 //! shard scan + cursor update because there is exactly one shard.
 //!
-//! Two scenarios:
+//! Three scenarios:
 //!   A. Cross-thread M producers blast into 1 consumer — total throughput.
 //!   B. Single-thread try_send / try_recv steady-state (no parking).
+//!   C. Cross-thread BATCHED via `try_send_batch(K=64)` — amortizes the
+//!      SignalSet `fetch_or` and `head.store` across K items.
 //!
 //! Conforms to bench_safety: ROUNDS = 1000, timeout-friendly, tee log
 //! expected from runner, no background work.
@@ -29,6 +31,7 @@ const ROUNDS: usize = 1000;       // per bench_safety: max 1000 msgs per run.
 const RUNS: usize = 50;            // 50 measurements for stable cross-thread stats
 const WARMUP: usize = 2;
 const M_VARIANTS: &[usize] = &[4, 8, 16];
+const BATCH_K: usize = 64;         // try_send_batch chunk size for section C
 
 #[inline(never)]
 fn run_mpsc(m: usize) -> u128 {
@@ -152,6 +155,128 @@ fn run_mpmc_st_hotpath(m: usize) -> u128 {
     elapsed
 }
 
+/// Cross-thread batched: each producer accumulates BATCH_K items and pushes
+/// them in one `try_send_batch`. Amortizes the SignalSet `fetch_or` and the
+/// `head.store(Release)` across the whole chunk.
+#[inline(never)]
+fn run_mpsc_batched(m: usize) -> u128 {
+    let (ps, c, sd) = Mpsc::<u64, RING_CAP>::new(m);
+    let total = m * ROUNDS;
+    let received = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(m + 2));
+
+    let received_c = received.clone();
+    let b_c = barrier.clone();
+    let consumer_h = thread::spawn(move || {
+        c.bind();
+        b_c.wait();
+        let mut got = 0usize;
+        while got < total {
+            let _ = c.recv_batch(|_v| {
+                received_c.fetch_add(1, Ordering::Relaxed);
+            });
+            got = received_c.load(Ordering::Relaxed);
+        }
+    });
+
+    let producer_handles: Vec<_> = ps.into_iter().map(|p| {
+        let b = barrier.clone();
+        thread::spawn(move || {
+            p.bind();
+            b.wait();
+            let mut chunk: Vec<u64> = Vec::with_capacity(BATCH_K);
+            for v in 0..ROUNDS as u64 {
+                chunk.push(v);
+                if chunk.len() == BATCH_K {
+                    while !chunk.is_empty() {
+                        let n = p.try_send_batch(&mut chunk);
+                        if n == 0 {
+                            // Ring full — fall back to send for remainder.
+                            let v = chunk.remove(0);
+                            p.send(v);
+                        }
+                    }
+                }
+            }
+            // Flush remainder.
+            while !chunk.is_empty() {
+                let n = p.try_send_batch(&mut chunk);
+                if n == 0 {
+                    let v = chunk.remove(0);
+                    p.send(v);
+                }
+            }
+        })
+    }).collect();
+
+    barrier.wait();
+    let t0 = Instant::now();
+    for h in producer_handles { h.join().unwrap(); }
+    consumer_h.join().unwrap();
+    let elapsed = t0.elapsed().as_nanos();
+    sd.signal();
+    elapsed
+}
+
+#[inline(never)]
+fn run_mpmc_batched(m: usize) -> u128 {
+    let (ps, mut cs, sd) = Mpmc::<u64, RING_CAP>::new(m, 1);
+    let c = cs.remove(0);
+    let total = m * ROUNDS;
+    let received = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(m + 2));
+
+    let received_c = received.clone();
+    let b_c = barrier.clone();
+    let consumer_h = thread::spawn(move || {
+        c.bind();
+        b_c.wait();
+        let mut got = 0usize;
+        while got < total {
+            let _ = c.recv_batch(|_v| {
+                received_c.fetch_add(1, Ordering::Relaxed);
+            });
+            got = received_c.load(Ordering::Relaxed);
+        }
+    });
+
+    let producer_handles: Vec<_> = ps.into_iter().map(|p| {
+        let b = barrier.clone();
+        thread::spawn(move || {
+            p.bind();
+            b.wait();
+            let mut chunk: Vec<u64> = Vec::with_capacity(BATCH_K);
+            for v in 0..ROUNDS as u64 {
+                chunk.push(v);
+                if chunk.len() == BATCH_K {
+                    while !chunk.is_empty() {
+                        let n = p.try_send_batch(&mut chunk);
+                        if n == 0 {
+                            let v = chunk.remove(0);
+                            p.send(v);
+                        }
+                    }
+                }
+            }
+            while !chunk.is_empty() {
+                let n = p.try_send_batch(&mut chunk);
+                if n == 0 {
+                    let v = chunk.remove(0);
+                    p.send(v);
+                }
+            }
+        })
+    }).collect();
+
+    barrier.wait();
+    let t0 = Instant::now();
+    for h in producer_handles { h.join().unwrap(); }
+    consumer_h.join().unwrap();
+    let elapsed = t0.elapsed().as_nanos();
+    sd.signal();
+    elapsed
+}
+
 fn percentile(sorted: &[u128], p: f64) -> u128 {
     if sorted.is_empty() { return 0; }
     let idx = ((sorted.len() as f64 - 1.0) * p) as usize;
@@ -199,6 +324,14 @@ fn main() {
         let total = m * ROUNDS;
         measure("mpsc(M)         st  ", m, total, || run_mpsc_st_hotpath(m));
         measure("mpmc(M,1)       st  ", m, total, || run_mpmc_st_hotpath(m));
+        println!();
+    }
+
+    println!("── C. Cross-thread BATCHED (try_send_batch K={}) ──", BATCH_K);
+    for &m in M_VARIANTS {
+        let total = m * ROUNDS;
+        measure("mpsc(M)        batch", m, total, || run_mpsc_batched(m));
+        measure("mpmc(M,1)      batch", m, total, || run_mpmc_batched(m));
         println!();
     }
 

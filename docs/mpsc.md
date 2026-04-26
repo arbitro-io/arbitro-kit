@@ -60,29 +60,45 @@ Dekker park-or-drain, per-producer backpressure park.
 ## Cost — `Mpsc` vs `Mpmc(M, 1)` head-to-head
 
 Measured on x86_64 (i9-12900K, 24 logical cores), `RING_CAP = 256`,
-`ROUNDS = 1000`, **50 runs**, p50 reported.
+`ROUNDS = 1000`, **50 runs**, p50 reported. After the cache-line
+padding fix on `PRing::head` / `PRing::tail`.
 
 ```
-── A. Cross-thread (M producer threads → 1 consumer thread) ──
+── A. Cross-thread per-item — M producers blast `try_send`, 1 consumer drains ──
 M       Mpsc p50 ns/msg     Mpmc(M,1) p50 ns/msg     Speedup
 ────────────────────────────────────────────────────────────
-4         45.3                42.0                    Mpmc 8% faster
-8         35.2                39.2                    Mpsc 10% faster
-16        32.5                33.2                    tie
+4         43.7                46.3                    tie / Mpsc 6% faster
+8         37.6                36.8                    tie
+16        31.6                38.8                    Mpsc 19% faster
 
 ── B. Single-thread try_send/try_recv (no park) ──
 M       Mpsc p50 ns/msg     Mpmc(M,1) p50 ns/msg     Speedup
 ────────────────────────────────────────────────────────────
-4          9.2                10.3                    Mpsc 12% faster
-8          9.7                10.2                    Mpsc  5% faster
-16        11.4                12.6                    Mpsc 10% faster
+4          9.5                10.9                    Mpsc 13% faster
+8          9.5                12.1                    Mpsc 21% faster
+16        12.3                13.6                    Mpsc 10% faster
+
+── C. Cross-thread BATCHED via `try_send_batch(K=64)` ──
+M       Mpsc p50 ns/msg     Mpmc(M,1) p50 ns/msg     Speedup vs A
+────────────────────────────────────────────────────────────────
+4         18.2                18.0                    A → C: 2.4× faster
+8         15.2                16.1                    A → C: 2.5× faster
+16        14.9                15.0                    A → C: 2.1× faster
 ```
 
 The single-thread numbers isolate the producer hot-path cost (no
 park/unpark overhead, no cross-CPU traffic). Mpsc's advantage there
-is consistent ~7-12%, which matches the prediction: the saved
+is consistent 10-21%, which matches the prediction: the saved
 operations are `cursor.get`, `cursor.set`, the modulo `(start + k) % n`,
 and one branch.
+
+The **batched** numbers (section C) show why `try_send_batch` matters
+when the caller naturally has K items at once. With `BATCH_K = 64`,
+one `fetch_or` + one `head.store(Release)` covers all 64 items
+instead of 64 of each. The producer hot-path cost drops from ~33-46
+ns/op to ~15-18 ns/op — roughly **2-2.5× faster**. Mpsc and Mpmc are
+basically tied here because the cursor scan in Mpmc happens once per
+batch, not per item.
 
 Reproduce with:
 
@@ -140,6 +156,14 @@ let _ = consumer_h.join();
 ```
 
 ### Batched (high-throughput fan-in)
+
+When the caller naturally has multiple items at once, `try_send_batch`
+amortizes the SignalSet `fetch_or` (the only contended atomic on the
+producer hot path) and the `head.store(Release)` across the whole chunk.
+Measured ~2-2.5× faster than per-item `try_send` cross-thread (see
+section C in the cost table above). The **caller decides** when to
+batch — the kit can't aggregate behind your back without a separate
+buffering layer.
 
 ```rust
 use arbitro_kit::route::Mpsc;
