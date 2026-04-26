@@ -94,18 +94,6 @@ name = "duplex_overhead"
 harness = false
 
 [[bench]]
-name = "duplex_probe"
-harness = false
-
-[[bench]]
-name = "stream_probe"
-harness = false
-
-[[bench]]
-name = "signal_duplex_probe"
-harness = false
-
-[[bench]]
 name = "lifeline_overhead"
 harness = false
 
