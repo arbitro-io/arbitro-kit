@@ -101,12 +101,30 @@ pub const MAX_MPMC_PRODUCERS: usize = 255;
 
 // ─── Per-(producer, shard) mini-Ring (SPSC) ───────────────────────────────
 
+/// Cache line size on x86_64 / aarch64. Used to separate `head` and `tail`
+/// onto distinct cache lines so the producer's `head.store(Release)` does
+/// not invalidate the consumer's cached `tail` (and vice versa). Without
+/// this padding every send triggers a cross-CPU cache-line bounce on the
+/// SAME line that holds both cursors — a textbook **false sharing** pitfall.
+///
+/// Same trick used by LMAX Disruptor, JCTools, DPDK rte_ring for the same
+/// reason. Mpsc's `PRing` carries the identical layout.
+const CACHE_LINE: usize = 64;
+
 /// SPSC ring owned by one producer on one shard. `RING_CAP` slots, indexed
 /// by `head & MASK` / `tail & MASK`. `head` only advances via the producer,
 /// `tail` only via the consumer.
+#[repr(C)]
 struct PRing<T: Send, const RING_CAP: usize> {
+    /// Producer cursor — only this producer writes; consumer reads with Acquire.
     head: AtomicUsize,
+    _pad_head: [u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
+    /// Consumer cursor — only the consumer writes; producer reads with Acquire.
     tail: AtomicUsize,
+    _pad_tail: [u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
+    /// Slot storage. Boxed so the struct itself stays small and easy to
+    /// stack-move during construction. The pointer here is read-only after
+    /// construction, so it's never on the cache-coherence hot path.
     slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
 }
 
@@ -118,7 +136,9 @@ impl<T: Send, const RING_CAP: usize> PRing<T, RING_CAP> {
             (0..RING_CAP).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect();
         Self {
             head: AtomicUsize::new(0),
+            _pad_head: [0u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
             tail: AtomicUsize::new(0),
+            _pad_tail: [0u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
             slots: slots.into_boxed_slice(),
         }
     }

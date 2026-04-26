@@ -22,7 +22,10 @@ use std::time::Instant;
 use arbitro_kit::route::{Mpmc, Mpsc};
 
 const RING_CAP: usize = 256;
-const ROUNDS: usize = 1000;       // per bench_safety: max 1000 msgs per run
+const ROUNDS: usize = 1000;       // per bench_safety: max 1000 msgs per run.
+                                   // For tighter cross-thread stats override at
+                                   // build time and re-run; we used 10k locally
+                                   // to validate the false-sharing fix.
 const RUNS: usize = 50;            // 50 measurements for stable cross-thread stats
 const WARMUP: usize = 2;
 const M_VARIANTS: &[usize] = &[4, 8, 16];
