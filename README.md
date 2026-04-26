@@ -337,22 +337,15 @@ Next:
 Every number in the docs is reproducible:
 
 ```bash
-cargo bench --bench signal_compare       # Signal vs raw AtomicBool
+cargo bench --bench gate_overhead        # gate primitives (Signal/SignalSet/Park) vs crossbeam Parker / mpsc
+cargo bench --bench channel_overhead     # Channel vs crossbeam vs std::mpsc round-trip
 cargo bench --bench pipe_overhead        # Pipe ST/XT + hook zero-cost claim
 cargo bench --bench ring_overhead        # Ring FLOW / ROUND-TRIP / payload sweep
-cargo bench --bench gate_overhead        # Channel vs crossbeam vs mpsc
 cargo bench --bench hub_overhead         # Hub throughput + RTT
 cargo bench --bench mpmc_overhead        # Mpmc MP/NC sweep + batched + crossbeam
-cargo bench --bench mpsc_vs_mpmc         # Mpsc vs Mpmc(M,1) head-to-head
-cargo bench --bench fanin_h2h            # Hub vs Mpmc vs crossbeam_channel fan-in
-cargo bench --bench ring_vs_crossbeam    # SPSC apples-to-apples vs crossbeam
-cargo bench --bench hub_sparse           # Hub drain on sparse-bit fan-in
-cargo bench --bench hub_multibit         # Hub drain on multi-bit fan-in
-cargo bench --bench ring_byo_atomic      # Ring with `Signal::from_bit` BYO-atomic
 cargo bench --bench stream_overhead      # Stream send / send_iter / ack-RTT / lockstep
 cargo bench --bench duplex_overhead      # Duplex zero-overhead check + RPC patterns + fire-and-forget
-cargo bench --bench rpc_patterns         # lockstep / busy-spin / batched / buffered / ack-RTT
-cargo bench --bench ring_vs_disruptor    # Ring vs LMAX-port disruptor SPSC
+cargo bench --bench lifeline_overhead    # Lifeline cancel / recv_or_cancel overhead
 ```
 
 For publication-grade numbers on Linux, pin the producer/consumer
