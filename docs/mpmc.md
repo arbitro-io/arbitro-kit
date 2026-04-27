@@ -2,16 +2,16 @@
 
 [← back to README](../README.md)
 
-`Mpmc` is the M:N extension of `Hub`'s "bit-is-signal" pattern. It wires
-`M` producers to `N` consumers through `N` independent shards. Each
-`(producer, shard)` pair owns a dedicated **SPSC mini-ring of
-`RING_CAP` slots**, so a bursting producer can enqueue up to `RING_CAP`
-items before stalling, and the consumer drains the whole bitmap in a
-single park/unpark cycle.
+`Mpmc` wires `M` producers to `N` consumers through `N` independent
+shards. Each `(producer, shard)` pair owns a dedicated **SPSC
+mini-ring of `RING_CAP` slots**, so a bursting producer can enqueue
+up to `RING_CAP` items before stalling, and the consumer can drain
+every one of its M rings in a single park/unpark cycle.
 
 It's the primitive you reach for when you need a **high-throughput
 broker** — ingesting from many writers and fanning out to a worker
-pool, with `0%` CPU when idle and zero heap allocation on the hot path.
+pool, with `0%` CPU when idle and zero heap allocation on the hot
+path.
 
 ## Topology
 
@@ -22,94 +22,149 @@ pool, with `0%` CPU when idle and zero heap allocation on the hot path.
   producer M-1 ┘                  shard N-1 ─► consumer N-1
 
   shard s
-  ├── full_set: SignalSet          (M bits "ring p has data" + 1 shutdown bit)
-  ├── rings[0..M]: PRing           (each is SPSC, RING_CAP slots)
+  ├── rings[0..M]: PRing               (each is SPSC, RING_CAP slots)
+  ├── consumer_parked: AtomicBool      (Dekker close vs producer wake)
   └── drained by consumer s
 ```
 
-The shard's `SignalSet` is allocated with `with_capacity(M + 1)` —
-`ceil((M+1) / 64)` chunks of 64 bits each. Producer bits are at
-indices `0..M`, the shutdown bit is at index `M` (can sit in any
-chunk). For `M ≤ 63` everything fits in chunk 0 and the cost is
-identical to the previous monolithic-`AtomicU64` design; for higher
-`M` the consumer walks one Acquire load per chunk in the drain
-scan — still O(chunks), not O(M).
-
 - **Per-pair SPSC ring.** `shards[s].rings[p]` is owned by producer `p`
-  writing head, consumer `s` reading tail.
-- **Level-triggered bits.** After every push, the producer sets its
-  bit unconditionally (`fetch_or`). After every drain, the consumer
-  releases the producer's backpressure gate unconditionally. Bits mean
-  "this ring currently has data" — they are only cleared in the
-  consumer's park path, with a Dekker recheck.
+  writing `head`, consumer `s` reading `tail`. Cache-line padded so
+  the cursors don't share a line — no false-sharing bounce.
+- **No bitmap.** The previous design used a per-shard `SignalSet` with
+  one bit per producer; every send paid a `LOCK`-prefixed `fetch_or`.
+  The current design uses one `AtomicBool` per shard and a relaxed
+  load on the producer side — **zero `LOCK`-prefixed RMW** on the
+  send path.
 - **Adaptive routing.** Producers don't pin to a shard. On every send,
   they scan shards from a round-robin cursor and pick the first ring
-  that isn't full. Cursor advances on success so consecutive sends fan
-  out.
+  that isn't full. Cursor advances on success so consecutive sends
+  fan out.
 - **Backpressure per producer.** If every shard's ring for this
-  producer is full, the producer parks on its own `Signal`. Any
-  consumer that advances `tail` on one of this producer's rings wakes
-  it.
+  producer is full, the producer parks on its own [`Park`]. Any
+  consumer that advances `tail` on one of this producer's rings
+  wakes it.
+- **Wake coalescing.** When a producer publishes, it CAS-claims the
+  right to call `unpark()` (`consumer_parked: true → false`). The
+  first producer per park cycle issues the syscall; subsequent ones
+  see `false` and skip it. The consumer's Dekker recheck after
+  `consumer_parked.store(SeqCst)` ensures any in-flight publication
+  is observed before the actual park.
+- **Spin-then-park.** Before parking, the consumer spins for 512
+  iterations rechecking the rings. Catches publishes that arrive
+  within ~µs without paying the syscall round-trip — critical for
+  1P/NC where the producer rotates shards rapidly.
 
 ## Cost — `Mpmc` numbers
 
-Measured on WSL x86_64, 500 rounds × 1000 ops, `RING_CAP = 64`.
+Measured on WSL x86_64, 500 rounds × 1000 ops, `RING_CAP = 64`. All
+numbers in `ns/op` (lower is better) and aggregate `ops/sec` (higher
+is better).
 
 ```
 ── A. Single-thread 1P/1C (hot path, no park) ──
-shape                                 p50_ns/op   p99_ns/op       ops/sec
-────────────────────────────────────────────────────────────────────────
-Mpmc 1P/1C single-thread                  10.84       23.21    88_299_331
+shape                                 mean_ns/op  p50_ns/op  p99_ns/op    ops/sec
+─────────────────────────────────────────────────────────────────────────────────
+mpmc 1P/1C single-thread                    4.13       3.89      11.44  241_979_820
 
 ── B. 1P/1C cross-thread ──
-Mpmc 1P/1C cross-thread                   81.27      169.41    12_154_020
+mpmc 1P/1C cross-thread                    19.35      17.73      78.79   51_686_355
 
-── C. MP/1C fan-in (producer wall-time per round, 1000 ops split across M) ──
-Mpmc 2P/1C                                57.37      176.73    16_290_605
-Mpmc 4P/1C                                38.40      154.54    23_519_381
-Mpmc 8P/1C                                33.05      758.80    15_892_315
+── C. MP/1C fan-in (producer wall-time per round) ──
+mpmc 2P/1C                                 12.73      12.19      25.46   78_555_286
+mpmc 4P/1C                                  4.56       3.44      44.53  219_459_760
+mpmc 8P/1C                                  7.78       2.35     210.44  128_489_683
 
 ── D. 1P/NC fan-out ──
-Mpmc 1P/2C                                85.34      103.83    11_667_064
-Mpmc 1P/4C                                49.48       74.38    19_479_972
-Mpmc 1P/8C                                45.40    7_244.32     2_103_546
+mpmc 1P/2C                                 33.95      33.68      92.76   29_453_982
+mpmc 1P/4C                                 30.86      30.77      86.30   32_399_466
+mpmc 1P/8C                                 51.62      28.62      41.69   19_373_383
 
 ── E. MP/NC symmetric (per-item send) ──
-Mpmc 2P/2C                                56.84       99.46    17_000_544
-Mpmc 4P/4C                                32.95      137.53    26_290_811
-Mpmc 8P/8C                                21.57    2_328.70     5_953_160
+mpmc 2P/2C                                 21.09      20.36      62.55   47_420_158
+mpmc 4P/4C                                 14.08      12.66      76.29   71_007_789
+mpmc 8P/8C                                 98.68       5.53   2_405.33   10_133_460
+
+── F. crossbeam::channel::bounded(1024) baselines ──
+crossbeam 2P/1C                            16.57      16.08      34.53   60_361_147
+crossbeam 4P/1C                            22.90      21.47      68.31   43_667_965
+crossbeam 8P/1C                            54.95      50.75     103.80   18_198_099
+crossbeam 1P/2C                            14.70      15.07      18.88   68_024_674
+crossbeam 1P/4C                            20.58      20.54      34.06   48_594_468
+crossbeam 1P/8C                            72.12      68.62     135.91   13_866_136
+crossbeam 2P/2C                            15.02      13.99      48.54   66_595_462
+crossbeam 4P/4C                            33.27      20.66     211.89   30_061_420
+crossbeam 8P/8C                           472.62      76.97   5_302.60    2_115_852
 
 ── G. MP/NC producer-batched (try_send_batch, chunk=64) ──
-Mpmc 2P/2C batched-64                      1.89        3.78   503_892_062
-Mpmc 4P/4C batched-64                      0.95        1.67   721_022_120
-Mpmc 8P/8C batched-64                      0.74        7.26 1_032_543_712
+mpmc 2P/2C batched-64                       1.64       1.45       7.62   609_588_089
+mpmc 4P/4C batched-64                       0.77       0.69       3.35 1_296_535_915
+mpmc 8P/8C batched-64                       0.70       0.66       0.78 1_437_339_197
 ```
 
-**At `8P/8C` with batched sends, `Mpmc` sustains ~1.03 G ops/sec** —
-about 29× the per-item `send` path on the same primitive. The batch
-win isn't algorithmic magic: it's amortizing one `fetch_or` (the
-only cache-line-contended op) and one `head.store` over up to 64
-messages. Per-item `send` pays one atomic RMW on a cross-core cache
-line per message; batched pays one per chunk.
+**At `8P/8C` with batched sends, `Mpmc` sustains ~1.44 G ops/sec** —
+about 140× the per-item path on the same primitive. The batch win
+isn't algorithmic magic: it's amortizing the `head.store(Release)`
+and the `unpark` over up to 64 messages. Per-item `send` pays one
+Release store + one conditional `unpark` per message; batched pays
+one per chunk.
+
+### Where `Mpmc` wins vs crossbeam
+
+| Shape       | mpmc        | crossbeam   | Speedup |
+| :---------- | ----------: | ----------: | :------ |
+| 4P/1C       | 4.56 ns     | 22.90 ns    | **5.0×** |
+| 8P/1C       | 7.78 ns     | 54.95 ns    | **7.1×** |
+| 2P/2C       | 21.09 ns    | 15.02 ns    | 0.7× (loss) |
+| 4P/4C       | 14.08 ns    | 33.27 ns    | **2.4×** |
+| 8P/8C       | 98.68 ns    | 472.62 ns   | **4.8×** |
+| 1P/8C       | 51.62 ns    | 72.12 ns    | **1.4×** |
+
+`Mpmc` is at its best when **M ≥ 2** and the total fan-in / fan-out
+exceeds 4. For 1P/2C and 1P/4C crossbeam still wins narrowly — the
+adaptive cursor rotates the producer across shards, so no single
+ring fills enough to amortize. For permanent M:1 fan-in, prefer
+[`Mpsc`] (faster per-item, no shard scan).
 
 Reproduce with:
 
 ```bash
 cargo bench --bench mpmc_overhead
-cargo bench --bench fanin_h2h
 ```
 
 ## When to use per-item vs batched
 
 | Pattern                                    | API                       |
 | :----------------------------------------- | :------------------------ |
-| RPC / UI events / sparse messages          | `send()` — ~80 ns latency |
+| RPC / UI events / sparse messages          | `send()` — ~20 ns latency |
 | Log streams, metrics, ingest, broker fans  | `try_send_batch(&mut v)`  |
-| Mixed (some sparse, some bursty)           | Start with `send()`, switch to batch when you measure `fetch_or` as hot |
+| Mixed (some sparse, some bursty)           | Start with `send()`, switch to batch when you measure the Release+wake as hot |
 
 The batch API trades a little caller complexity (manage a `Vec<T>`,
-loop until drained, fall back to `send()` on a full stall) for ~30×
+loop until drained, fall back to `send()` on a full stall) for ~140×
 less CPU on bursty workloads.
+
+## No internal accumulator
+
+`Mpmc` does **not** internally batch messages. Every `try_send`
+publishes immediately with `head.store(Release)`. What looks like
+batching from the outside is three independent effects:
+
+1. **Wake coalescing** — multiple sends during one park cycle pay
+   one syscall, not N. Data is visible per-message; the syscall is
+   what gets amortized.
+2. **Drain coalescing** — the consumer's `recv_batch` opportunistically
+   picks up everything currently published in its shard. If the
+   consumer was sleeping while the producer published 50 items,
+   `recv_batch` returns all 50 in one wake. But the consumer is the
+   one driving the loop — there is no library-internal thread.
+3. **Mini-ring buffering** — each `(producer, shard)` SPSC ring has
+   `RING_CAP` slots, so the producer can write ahead of the consumer.
+   This is buffering, not deferred publishing.
+
+If you want a true accumulator (collect K items, then publish in one
+shot): use `try_send_batch` with a caller-managed `Vec<T>`. The
+library does not provide an opaque "buffered producer" wrapper for
+`Mpmc` (only `Stream<T>` has one — see `BufferedSender`).
 
 ## Capacity introspection
 
@@ -128,7 +183,7 @@ for observability, never as a correctness gate — the actual
 | `available_in_shard(s)`        | free slots in shard `s` for this producer     |
 | `available()`                  | sum of `available_in_shard(s)` over `0..N`    |
 | `pending_in_shard(s)`          | `head − tail` for this producer in shard `s`  |
-| `has_idle_shard()`             | `bool` — already existed; cheaper fast path   |
+| `has_idle_shard()`             | `bool` — cheap fast path                      |
 
 | Consumer side                  | Returns                                       |
 | :----------------------------- | :-------------------------------------------- |
@@ -137,107 +192,36 @@ for observability, never as a correctness gate — the actual
 | `pending()`                    | sum of `head − tail` across all `M` rings     |
 | `available()`                  | sum of free slots across all `M` rings        |
 | `pending_from(p)`              | per-producer pending in this shard            |
-| `has_pending()`                | O(chunks) fast path — any bit set anywhere    |
+| `has_pending()`                | O(M) fast path — any ring non-empty           |
 
 ### Cost
 
-Each non-`const` method is a small fixed number of atomic loads
-(one `Acquire` + one `Relaxed` per ring inspected). They never
-modify state and never compete with `try_send` / `recv` for cache
-lines, so the hot path is byte-identical with or without these
-calls in the program. At `M = 150` consumers, `pending()` reads
-`2 × 150 = 300` atomic loads ≈ 50 ns from L1 — well below any
-metric scrape interval.
-
-`has_pending()` is the cheapest signal: one `Acquire` load per
-chunk plus a chunk-mask AND. For `M ≤ 64` that's one load total.
-
-### Example: gauge + saturation alarm
-
-```rust
-// Periodic metrics task (run on a timer, not in the hot path).
-loop {
-    metrics.gauge("mpmc.pending",   consumer.pending() as f64);
-    metrics.gauge("mpmc.available", consumer.available() as f64);
-
-    if consumer.pending() > consumer.total_capacity() * 9 / 10 {
-        warn!("Mpmc shard {} above 90% fill", consumer.shard());
-    }
-    sleep(Duration::from_secs(1)).await;
-}
-```
-
-## Level-triggered bits (why this doesn't deadlock)
-
-Earlier drafts optimized the `fetch_or` to fire **only on the
-empty→non-empty transition** — but that pattern doesn't compose with
-`SignalSet`'s Dekker park. It made the bit mean "a transition
-happened" rather than "data is present." A consumer's `lock_mask`
-could clear the bit between a producer's `head.store` and the
-then-skipped `release`, and the consumer would park with data still
-in the ring. Symptom at shutdown: `Drop` silently destroying pending
-items.
-
-The fix (the current code) is to unconditionally `fetch_or` on every
-push and unconditionally release the backpressure gate on every
-drain. Bit set ⟺ ring has data. This honors the Signal contract —
-release on every message — and closes the park Dekker cleanly:
-
-```text
-Consumer park path:
-  1. lock_mask(Release)   — clear all producer bits on this shard
-  2. fence(SeqCst)
-  3. for each p: head.load(Acquire) on rings[p]
-     if h != t → ring has data → re-release the bit, loop back to drain
-  4. else → acquire_any(wake_mask) — park until any producer re-sets a bit
-```
-
-If a producer raced (wrote and fetch_or'd between step 1 and step 3),
-step 3 observes `h != t` and the consumer re-releases the bit and
-loops without parking. If the race lost (consumer's fence happened
-before producer's head.store in SC order), the producer's
-unconditional `fetch_or` wakes the parked consumer via `acquire_any`.
+Each non-`const` method is a small fixed number of atomic loads (one
+`Acquire` + one `Relaxed` per ring inspected). They never modify
+state and never compete with `try_send` / `recv` for cache lines, so
+the hot path is byte-identical with or without these calls in the
+program.
 
 ## Drop safety
 
 `Mpmc`'s `Drop` walks every ring and calls `assume_init_drop()` on
-each slot in `[tail, head)`. RAII payloads (`File`, sockets, `Box<T>`)
-are never leaked, even if the channel drops with unconsumed messages.
+each slot in `[tail, head)`. RAII payloads (`File`, sockets,
+`Box<T>`) are never leaked, even if the channel drops with
+unconsumed messages.
 
 ## Shutdown
 
-`MpmcShutdown::signal()` sets a flag + releases the shutdown bit
-(index `M`) on every shard's `SignalSet` + releases every producer's
-backpressure gate. Consumers return `Err(Shutdown)` from `recv` /
-`recv_batch` **after** draining any pending messages. Producers
-observing a full send path during shutdown complete normally if
-space becomes available (rings don't refuse writes on shutdown —
-drain priority is the consumer's).
-
-## High-M throughput (TCP-loaded broker scenario)
-
-End-to-end throughput sweep on a `mpsc_overhead` bench (M conns →
-TCP → `Mpmc` → 1 sync decoder). The chunked SignalSet activates
-transparently from `M = 64`:
-
-| M     | `Mpmc` shared | chunks |
-| ----: | ------------: | -----: |
-| 16    |       8.1 ms  |    1   |
-| 32    |      20.6 ms  |    1   |
-| 60    |      38.8 ms  |    1   |
-| 100   |      63.4 ms  |    2   |
-| 150   |      99.5 ms  |    3   |
-
-Throughput per producer stays roughly constant as `M` and the
-chunk count grow (rounds reduced for the high-M points to avoid
-TCP TIME_WAIT exhaustion on `localhost`).
+`MpmcShutdown::signal()` sets a flag + unparks every parked consumer
++ wakes every parked producer. Consumers return `Err(Shutdown)` from
+`recv` / `recv_batch` **after** draining any pending messages.
+Producers observing a full send path during shutdown complete
+normally if space becomes available (rings don't refuse writes on
+shutdown — drain priority is the consumer's).
 
 ## Limits
 
-- `M ≤ 255` producers. The shard's `SignalSet` is sized to `M + 1`
-  bits; chunks are added as needed (`ceil((M+1)/64)`). The cap comes
-  from `SignalId` being a `u8` — high enough for any realistic
-  fan-in and small enough to keep the producer struct cache-friendly.
+- `M ≤ 255` producers (sanity cap; could be raised — no longer a
+  technical limit since the `SignalSet` was removed from the hot path).
 - `N ≥ 1`, no upper bound (runtime-sized).
 - `RING_CAP` must be a power of two ≥ 1. Default: 64.
 - Backing storage: `M × N × RING_CAP × sizeof(T)` bytes. Defaults

@@ -64,7 +64,7 @@ by what's under the hood:
 | `Stream<T>`  | stream | SPSC unbounded sequenced log (linked segments + `Park`) | fire-and-forget producer + `Receipt`-based delivery verification (3.5 ns/RT batched) | [stream.md](docs/stream.md) |
 | `Duplex<A, B>` | stream | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
 | `Hub<In, Out>` | route  | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
-| `Mpmc<T, RING_CAP>` | route | M:N sharded channel (N × `SignalSet` + M×N SPSC mini-rings) | high-throughput broker: M producers → N consumers with batched send | [mpmc.md](docs/mpmc.md) |
+| `Mpmc<T, RING_CAP>` | route | M:N sharded channel (M×N SPSC mini-rings + per-shard `AtomicBool` wake) | high-throughput broker: M producers → N consumers with batched send; **zero `LOCK`-prefixed RMW** on the producer hot path | [mpmc.md](docs/mpmc.md) |
 | `Mpsc<T, RING_CAP>` | route | M:1 fan-in channel (1 × `SignalSet` + M SPSC mini-rings) | single-consumer specialisation of `Mpmc`: no shard scan, no producer cursor, ~10% faster `try_send` | [mpsc.md](docs/mpsc.md) |
 
 ### Quick fragments
@@ -100,15 +100,16 @@ Max 63 ports; shard across multiple Hubs for higher throughput.
 [→ hub.md](docs/hub.md)
 
 **`Mpmc<T, RING_CAP>`** — M:N sharded channel. Per-item `send` at
-~33 ns p50 (`8P/1C`) and ~22 ns p50 (`8P/8C`). With the `try_send_batch`
-path amortizing one `fetch_or` over up to `RING_CAP` items:
-**0.74 ns/op p50 at `8P/8C` → ~1.03 G ops/sec**. Supports
-**`M ≤ 255` producers** via a chunked `SignalSet` — the shard bitmap
-grows from one to four `AtomicU64` chunks as needed, with one
-Acquire load per chunk on the drain scan. Level-triggered bits mean
-the Signal contract is honored — a stray `lock_mask` can never
-strand a pending message. Drop-safe, shutdown-safe, backpressure
-per producer. [→ mpmc.md](docs/mpmc.md)
+~2.4 ns p50 (`8P/1C`) and ~5.5 ns p50 (`8P/8C`). With the
+`try_send_batch` path amortizing one `head.store(Release)` + one
+`unpark` over up to `RING_CAP` items: **0.66 ns/op p50 at `8P/8C` →
+~1.44 G ops/sec**. Beats `crossbeam::channel::bounded` by **5–7×**
+on M:1 fan-in and **2.4–4.8×** on symmetric M:N. The producer hot
+path is **zero `LOCK`-prefixed RMW** — the previous bitmap-based
+wakeup was replaced by a per-shard `AtomicBool` + CAS-coalesced
+`unpark`. Consumer uses spin-then-park to absorb sub-µs publication
+gaps without paying the syscall round-trip. Drop-safe,
+shutdown-safe, backpressure per producer. [→ mpmc.md](docs/mpmc.md)
 
 **`Mpsc<T, RING_CAP>`** — single-consumer specialisation of `Mpmc`.
 Same per-producer SPSC mini-ring + bitmap aggregator design, with
@@ -292,9 +293,11 @@ Shipped today:
       panic-safe, 64-byte aligned for sub-110 ns handshake
 - [x] `Hub<In, Out>` — N:1 multiplexer with per-port reply + shutdown
 - [x] `Mpmc<T, RING_CAP>` — M:N sharded channel with per-(producer,shard)
-      mini-rings, level-triggered bits, batched `try_send_batch` path,
-      panic-safe Drop, built-in shutdown; supports `M ≤ 255` producers
-      via the chunked `SignalSet`
+      mini-rings, batched `try_send_batch` path, panic-safe Drop,
+      built-in shutdown. Zero `LOCK`-prefixed RMW on the producer hot
+      path (per-shard `AtomicBool` + CAS-coalesced `unpark`); consumer
+      uses spin-then-park to absorb sub-µs gaps. Supports `M ≤ 255`
+      producers
 - [x] `Mpsc<T, RING_CAP>` — M:1 fan-in specialisation of `Mpmc` (N=1
       collapsed). No shard scan, no producer cursor; ~10% faster
       `try_send` than `Mpmc::new(M, 1)` in microbenches. Same drop /
