@@ -150,10 +150,15 @@ OS threads.
 ```
 waiter/
 ├── mod.rs       — Waiter, BlockingWaiter, AsyncWaiter
-├── park.rs      — ParkWaiter (default; wraps gate::Park)
+├── park.rs      — ParkWaiter (default; full Dekker-safe park/unpark)
 └── notify.rs    — NotifyWaiter (feature = "tokio")
 ```
 
-`gate/{signal,park}.rs` are kept as private building blocks — `Park`
-backs `ParkWaiter`'s spin-then-park dance, and `Mpsc` + `stream/stream.rs`
-still use it directly until they're lifted in a future pass.
+`ParkWaiter` is the canonical sync backend: it owns the `parked: AtomicBool`
++ `worker: UnsafeCell<Thread>` pair, runs the spin-then-park dance, and
+exposes an inherent `wait_until_deadline` for primitives that need timed
+waits (e.g. `OneSignal::acquire_timeout`). Every primitive in the crate
+(`Pipe`, `Channel`, `OneShot`, `OneSignal`, `Ring`, `Stream`, `Duplex`,
+`Mpsc`, `Mpmc`, `Hub`, `SignalSet`) is `<W: Waiter = ParkWaiter>` — the
+default keeps every existing call site source-compatible while opening
+the door to `<NotifyWaiter>` and future `<UringWaiter>` instantiations.

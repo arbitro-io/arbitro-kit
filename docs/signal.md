@@ -1,107 +1,50 @@
-# `Signal` — M:1 single-bit gate
+# `Signal` — moved into `ParkWaiter`
 
 [← back to README](../README.md)
 
-`Signal` is the atom every other primitive in `arbitro-kit` is built on.
-It behaves like a gate: many producers `release()` it lock-free, a single
-consumer `acquire()`s it and parks when idle. Conceptually a single bit,
-but the interplay between its two `AtomicBool`s (state + parked) is what
-makes it fast.
+> **Heads up.** The standalone `Signal` type was removed during the
+> [`Waiter`](waiter.md) migration. Its Dekker-safe park/unpark dance
+> now lives inside [`ParkWaiter`](../src/waiter/park.rs), the default
+> backend for every primitive in the crate.
 
-## Wire diagram
+## What replaced it
 
-```text
-producer                               consumer
-────────                               ────────
-locked.store(false, Release)   ─────→  locked.load(Acquire)           // fast-path
-if parked.load(Relaxed):               ↓ (if still locked)
-    worker.unpark()                    tight spin (64×)
-                                       PAUSE spin (512×)
-                                       parked.store(true, SeqCst)     // ← once per park
-                                       recheck locked → park()
-```
+| Old role of `Signal` | New home |
+|---|---|
+| Internal park/unpark engine driving every primitive | [`ParkWaiter`](../src/waiter/park.rs) — same Dekker dance, same costs, generic-ready |
+| Public single-use M:1 gate | [`OneSignal<W>`](../src/gate/one_signal.rs) — single-use, payloadless, with `acquire_timeout` and async via `OneSignal<NotifyWaiter>` |
+| Multi-channel coalesced wake | [`SignalSet<W>`](../src/gate/signal_set.rs) — up to 256 named channels |
 
-One `SeqCst` barrier, paid **once per park event**, closes the Dekker
-race between the producer's `locked.store + parked.load` pair and the
-consumer's `parked.store + locked.load` pair. Every other operation on
-the hot path is `Relaxed` / `Release` / `Acquire`.
+## Why the change
 
-## Cost (x86_64, commodity laptop, WSL Linux)
+Before the migration, `Signal` and `Park` were two parallel sync-only
+gates wired into every primitive by hand. Adding async support meant
+duplicating `*Async` types byte-for-byte. The [`Waiter`](waiter.md)
+trait collapsed both into a single backend abstraction:
+
+- Every primitive is now `<W: Waiter = ParkWaiter>`.
+- Sync stays the default (zero source churn for existing callers).
+- `<W = NotifyWaiter>` (feature `tokio`) gives the async variants
+  for free.
+- Future runtimes (io_uring, etc.) plug in as one new `Waiter` impl.
+
+## Cost (unchanged from the old `Signal`)
 
 | Path                              |              Cost |
 | --------------------------------- | ----------------: |
-| `release()` — consumer spinning   |            ~0.6 ns |
-| `release()` — consumer parked     |      ~7 µs (syscall) |
-| `acquire()` fast path             |            ~0.3 ns |
-| `acquire()` park extra cost       |   +20 ns (1 SeqCst) |
-| Struct size                       |     64 B (aligned) |
+| `wake()` — consumer not parked    |            ~0.3 ns |
+| `wake()` — consumer parked        |      ~7 µs (syscall) |
+| `wait_until()` ready on entry     |            ~0.5 ns |
+| `wait_until()` park extra cost    |   +20 ns (1 SeqCst) |
 | CPU while parked                  |                0% |
 
-Within noise of a raw `AtomicBool::store` in the hot case, and within a
-syscall of a perfect park/unpark in the cold case. No known cheaper M:1
-signal primitive exists in safe Rust.
+Numbers are reproducible via `cargo bench --bench gate_overhead` —
+the bench keeps a `Signal` shim wrapping `ParkWaiter` so head-to-head
+comparisons against `crossbeam Parker` / `Mutex+Condvar` /
+`AtomicBool+park` stay on the table.
 
-## Correctness across architectures
+## See also
 
-- **x86 / x86_64 (TSO)**: the race between the two relaxed load/store
-  pairs is masked by strong memory ordering + store-buffer drain (~tens
-  of cycles, while the spin window runs ~15 µs).
-- **ARM / aarch64 (weakly ordered)**: that mask does not exist. The
-  consumer's `SeqCst` store on `parked` + recheck of `locked` is what
-  guarantees forward progress. Do not weaken it.
-
-## BYO-atomic via `SignalSource`
-
-`Signal` is generic over a `SignalSource` trait that provides the
-open/closed bit. The default `OwnedBool` carries its own `AtomicBool`,
-but two view types let you bind a `Signal` over an atomic the caller
-already owns:
-
-- `Signal::from_bool(&AtomicBool)` — wraps a borrowed `AtomicBool`
-  (`BoolView`). `true` = open.
-- `Signal::from_bit(&AtomicU64, bit)` — wraps a single bit of a shared
-  `AtomicU64` (`BitView`). Multiple `Signal`s can coexist over the same
-  `AtomicU64`; updates use `fetch_or` / `fetch_and`.
-
-Use these when readiness is already encoded in your own state and
-duplicating it into a private `AtomicBool` would just add cache traffic.
-
-## `Signal` vs `Park`
-
-`Signal` = `Park` + an owned `SignalSource`. When the readiness state
-*already* lives in the caller's data (e.g. a ring's head/tail cursors),
-prefer `Park` directly: the consumer's predicate reads the existing
-state, the producer's `wake()` only touches the parked flag, and one
-Release store on the hot path disappears. `Ring` and `Mpmc` are built
-on `Park` for exactly this reason.
-
-## Concurrency model
-
-Exactly **one consumer** may call `acquire()` / `set_worker()`. Any
-number of producers may call `release()` / `lock()` / `is_open()`
-concurrently from any thread without synchronization between them.
-
-## Usage
-
-```rust
-use arbitro_kit::gate::Signal;
-use std::sync::Arc;
-
-let sig = Arc::new(Signal::new());
-
-// Consumer
-{
-    let s = sig.clone();
-    std::thread::spawn(move || {
-        s.set_worker(std::thread::current());
-        loop {
-            s.acquire();
-            // do work ...
-            s.lock();
-        }
-    });
-}
-
-// Producer — any thread, any number.
-sig.release();
-```
+- [`waiter.md`](waiter.md) — the trait, the three concrete impls, and the
+  io_uring extension story.
+- [`signalset.md`](signalset.md) — public bitmap gate primitive.

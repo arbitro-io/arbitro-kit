@@ -13,59 +13,67 @@ consumer tells the OS *"wake me when there's work"* cost 0% CPU.
 
 ---
 
-## The `Signal` primitive
+## The `Waiter` trait
 
-Everything in this crate is built on top of `Signal` — an M:1 signal that
-behaves like a gate. Producers `release()` it (lock-free); a single
-consumer `acquire()`s and parks when idle. One `SeqCst` barrier, paid
-**once per park event**, closes the Dekker race; every other hot-path
-op is `Relaxed` / `Release` / `Acquire`.
+Everything in this crate runs over a single wait/wake contract: the
+[`Waiter`](src/waiter/mod.rs) trait. Producers call `wake()` lock-free;
+the single consumer calls `wait_until(predicate)` and parks when idle.
+One `SeqCst` barrier, paid **once per park event**, closes the Dekker
+race; every other hot-path op is `Relaxed` / `Release` / `Acquire`.
 
 | Path                              |              Cost |
 | --------------------------------- | ----------------: |
-| `release()` — consumer spinning   |            ~0.6 ns |
-| `release()` — consumer parked     |      ~7 µs (syscall) |
-| `acquire()` fast path             |            ~0.3 ns |
-| `acquire()` park extra cost       |   +20 ns (1 SeqCst) |
+| `wake()` — consumer not parked    |            ~0.3 ns |
+| `wake()` — consumer parked        |      ~7 µs (syscall) |
+| `wait_until()` ready on entry     |            ~0.5 ns |
+| `wait_until()` park extra cost    |   +20 ns (1 SeqCst) |
 | CPU while parked                  |                0% |
 
-**→ [docs/signal.md](docs/signal.md)** for the full wire diagram,
-correctness notes across x86/ARM, and the concurrency model.
+Three concrete backends ship today:
+
+- **`ParkWaiter`** (default) — `std::thread::park`/`unpark`. Sync.
+- **`NotifyWaiter`** (feature `tokio`) — `tokio::sync::Notify`. Async.
+- **(future) `UringWaiter`** — io_uring CQE-based. Add one file,
+  every primitive inherits async support.
+
+Every primitive is `<W: Waiter = ParkWaiter>`, so existing sync
+call sites compile unchanged. Switch to async by switching the type
+parameter — same struct, same semantics, different backend.
+
+**→ [docs/waiter.md](docs/waiter.md)** for the contract, the three
+concrete impls, and the io_uring extension story.
+**→ [docs/signal.md](docs/signal.md)** for what happened to the old
+`Signal` type (folded into `ParkWaiter`).
 
 ---
 
 ## What you can build on top
 
-`Signal` is the atom. A small family of composites ships in the crate,
-each a thin wrapper — most of the cost model carries over unchanged.
-A second low-level primitive, `Park`, exposes the stateless park/unpark
-half of `Signal` for callers that already track readiness in their own
-state (used internally by `Ring` and `Mpmc`):
-
-The crate is organized in four modules by **what the user wants**, not
+The crate is organized in five modules by **what the user wants**, not
 by what's under the hood:
 
 | Module | Question it answers | Types |
 | :----- | :------------------ | :---- |
-| [`gate`](src/gate/)     | "How do I synchronize?" (no payload)            | `Signal`, `SignalSet`, `Park` |
-| [`slot`](src/slot/)     | "1 message in flight, no buffer?"               | `Pipe`, `Channel` |
-| [`stream`](src/stream/) | "FIFO of messages?"                             | `Ring`, `Stream`, `Duplex`, `BufferedSender` |
-| [`route`](src/route/)   | "N→M with topology?"                            | `Hub`, `Mpmc`, `Mpsc` |
+| [`waiter`](src/waiter/) | "Which wake backend?"                          | `Waiter`, `BlockingWaiter`, `AsyncWaiter`, `ParkWaiter`, `NotifyWaiter` |
+| [`gate`](src/gate/)     | "How do I synchronize?" (no payload)            | `OneSignal<W>`, `SignalSet<W>`, `Lifeline` |
+| [`slot`](src/slot/)     | "1 message in flight, no buffer?"               | `Pipe<T, H, W>`, `Channel<Req, Resp, W>` |
+| [`stream`](src/stream/) | "FIFO of messages?"                             | `Ring<T, CAP, W>`, `Stream<T, W>`, `Duplex<A, B, W>`, `BufferedSender` |
+| [`route`](src/route/)   | "N→M with topology?"                            | `Hub<In, Out, W>`, `Mpmc<T, CAP, W>`, `Mpsc<T, CAP, W>`, `OneShot<T, W>` |
 
 | Type         | Module | Shape                                     | What it adds                                                        | Docs |
 | :----------- | :----- | :---------------------------------------- | :------------------------------------------------------------------ | :--- |
-| `Signal`     | gate   | single-bit M:1 signal                     | the primitive itself; BYO-atomic via `from_bool` / `from_bit`        | [signal.md](docs/signal.md) |
-| `Park`       | gate   | stateless park/unpark                     | wait on caller-owned readiness state (no duplicated `AtomicBool`)   | (used by `Ring`, `Mpmc`) |
-| `SignalSet`  | gate   | up to 256 bits over a chunked `Box<[AtomicU64]>` | wait for any / all / subset of named signals; ≤64-bit case stays a single `AtomicU64` | [signalset.md](docs/signalset.md) |
+| `OneSignal<W>` | gate | single-use payloadless gate               | minimal "block until released"; `acquire_timeout` (sync), `acquire_async` (async); **286 ns p50 RT-w/-ack** cross-thread | (see `src/gate/one_signal.rs`) |
+| `SignalSet<W>` | gate | up to 256 bits over a chunked `Box<[AtomicU64]>` | wait for any / all / subset of named signals; ≤64-bit case stays a single `AtomicU64` | [signalset.md](docs/signalset.md) |
 | `Lifeline`   | gate   | up to 64 indexed waiters, fire-and-forget | external cancellation: `cancel_one` / `cancel_mask` / `cancel_all`; `recv_or_cancel` opt-in across transports (+0.7 ns vs baseline) | [lifeline.md](docs/lifeline.md) |
-| `Pipe<T, H>` | slot   | SPSC single-slot (1 × `Signal`)           | minimal payload transport with zero-cost observer hooks             | [pipe.md](docs/pipe.md) |
-| `Channel<Req, Resp>` | slot | SPSC request/response (2 × `Signal`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
-| `Ring<T, CAP>` | stream | SPSC bounded ring (2 × `Park`)          | burst absorption, pipelined throughput, batch send + batch ack      | [ring.md](docs/ring.md) |
-| `Stream<T>`  | stream | SPSC unbounded sequenced log (linked segments + `Park`) | fire-and-forget producer + `Receipt`-based delivery verification (3.5 ns/RT batched) | [stream.md](docs/stream.md) |
-| `Duplex<A, B>` | stream | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
-| `Hub<In, Out>` | route  | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
-| `Mpmc<T, RING_CAP>` | route | M:N sharded channel (M×N SPSC mini-rings + per-shard `AtomicBool` wake) | high-throughput broker: M producers → N consumers with batched send; **zero `LOCK`-prefixed RMW** on the producer hot path | [mpmc.md](docs/mpmc.md) |
-| `Mpsc<T, RING_CAP>` | route | M:1 fan-in channel (1 × `SignalSet` + M SPSC mini-rings) | single-consumer specialisation of `Mpmc`: no shard scan, no producer cursor, ~10% faster `try_send` | [mpsc.md](docs/mpsc.md) |
+| `Pipe<T, H, W>` | slot | SPSC single-slot (1 × `Waiter`)          | minimal payload transport with zero-cost observer hooks; sync `recv` or async `recv_async` per backend; **191 ns p50 RT-w/-ack** | [pipe.md](docs/pipe.md) |
+| `Channel<Req, Resp, W>` | slot | SPSC request/response (2 × `Waiter`) | zero-copy round-trip with ownership transfer                        | [channel.md](docs/channel.md) |
+| `OneShot<T, W>` | route | single-use payload-carrying gate         | `OneSignal` + a `T` slot; **365 ns p50 RT-w/-ack** cross-thread, **67× faster than `tokio::sync::oneshot`** | (see `src/route/oneshot.rs`) |
+| `Ring<T, CAP, W>` | stream | SPSC bounded ring (2 × `Waiter`)       | burst absorption, pipelined throughput, batch send + batch ack      | [ring.md](docs/ring.md) |
+| `Stream<T, W>` | stream | SPSC unbounded sequenced log (linked segments + `Waiter`) | fire-and-forget producer + `Receipt`-based delivery verification (3.5 ns/RT batched) | [stream.md](docs/stream.md) |
+| `Duplex<A, B, W>` | stream | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
+| `Hub<In, Out, W>` | route | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
+| `Mpmc<T, CAP, W>` | route | M:N sharded channel (M×N SPSC mini-rings + per-shard `AtomicBool` wake) | high-throughput broker: M producers → N consumers with batched send; **zero `LOCK`-prefixed RMW** on the producer hot path | [mpmc.md](docs/mpmc.md) |
+| `Mpsc<T, CAP, W>` | route | M:1 fan-in channel (`Waiter` + M SPSC mini-rings) | single-consumer specialisation of `Mpmc`: no shard scan, no producer cursor, ~10% faster `try_send` | [mpsc.md](docs/mpsc.md) |
 
 ### Quick fragments
 
@@ -145,28 +153,26 @@ crate. [→ duplex.md](docs/duplex.md)
 
 See each primitive's doc file for full examples and cost breakdowns.
 
-### Single signal
+### Single-use gate (`OneSignal`)
 
 ```rust
-use arbitro_kit::gate::Signal;
-use std::sync::Arc;
+use arbitro_kit::gate::OneSignal;
+use arbitro_kit::waiter::ParkWaiter;
 
-let sig = Arc::new(Signal::new());
+let (tx, rx) = OneSignal::<ParkWaiter>::new();
 
-// Consumer
-let s = sig.clone();
-std::thread::spawn(move || {
-    s.set_worker(std::thread::current());
-    loop {
-        s.acquire();
-        // do work ...
-        s.lock();
-    }
+let h = std::thread::spawn(move || {
+    rx.bind();                  // register this thread for unpark
+    rx.acquire().unwrap();      // blocks; returns Ok(()) on release
 });
 
-// Producer — any thread, any number.
-sig.release();
+tx.release();                   // wakes the receiver
+h.join().unwrap();
 ```
+
+For an async receiver, swap `ParkWaiter` for `NotifyWaiter` (feature
+`tokio`) and call `rx.acquire_async().await`. The struct is the same;
+only the wake backend changes.
 
 ### SPSC round-trip channel
 
@@ -269,12 +275,13 @@ its own outbound by mistake.
 
 ## Non-goals
 
-- **Async.** Primitives are synchronous; `acquire*` parks the OS thread.
-  The lock-free producer side is compatible with any async runtime, but
-  `Future`-based waits are not provided.
 - **Ordered multi-producer delivery.** `SignalSet` coalesces repeated
   releases on the same bit. If you need to count events, use the bit
   to wake a consumer that drains a separate queue.
+- **Bring-your-own scheduler integration.** Async support ships via
+  `NotifyWaiter` (tokio) under the `tokio` feature. Other runtimes
+  (smol, async-std, io_uring) are one `Waiter` impl away — see
+  [docs/waiter.md](docs/waiter.md) — but the crate doesn't ship them.
 
 ---
 
@@ -282,32 +289,39 @@ its own outbound by mistake.
 
 Shipped today:
 
-- [x] `Signal` — M:1 single-bit signal with Dekker-safe park
-- [x] `SignalSet` — up to 256 coalesced signals over a chunked
+- [x] **`Waiter` trait family** — every primitive is `<W: Waiter =
+      ParkWaiter>`. Three concrete backends: `ParkWaiter` (sync,
+      default), `NotifyWaiter` (tokio, feature-gated). Adding io_uring
+      = one new file
+- [x] `OneSignal<W>` — single-use payloadless gate; `acquire_timeout`
+      on `ParkWaiter`, `acquire_async` on any `AsyncWaiter`
+- [x] `OneShot<T, W>` — single-use payload-carrying gate; **67×
+      faster than `tokio::sync::oneshot`** at full ack RT
+- [x] `SignalSet<W>` — up to 256 coalesced signals over a chunked
       `Box<[AtomicU64]>`; the `≤64`-bit case still uses a single
       `AtomicU64` chunk with zero measurable overhead
-- [x] `Pipe<T, H>` — SPSC single-slot with zero-cost observer hook
-- [x] `Ring<T, CAP>` — SPSC bounded ring with batch send + batch ack,
-      panic-safe, payload-sweep-documented
-- [x] `Channel<Req, Resp>` — SPSC zero-copy request/response,
+- [x] `Pipe<T, H, W>` — SPSC single-slot with zero-cost observer hook
+- [x] `Ring<T, CAP, W>` — SPSC bounded ring with batch send + batch
+      ack, panic-safe, payload-sweep-documented
+- [x] `Channel<Req, Resp, W>` — SPSC zero-copy request/response,
       panic-safe, 64-byte aligned for sub-110 ns handshake
-- [x] `Hub<In, Out>` — N:1 multiplexer with per-port reply + shutdown
-- [x] `Mpmc<T, RING_CAP>` — M:N sharded channel with per-(producer,shard)
+- [x] `Hub<In, Out, W>` — N:1 multiplexer with per-port reply + shutdown
+- [x] `Mpmc<T, CAP, W>` — M:N sharded channel with per-(producer,shard)
       mini-rings, batched `try_send_batch` path, panic-safe Drop,
       built-in shutdown. Zero `LOCK`-prefixed RMW on the producer hot
       path (per-shard `AtomicBool` + CAS-coalesced `unpark`); consumer
       uses spin-then-park to absorb sub-µs gaps. Supports `M ≤ 255`
       producers
-- [x] `Mpsc<T, RING_CAP>` — M:1 fan-in specialisation of `Mpmc` (N=1
+- [x] `Mpsc<T, CAP, W>` — M:1 fan-in specialisation of `Mpmc` (N=1
       collapsed). No shard scan, no producer cursor; ~10% faster
       `try_send` than `Mpmc::new(M, 1)` in microbenches. Same drop /
       shutdown / backpressure guarantees as `Mpmc`
-- [x] `Stream<T>` — SPSC unbounded sequenced log with `Receipt`-based
+- [x] `Stream<T, W>` — SPSC unbounded sequenced log with `Receipt`-based
       delivery verification; `BufferedSender` accumulator; opt-in
       `strict_wake` mode for bidirectional patterns
-- [x] `Duplex<A, B>` — bidirectional unbounded SPSC over two `Stream`s
-      with type-safe direction; built on `strict_wake` so 1M-scale
-      lockstep RPC is deadlock-free
+- [x] `Duplex<A, B, W>` — bidirectional unbounded SPSC over two
+      `Stream`s with type-safe direction; built on `strict_wake` so
+      1M-scale lockstep RPC is deadlock-free
 - [x] `Lifeline` — fire-and-forget cancellation scope (up to 64 waiters
       per scope), with `recv_or_cancel` on `Stream` / `Ring` / `Duplex`;
       opt-in (+0.7 ns vs baseline `recv`), zero impact on existing
@@ -322,12 +336,12 @@ Next:
       backpressure. Same zero-cost hook contract as `Pipe`.
 - [ ] **`Queue<T>`** — MPSC unbounded built on a `Ring` per producer +
       a `SignalSet` drain. Lock-free enqueue, batched drain.
-- [ ] **Async adapters** — `Future`-based `acquire` without giving up
-      the synchronous lock-free producer side. Opt-in feature, no
-      runtime dependency.
-- [ ] **`no_std` core** — feature-gated extraction of `Signal` and
+- [ ] **`UringWaiter`** — io_uring CQE-based `Waiter` impl. Single new
+      file under `src/waiter/`; every primitive in the crate inherits
+      io_uring support automatically.
+- [ ] **`no_std` core** — feature-gated extraction of `OneSignal` and
       `SignalSet` for embedded / freestanding targets (park via a
-      user-provided waiter trait).
+      user-provided `Waiter` impl).
 - [ ] **Loom model checks** — permutation testing of the park protocol
       under weak memory models beyond what `miri` already covers.
 - [ ] **ARM64 numbers** — current cost tables are x86_64; validate on
@@ -340,7 +354,8 @@ Next:
 Every number in the docs is reproducible:
 
 ```bash
-cargo bench --bench gate_overhead        # gate primitives (Signal/SignalSet/Park) vs crossbeam Parker / mpsc
+cargo bench --bench gate_overhead        # gate primitives (ParkWaiter shim/SignalSet/OneSignal) vs crossbeam Parker / Mutex+Condvar
+cargo bench --bench oneshot_h2h          # OneSignal / OneShot / Pipe / tokio::oneshot — fast path, spin, park, full ack RT
 cargo bench --bench channel_overhead     # Channel vs crossbeam vs std::mpsc round-trip
 cargo bench --bench pipe_overhead        # Pipe ST/XT + hook zero-cost claim
 cargo bench --bench ring_overhead        # Ring FLOW / ROUND-TRIP / payload sweep
