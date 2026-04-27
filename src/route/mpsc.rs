@@ -1,22 +1,53 @@
 //! M:1 multi-producer / single-consumer bounded channel.
 //!
-//! [`Mpsc<T, RING_CAP>`] is the **single-consumer specialisation** of
-//! [`super::mpmc::Mpmc`]: N is hardcoded to 1, so every producer feeds the
-//! same shard. Compared with `Mpmc::<T, RING_CAP>::new(M, 1)`, this drops:
+//! Per-producer SPSC mini-rings + consumer-side scan for wakeup. Producers
+//! never execute a `LOCK`-prefixed RMW on the send path: the only atomic
+//! they touch outside their own ring is a single `AtomicBool` load
+//! (`consumer_parked`) used to decide whether to `unpark` the consumer.
 //!
-//! - the per-producer adaptive `cursor` and the `for k in 0..n` shard scan,
-//! - the `Shard` indirection (fields move directly into `MpscInner`),
-//! - the `shard_idx` field on the consumer,
-//! - the `Vec<MpmcConsumer>` return — the single consumer is returned by value.
+//! ## Hot paths
 //!
-//! Hot-path semantics are otherwise identical to `Mpmc`:
-//! - Each producer owns a private SPSC mini-ring of `RING_CAP` slots.
-//! - The consumer drains every ready ring via the shared SignalSet bitmap.
-//! - Bits are cleared only in the park path (Dekker recheck), never during
-//!   drain — so amortised cost is one `fetch_or` per burst, not per item.
+//! Producer `try_send`:
+//!   - load this producer's `head` (Relaxed) and `tail` (Acquire);
+//!   - if full → return `Err(value)`;
+//!   - write slot, `head.store(Release)`;
+//!   - `consumer_parked.load(Relaxed)` — if `true`, `unpark` the consumer.
 //!
-//! When in doubt between `Mpsc` and `Mpmc(M, 1)`: pick `Mpsc`. The codegen
-//! is tighter and the API is clearer for true M:1 fan-in.
+//! Consumer `try_recv`:
+//!   - for `p in 0..M`: load (head, tail) of `ring[p]`; if non-empty, take
+//!     one item and `producer_parks[p].wake()` (only relevant under
+//!     backpressure).
+//!
+//! Consumer `recv` park path uses a Dekker recheck:
+//!   - `consumer_parked.store(true, SeqCst)`
+//!   - rescan all M rings + shutdown flag
+//!   - if still nothing → `thread::park()`.
+//!
+//! ## Why this layout (vs Vyukov-style shared queue)
+//!
+//! Crossbeam's `channel::bounded` serialises every send through a single
+//! `LOCK fetch_add` on a shared `tail`. With M producers that line bounces
+//! M times per send. Here every producer owns its own ring head/tail —
+//! zero coherence traffic between producers — and the consumer pays an
+//! O(M) scan per drain pass, amortised across whatever burst the rings
+//! hold (typically dozens to hundreds of items per pass).
+//!
+//! Bench (`benches/mpsc_overhead.rs`, x86_64, 4 P-cores + 8 E-cores):
+//!
+//! | Topology      | crossbeam mean | this `Mpsc` mean | speed-up |
+//! |---------------|---------------:|-----------------:|---------:|
+//! | 1P/1C cross   |   ~58 ns/op    |     ~6 ns/op     |   ~10×   |
+//! | 4P/1C         |   ~26 ns/op    |     ~2 ns/op     |   ~13×   |
+//! | 8P/1C         |   ~58 ns/op    |     ~2 ns/op     |   ~29×   |
+//! | 100P/1C       |   ~65 ns/op    |    ~36 ns/op     |   ~1.8×  |
+//!
+//! ## When to reach for `Mpsc`
+//!
+//! - True M:1 fan-in with anonymous producers (no per-producer reply
+//!   channel needed — use `Hub` for named ports + replies).
+//! - When the consumer is a dedicated drain thread that calls `recv` /
+//!   `recv_batch` in a tight loop.
+//! - For M:N fan-in, use [`super::mpmc::Mpmc`] instead.
 
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
@@ -24,36 +55,25 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::gate::{Park, SignalId, SignalSet};
+use crate::gate::Park;
 use crate::route::hub::Shutdown;
 
-/// Maximum number of producers. Same limit as `Mpmc` because the SignalSet
-/// bit layout is shared (M producer bits + 1 shutdown bit).
+/// Maximum number of producers per channel.
 pub const MAX_MPSC_PRODUCERS: usize = 255;
+
+const CACHE_LINE: usize = 64;
 
 // ─── Per-producer mini-Ring (SPSC) ────────────────────────────────────────
 
-/// Cache line size on x86_64 / aarch64. Used to separate `head` and `tail`
-/// onto distinct cache lines so the producer's `head.store(Release)` does
-/// not invalidate the consumer's cached `tail` (and vice versa). Without
-/// this padding, every send triggers a cross-CPU cache-line bounce on the
-/// SAME line that holds both cursors — a textbook **false sharing** pitfall.
-///
-/// Empirically saves 5–15 % on hot SPSC paths on x86_64 (matches what
-/// LMAX Disruptor, JCTools, and DPDK rte_ring all do for the same reason).
-const CACHE_LINE: usize = 64;
-
+/// Cache-line-padded SPSC ring shared between one producer and the consumer.
+/// `head` and `tail` live on separate cache lines to avoid false sharing on
+/// the cross-core publish path.
 #[repr(C)]
 struct PRing<T: Send, const RING_CAP: usize> {
-    /// Producer cursor — only this producer writes; consumer reads with Acquire.
     head: AtomicUsize,
     _pad_head: [u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
-    /// Consumer cursor — only the consumer writes; producer reads with Acquire.
     tail: AtomicUsize,
     _pad_tail: [u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
-    /// Slot storage. Boxed so the struct itself stays small and easy to
-    /// stack-move during construction. The pointer here is read-only after
-    /// construction, so it's never on the cache-coherence hot path.
     slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
 }
 
@@ -78,17 +98,18 @@ impl<T: Send, const RING_CAP: usize> PRing<T, RING_CAP> {
     }
 }
 
-// ─── Shared inner state (no Shard layer) ───────────────────────────────────
+// ─── Shared inner state ───────────────────────────────────────────────────
 
 struct MpscInner<T: Send, const RING_CAP: usize> {
-    /// Bit `p` = "ring[p] possibly has data". Bit `m` = shutdown.
-    full_set: SignalSet,
-    /// `rings[p]` owned by producer `p`. Single shard inline.
     rings: Box<[PRing<T, RING_CAP>]>,
-    /// Per-chunk mask covering producer bits `0..m` only.
-    full_mask_chunks: Box<[u64]>,
-    shutdown_id: SignalId,
-    /// Per-producer backpressure park.
+    /// Set by the consumer immediately before parking (with `SeqCst`).
+    /// Producers read with `Relaxed`; on `true` they `unpark` the consumer.
+    consumer_parked: AtomicBool,
+    /// Consumer's `Thread` handle, written once on `bind()` and read by
+    /// producers under the `consumer_parked` Dekker dance.
+    consumer_thread: UnsafeCell<Option<std::thread::Thread>>,
+    /// Per-producer backpressure park: when a producer's ring is full, it
+    /// parks here until the consumer drains and calls `wake()`.
     producer_parks: Box<[Park]>,
     shutdown: AtomicBool,
     m: usize,
@@ -103,37 +124,47 @@ impl<T: Send, const RING_CAP: usize> MpscInner<T, RING_CAP> {
             RING_CAP > 0 && RING_CAP.is_power_of_two(),
             "RING_CAP must be a power of two ≥ 1"
         );
-
-        let mut full_set = SignalSet::with_capacity(m + 1);
-        for p in 0..m {
-            let name: &'static str =
-                Box::leak(format!("mpsc_p{p}").into_boxed_str());
-            let _ = full_set.create(name);
-        }
-        let shutdown_name: &'static str = Box::leak("mpsc_shutdown".into());
-        let shutdown_id = full_set.create(shutdown_name);
-        debug_assert_eq!(shutdown_id.index() as usize, m);
-
-        let n_chunks = full_set.n_chunks();
-        let mut full_mask_chunks: Vec<u64> = vec![0; n_chunks];
-        for p in 0..m {
-            let c = p / 64;
-            full_mask_chunks[c] |= 1u64 << (p % 64);
-        }
-
         let rings: Vec<PRing<T, RING_CAP>> =
             (0..m).map(|_| PRing::new()).collect();
         let producer_parks: Vec<Park> = (0..m).map(|_| Park::new()).collect();
-
         Self {
-            full_set,
             rings: rings.into_boxed_slice(),
-            full_mask_chunks: full_mask_chunks.into_boxed_slice(),
-            shutdown_id,
+            consumer_parked: AtomicBool::new(false),
+            consumer_thread: UnsafeCell::new(None),
             producer_parks: producer_parks.into_boxed_slice(),
             shutdown: AtomicBool::new(false),
             m,
         }
+    }
+
+    /// Wake the consumer if it's parked. Reads the flag with `Relaxed`;
+    /// false negatives are tolerated because the consumer's Dekker recheck
+    /// closes the race (it re-scans every ring after setting `parked = true`
+    /// with `SeqCst`).
+    #[inline]
+    fn maybe_wake_consumer(&self) {
+        if self.consumer_parked.load(Ordering::Relaxed) {
+            // SAFETY: `consumer_thread` is written once in `bind()` before
+            // any producer can publish. After binding it is read-only.
+            unsafe {
+                if let Some(t) = &*self.consumer_thread.get() {
+                    t.unpark();
+                }
+            }
+        }
+    }
+
+    /// `true` iff at least one ring has a published-but-not-consumed item.
+    /// O(M).
+    #[inline]
+    fn any_ring_has_work(&self) -> bool {
+        for p in 0..self.m {
+            let ring = &self.rings[p];
+            let h = ring.head.load(Ordering::Acquire);
+            let t = ring.tail.load(Ordering::Relaxed);
+            if h != t { return true; }
+        }
+        false
     }
 }
 
@@ -154,10 +185,10 @@ impl<T: Send, const RING_CAP: usize> Drop for MpscInner<T, RING_CAP> {
     }
 }
 
-// ─── Public facade ─────────────────────────────────────────────────────────
+// ─── Public facade ────────────────────────────────────────────────────────
 
-/// M:1 bounded channel. Each producer is an SPSC ring of `RING_CAP` slots
-/// feeding the same consumer.
+/// M:1 bounded channel. Each producer owns an SPSC ring of `RING_CAP`
+/// slots; the single consumer drains every ring via a scan.
 pub struct Mpsc<T: Send, const RING_CAP: usize = 64>(PhantomData<T>);
 
 impl<T: Send + 'static, const RING_CAP: usize> Mpsc<T, RING_CAP> {
@@ -182,34 +213,28 @@ impl<T: Send + 'static, const RING_CAP: usize> Mpsc<T, RING_CAP> {
             m <= MAX_MPSC_PRODUCERS,
             "Mpsc::new: m must be <= {MAX_MPSC_PRODUCERS}"
         );
-
         let inner = Arc::new(MpscInner::<T, RING_CAP>::new(m));
-
         let producers: Vec<MpscProducer<T, RING_CAP>> = (0..m)
             .map(|p| MpscProducer {
                 inner: inner.clone(),
                 my_idx: p,
-                my_id: SignalId::new(p as u8),
                 _not_sync: PhantomData,
             })
             .collect();
-
         let consumer = MpscConsumer {
             inner: inner.clone(),
             _not_sync: PhantomData,
         };
-
         let shutdown = MpscShutdown { inner };
         (producers, consumer, shutdown)
     }
 }
 
-// ─── Producer handle ───────────────────────────────────────────────────────
+// ─── Producer handle ──────────────────────────────────────────────────────
 
 pub struct MpscProducer<T: Send, const RING_CAP: usize = 64> {
     inner: Arc<MpscInner<T, RING_CAP>>,
     my_idx: usize,
-    my_id: SignalId,
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -217,6 +242,9 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
     #[inline]
     pub fn index(&self) -> usize { self.my_idx }
 
+    /// Register the current thread as this producer's worker. Must be
+    /// called by the producer thread before it can be parked on
+    /// backpressure.
     #[inline]
     pub fn bind(&self) {
         self.inner.producer_parks[self.my_idx]
@@ -251,8 +279,8 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
         h.wrapping_sub(t)
     }
 
-    /// Non-blocking send. No shard scan, no cursor — direct ring access.
-    /// Returns `Err(value)` if this producer's ring is full.
+    /// Non-blocking send. Hot path: 1 Relaxed load + 1 Acquire load + 1
+    /// Release store + 1 Relaxed load. **Zero `LOCK`-prefixed RMW.**
     #[inline]
     pub fn try_send(&self, value: T) -> Result<(), T> {
         let ring = &self.inner.rings[self.my_idx];
@@ -261,16 +289,21 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
         if PRing::<T, RING_CAP>::is_full(h, t) {
             return Err(value);
         }
-        // Safety: SPSC — only this producer writes slots[head] on this ring.
+        // SAFETY: SPSC — this producer is the only writer to `ring.slots`,
+        // and `head` has not been advanced yet so the consumer cannot read
+        // this slot.
         unsafe {
             (*ring.slots[h & PRing::<T, RING_CAP>::MASK].get()).write(value);
         }
         ring.head.store(h.wrapping_add(1), Ordering::Release);
-        self.inner.full_set.release(self.my_id);
+        self.inner.maybe_wake_consumer();
         Ok(())
     }
 
-    /// Batch send: amortise the SignalSet release across multiple items.
+    /// Bulk send: drains up to `min(items.len(), available)` from `items`
+    /// into the ring, with one `head.store(Release)` and one consumer
+    /// wake-check at the end. Returns the number of items consumed from
+    /// `items`.
     pub fn try_send_batch(&self, items: &mut Vec<T>) -> usize {
         if items.is_empty() { return 0; }
         let ring = &self.inner.rings[self.my_idx];
@@ -288,12 +321,12 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
             h = h.wrapping_add(1);
         }
         ring.head.store(h, Ordering::Release);
-        self.inner.full_set.release(self.my_id);
+        self.inner.maybe_wake_consumer();
         take
     }
 
     /// Blocking send. Parks on this producer's backpressure park if the
-    /// ring is full.
+    /// ring is full; returns silently on shutdown without delivering.
     #[inline]
     pub fn send(&self, mut value: T) {
         loop {
@@ -302,12 +335,16 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
                 Err(v) => value = v,
             }
             self.inner.producer_parks[self.my_idx]
-                .wait_until(|| self.has_room());
+                .wait_until(|| self.has_room()
+                    || self.inner.shutdown.load(Ordering::Acquire));
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                return;
+            }
         }
     }
 }
 
-// ─── Consumer handle ───────────────────────────────────────────────────────
+// ─── Consumer handle ──────────────────────────────────────────────────────
 
 pub struct MpscConsumer<T: Send, const RING_CAP: usize = 64> {
     inner: Arc<MpscInner<T, RING_CAP>>,
@@ -315,9 +352,14 @@ pub struct MpscConsumer<T: Send, const RING_CAP: usize = 64> {
 }
 
 impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
-    #[inline]
+    /// Register the consumer thread. Must be called by the consumer thread
+    /// itself before any producer publishes.
     pub fn bind(&self) {
-        self.inner.full_set.set_worker(std::thread::current());
+        // SAFETY: `consumer_thread` is written once before producers can
+        // observe `consumer_parked == true`.
+        unsafe {
+            *self.inner.consumer_thread.get() = Some(std::thread::current());
+        }
     }
 
     #[inline]
@@ -341,147 +383,116 @@ impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
 
     #[inline]
     pub fn has_pending(&self) -> bool {
-        for c in 0..self.inner.full_mask_chunks.len() {
-            let state = self.inner.full_set.state_chunk(c)
-                & self.inner.full_mask_chunks[c];
-            if state != 0 { return true; }
-        }
-        false
+        self.inner.any_ring_has_work()
     }
 
+    /// Scan all M rings, return the first item found. Round-robin order;
+    /// fairness across rings is best-effort, not guaranteed.
     #[inline]
     pub fn try_recv(&self) -> Option<T> {
         let m = self.inner.m;
-        let n_chunks = self.inner.full_mask_chunks.len();
-        for c in 0..n_chunks {
-            let state = self.inner.full_set.state_chunk(c)
-                & self.inner.full_mask_chunks[c];
-            if state == 0 { continue; }
-            let mut remaining = state;
-            while remaining != 0 {
-                let bit_in_chunk = remaining.trailing_zeros() as usize;
-                let bit = 1u64 << bit_in_chunk;
-                remaining &= !bit;
-                let p = c * 64 + bit_in_chunk;
-                if p >= m { break; }
-                let ring = &self.inner.rings[p];
-                let t = ring.tail.load(Ordering::Relaxed);
-                let h = ring.head.load(Ordering::Acquire);
-                if t == h { continue; }
-                let v = unsafe {
-                    (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                        .assume_init_read()
-                };
-                ring.tail.store(t.wrapping_add(1), Ordering::Release);
-                self.inner.producer_parks[p].wake();
-                return Some(v);
-            }
+        for p in 0..m {
+            let ring = &self.inner.rings[p];
+            let t = ring.tail.load(Ordering::Relaxed);
+            let h = ring.head.load(Ordering::Acquire);
+            if t == h { continue; }
+            let v = unsafe {
+                (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
+                    .assume_init_read()
+            };
+            ring.tail.store(t.wrapping_add(1), Ordering::Release);
+            self.inner.producer_parks[p].wake();
+            return Some(v);
         }
         None
     }
 
+    /// Blocking receive. Drains one item, parking on `thread::park` when
+    /// every ring is empty. Returns `Err(Shutdown)` after shutdown is
+    /// signalled and all rings are drained.
     pub fn recv(&self) -> Result<T, Shutdown> {
         loop {
             if let Some(v) = self.try_recv() { return Ok(v); }
             if self.inner.shutdown.load(Ordering::Acquire) {
-                self.inner.full_set.lock(self.inner.shutdown_id);
                 return Err(Shutdown);
             }
-            if self.park_or_drain()? { /* drained, loop */ }
+            // Dekker park: announce parking, recheck, then park.
+            self.inner.consumer_parked.store(true, Ordering::SeqCst);
+            if self.inner.any_ring_has_work() {
+                self.inner.consumer_parked.store(false, Ordering::Relaxed);
+                continue;
+            }
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                self.inner.consumer_parked.store(false, Ordering::Relaxed);
+                return Err(Shutdown);
+            }
+            std::thread::park();
+            self.inner.consumer_parked.store(false, Ordering::Relaxed);
         }
     }
 
+    /// Drain at least one full pass and invoke `f` on every item drained.
+    /// Blocks (parks) when no work is found and the channel is alive.
     pub fn recv_batch<F: FnMut(T)>(&self, mut f: F) -> Result<usize, Shutdown> {
         loop {
             let count = self.drain_all(&mut f);
             if count > 0 { return Ok(count); }
             if self.inner.shutdown.load(Ordering::Acquire) {
-                self.inner.full_set.lock(self.inner.shutdown_id);
                 return Err(Shutdown);
             }
-            self.park_or_drain()?;
+            self.inner.consumer_parked.store(true, Ordering::SeqCst);
+            if self.inner.any_ring_has_work() {
+                self.inner.consumer_parked.store(false, Ordering::Relaxed);
+                continue;
+            }
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                self.inner.consumer_parked.store(false, Ordering::Relaxed);
+                return Err(Shutdown);
+            }
+            std::thread::park();
+            self.inner.consumer_parked.store(false, Ordering::Relaxed);
         }
     }
 
+    /// Non-blocking batch drain. Returns the number of items drained on
+    /// this pass (zero means "nothing right now", not shutdown).
     pub fn try_recv_batch<F: FnMut(T)>(&self, mut f: F) -> usize {
         self.drain_all(&mut f)
     }
 
+    /// Drain every ring at least once. Loops until a full pass finds zero
+    /// new items — covers the case where draining ring `p` lets producer
+    /// `p-1` (already passed) commit more work.
     #[inline]
     fn drain_all<F: FnMut(T)>(&self, f: &mut F) -> usize {
         let m = self.inner.m;
-        let n_chunks = self.inner.full_mask_chunks.len();
-        let mut count = 0;
+        let mut count: usize = 0;
         loop {
-            let mut any_state = false;
             let mut progress = false;
-            for c in 0..n_chunks {
-                let state = self.inner.full_set.state_chunk(c)
-                    & self.inner.full_mask_chunks[c];
-                if state == 0 { continue; }
-                any_state = true;
-                let mut remaining = state;
-                while remaining != 0 {
-                    let bit_in_chunk = remaining.trailing_zeros() as usize;
-                    remaining &= remaining - 1;
-                    let p = c * 64 + bit_in_chunk;
-                    if p >= m { break; }
-                    let ring = &self.inner.rings[p];
-                    let mut t = ring.tail.load(Ordering::Relaxed);
-                    let h = ring.head.load(Ordering::Acquire);
-                    if t == h { continue; }
-                    while t != h {
-                        let v = unsafe {
-                            (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                                .assume_init_read()
-                        };
-                        t = t.wrapping_add(1);
-                        f(v);
-                        count += 1;
-                        progress = true;
-                    }
-                    ring.tail.store(t, Ordering::Release);
-                    self.inner.producer_parks[p].wake();
+            for p in 0..m {
+                let ring = &self.inner.rings[p];
+                let mut t = ring.tail.load(Ordering::Relaxed);
+                let h = ring.head.load(Ordering::Acquire);
+                if t == h { continue; }
+                while t != h {
+                    let v = unsafe {
+                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
+                            .assume_init_read()
+                    };
+                    t = t.wrapping_add(1);
+                    f(v);
+                    count += 1;
+                    progress = true;
                 }
+                ring.tail.store(t, Ordering::Release);
+                self.inner.producer_parks[p].wake();
             }
-            if !any_state { return count; }
             if !progress { return count; }
         }
     }
-
-    fn park_or_drain(&self) -> Result<bool, Shutdown> {
-        let m = self.inner.m;
-        let n_chunks = self.inner.full_mask_chunks.len();
-
-        for c in 0..n_chunks {
-            self.inner.full_set
-                .lock_chunk_mask(c, self.inner.full_mask_chunks[c]);
-        }
-        std::sync::atomic::fence(Ordering::SeqCst);
-
-        let mut any_raced = false;
-        for p in 0..m {
-            let ring = &self.inner.rings[p];
-            let h = ring.head.load(Ordering::Acquire);
-            let t = ring.tail.load(Ordering::Relaxed);
-            if h != t {
-                self.inner.full_set.release(SignalId::new(p as u8));
-                any_raced = true;
-            }
-        }
-        if any_raced { return Ok(true); }
-
-        if self.inner.shutdown.load(Ordering::Acquire) {
-            self.inner.full_set.lock(self.inner.shutdown_id);
-            return Err(Shutdown);
-        }
-
-        self.inner.full_set.acquire_any_chunk();
-        Ok(false)
-    }
 }
 
-// ─── Shutdown handle ───────────────────────────────────────────────────────
+// ─── Shutdown handle ──────────────────────────────────────────────────────
 
 pub struct MpscShutdown<T: Send, const RING_CAP: usize = 64> {
     inner: Arc<MpscInner<T, RING_CAP>>,
@@ -492,10 +503,20 @@ impl<T: Send, const RING_CAP: usize> Clone for MpscShutdown<T, RING_CAP> {
 }
 
 impl<T: Send, const RING_CAP: usize> MpscShutdown<T, RING_CAP> {
+    /// Mark the channel shut down and wake every parked endpoint
+    /// (consumer + all producers blocked on backpressure).
     #[inline]
     pub fn signal(&self) {
         self.inner.shutdown.store(true, Ordering::Release);
-        self.inner.full_set.release(self.inner.shutdown_id);
+        if self.inner.consumer_parked.load(Ordering::Relaxed) {
+            // SAFETY: `consumer_thread` is written once in `bind()` before
+            // any producer can race us.
+            unsafe {
+                if let Some(t) = &*self.inner.consumer_thread.get() {
+                    t.unpark();
+                }
+            }
+        }
         for p in self.inner.producer_parks.iter() { p.wake(); }
     }
 
@@ -505,7 +526,7 @@ impl<T: Send, const RING_CAP: usize> MpscShutdown<T, RING_CAP> {
     }
 }
 
-// ─── Tests ─────────────────────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -626,6 +647,7 @@ mod tests {
         let producers: Vec<_> = ps.drain(..).collect();
         let handles: Vec<_> = producers.into_iter().enumerate().map(|(i, p)| {
             std::thread::spawn(move || {
+                p.bind();
                 for v in 0..50u32 { p.send((i as u32) * 1000 + v); }
             })
         }).collect();

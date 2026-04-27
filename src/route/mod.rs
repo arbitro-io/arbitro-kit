@@ -12,9 +12,11 @@
 //! - [`Mpmc<T>`] — M:N **anonymous** sharded channel. Per-(producer, shard)
 //!   SPSC mini-rings; consumers steal across shards. Built-in shutdown
 //!   and panic-safe Drop.
-//! - [`Mpsc<T>`] — M:1 fan-in specialisation of [`Mpmc`]. Same per-producer
-//!   SPSC mini-ring + bitmap aggregator, with `N = 1` collapsed: no shard
-//!   scan, no producer cursor, ~10% faster `try_send` than `Mpmc::new(M, 1)`.
+//! - [`Mpsc<T>`] — M:1 fan-in. Per-producer SPSC mini-ring + consumer-side
+//!   scan for wakeup. Producers pay **zero `LOCK`-prefixed RMW** on the
+//!   send path; the consumer pays an O(M) scan per drain pass, amortised
+//!   across the burst. ~10× faster than `crossbeam::channel::bounded` at
+//!   1P/1C, ~13–29× faster at 4P/1C and 8P/1C (see `benches/mpsc_overhead.rs`).
 //!
 //! ## When to reach for `route`
 //!

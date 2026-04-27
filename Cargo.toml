@@ -51,6 +51,10 @@ harness = false
 name = "lifeline_overhead"
 harness = false
 
+[[bench]]
+name = "mpsc_overhead"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
