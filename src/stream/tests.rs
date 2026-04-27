@@ -332,28 +332,41 @@ fn recv_or_cancel_unparks_blocked_worker() {
 #[test]
 fn recv_or_cancel_one_target_only() {
     use crate::gate::Lifeline;
+    use std::sync::mpsc;
     use std::time::Duration;
     let s_a: Arc<Stream<u64>> = Arc::new(Stream::new());
     let s_b: Arc<Stream<u64>> = Arc::new(Stream::new());
     let life = Arc::new(Lifeline::new());
 
+    // Capture each worker's actual `WaiterId` instead of assuming spawn
+    // order — `register()` returns sequential ids but the scheduler may
+    // run B before A, in which case B would be `WaiterId(0)` and the
+    // hard-coded `cancel_one(WaiterId(0))` would target the wrong worker
+    // (cancelling B, leaving A parked forever).
+    let (id_tx_a, id_rx_a) = mpsc::channel::<crate::gate::WaiterId>();
+    let (id_tx_b, id_rx_b) = mpsc::channel::<crate::gate::WaiterId>();
+
     let sa = s_a.clone(); let la = life.clone();
     let h_a = thread::spawn(move || {
         sa.set_consumer(thread::current());
         let id = la.register(thread::current());
+        id_tx_a.send(id).unwrap();
         sa.recv_or_cancel(&la, id).map(|_| ()).map_err(|_| ())
     });
     let sb = s_b.clone(); let lb = life.clone();
     let h_b = thread::spawn(move || {
         sb.set_consumer(thread::current());
         let id = lb.register(thread::current());
+        id_tx_b.send(id).unwrap();
         sb.recv_or_cancel(&lb, id)
     });
 
+    let id_a = id_rx_a.recv().unwrap();
+    let _id_b = id_rx_b.recv().unwrap();
     thread::sleep(Duration::from_millis(30));
 
-    // Cancel only worker 0.
-    life.cancel_one(crate::gate::WaiterId(0));
+    // Cancel only worker A by its captured id.
+    life.cancel_one(id_a);
     let _ = h_a.join().unwrap();   // Worker A returns Err.
 
     // Worker B is still parked. Send data → returns Ok.

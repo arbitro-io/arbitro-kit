@@ -1,33 +1,51 @@
-//! Multi-channel M:1 signal: up to 64 gates backed by one `AtomicU64` bitmap.
+//! Multi-channel M:1 signal: up to 64 gates per chunk, backed by an
+//! `AtomicU64` bitmap, generic over the wait/wake backend.
 //!
 //! ## Model
 //!
-//! Each gate occupies one bit of an `AtomicU64`. Bit set = that gate is open
-//! (has pending work). Bit clear = locked.
+//! Each gate occupies one bit. Bit set = that gate is open (has pending work).
+//! Bit clear = locked.
 //!
 //! - `release(id)`: `fetch_or(bit, Release)`. Lock-free. Wakes the consumer
-//!   iff a bit flipped 0→1 and the consumer is parked.
-//! - `lock(id)`: `fetch_and(!bit, Relaxed)`. Lock-free.
-//! - `acquire_any(mask)` / `acquire_all(mask)` / `acquire_full()`: block the
-//!   consumer until the predicate over the current state holds. Spin-then-park
-//!   like [`super::Signal`].
+//!   iff a bit flipped 0→1 (coalesces repeated releases). The
+//!   [`Waiter`](crate::waiter::Waiter) handles "is consumer parked?"
+//!   internally — `release` just calls `waiter.wake()` unconditionally on
+//!   the 0→1 edge.
+//! - `lock(id)`: `fetch_and(!bit, Release)`. Lock-free, no wake.
+//! - `acquire_any(mask)` / `acquire_all(mask)` / `acquire`: block (sync) or
+//!   await (async) until the predicate holds.
+//!
+//! ## Runtime — pick at the type level
+//!
+//! - `SignalSet<>` (default `W = ParkWaiter`) — sync, OS-thread, `acquire_*`
+//!   blocks the calling thread.
+//! - `SignalSet<NotifyWaiter>` (feature `tokio`) — async, `acquire_*_async`.
+//! - Future runtimes (io_uring, …) — write one new `Waiter` impl and
+//!   `SignalSet<MyWaiter>` works automatically.
 //!
 //! ## Why a bitmap and not N Signals
 //!
-//! Coordinating N independent `Signal`s for "wait until any of them fires" would
-//! require N `Thread` handles or a shared event primitive. A single `AtomicU64`
-//! collapses the whole state into one load/store on the hot path and lets the
-//! consumer check any boolean combination of gates with one read.
+//! Coordinating N independent waiters for "wait until any of them fires"
+//! would require N `Thread` handles or a shared event primitive. A single
+//! `AtomicU64` collapses the whole state into one load on the hot path
+//! and lets the consumer check any boolean combination of gates with one
+//! read.
 //!
 //! ## Limits
 //!
-//! - Max 64 gates per set (one bit each).
-//! - **M producers : 1 consumer**, same as [`super::Signal`].
-//! - Signal registration must happen before the set is shared (compile-time
+//! - One bit per gate; default capacity 64. Use [`SignalSet::with_capacity`]
+//!   for more.
+//! - **M producers : 1 consumer**, same as the underlying [`Waiter`].
+//! - Gate registration must happen before the set is shared (compile-time
 //!   enforced: `create` takes `&mut self`).
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::waiter::{ParkWaiter, Waiter};
+#[cfg(feature = "tokio")]
+use crate::waiter::AsyncWaiter;
+use crate::waiter::BlockingWaiter;
 
 /// Maximum number of gates a `SignalSet` can host with the legacy
 /// (mask: u64) API. Sets with more than 64 bits must be created via
@@ -36,8 +54,8 @@ pub const MAX_GATES: usize = 64;
 
 /// Handle for a gate registered in a `SignalSet`. Cheap to `Copy`.
 ///
-/// Use [`SignalId::mask`] to combine multiple ids into a `u64` bitmask suitable
-/// for [`SignalSet::acquire_any`] / [`SignalSet::acquire_all`].
+/// Use [`SignalId::mask`] to combine multiple ids into a `u64` bitmask
+/// suitable for [`SignalSet::acquire_any`] / [`SignalSet::acquire_all`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SignalId(u8);
 
@@ -66,77 +84,62 @@ impl SignalId {
     }
 }
 
-/// Default spin iterations before parking. Same rationale as
-/// [`crate::gate::DEFAULT_SPIN_ITERS`].
-pub const DEFAULT_SPIN_ITERS: u32 = 512;
-
 #[repr(align(64))]
-pub struct SignalSet {
-    /// Chunked bitmap. `chunks[c]` bit `b` = gate `c*64 + b` is open. Read
-    /// with `Acquire`, mutated with `fetch_or(Release)` / `fetch_and(Release)`.
-    /// Default capacity is 1 chunk (64 bits) — same memory footprint as the
-    /// previous `AtomicU64` once factor in the heap pointer.
+pub struct SignalSet<W: Waiter = ParkWaiter> {
+    /// Chunked bitmap. `chunks[c]` bit `b` = gate `c*64 + b` is open.
+    /// Read with `Acquire`, mutated with `fetch_or(Release)` /
+    /// `fetch_and(Release)`. Default capacity is 1 chunk (64 bits).
     chunks: Box<[AtomicU64]>,
-    /// Set by the consumer before parking, cleared after wake. Producers
-    /// probe this flag to decide whether `unpark` is needed.
-    parked: AtomicBool,
-    /// Spin iterations before parking in `acquire*`. Set at construction via
-    /// [`SignalSet::new`] (default [`DEFAULT_SPIN_ITERS`]) or [`SignalSet::with_spin`].
-    spin_iters: u32,
-    /// Registered consumer thread. Written pre-share, read only when
-    /// `parked == true`.
-    worker: UnsafeCell<Option<std::thread::Thread>>,
-    /// Optional debug names, indexed by `SignalId.0`. Never read in hot path.
-    /// Sized to `capacity_bits()` at construction.
+    /// Wait/wake backend. `ParkWaiter` for sync OS-thread, `NotifyWaiter`
+    /// for tokio, future impls for io_uring.
+    waiter: W,
+    /// Optional debug names, indexed by `SignalId.0`. Never read in hot
+    /// path. Sized to `capacity_bits()` at construction.
     names: UnsafeCell<Vec<Option<&'static str>>>,
     /// Next free slot for `create()`. Mutated only pre-share via `&mut self`.
     next_id: UnsafeCell<u32>,
 }
 
-// Safety: `worker` / `names` / `next_id` obey the same discipline as
-// `Signal::worker`: mutated through `&mut self` (pre-share) or only read once
-// `parked == true` has synchronized the consumer's writes.
-unsafe impl Sync for SignalSet {}
-unsafe impl Send for SignalSet {}
+// Safety: `names` / `next_id` are mutated only through `&mut self`
+// (pre-share) — `create` requires exclusive access. Read paths after
+// share are limited to the single consumer thread (registered via the
+// waiter's `set_worker`). `chunks` and `waiter` are themselves `Sync`.
+unsafe impl<W: Waiter> Sync for SignalSet<W> {}
+unsafe impl<W: Waiter> Send for SignalSet<W> {}
 
-impl Default for SignalSet {
+impl<W: Waiter> Default for SignalSet<W> {
     fn default() -> Self { Self::new() }
 }
 
-impl SignalSet {
-    pub fn new() -> Self { Self::with_spin(DEFAULT_SPIN_ITERS) }
-
-    /// Construct with a custom spin-iteration budget. See [`Signal::with_spin`]
-    /// for semantics. 0 = always park immediately after the fast-path check.
-    pub fn with_spin(spin_iters: u32) -> Self {
-        Self::with_capacity_and_spin(MAX_GATES, spin_iters)
+impl<W: Waiter> SignalSet<W> {
+    /// Construct a `SignalSet` with default capacity (64 bits, one chunk).
+    pub fn new() -> Self {
+        Self::with_capacity(MAX_GATES)
     }
 
     /// Construct a SignalSet with explicit bit capacity. For `n_bits ≤ 64`
     /// this is identical to `new()` (single AtomicU64 chunk). For larger
     /// `n_bits`, allocates `ceil(n_bits / 64)` chunks. Mask-based methods
     /// (`acquire_any(mask: u64)`, `lock_mask(mask: u64)`, `state()`) only
-    /// address the first chunk and remain backward-compatible for the
-    /// `≤64` case.
+    /// address the first chunk.
     pub fn with_capacity(n_bits: usize) -> Self {
-        Self::with_capacity_and_spin(n_bits, DEFAULT_SPIN_ITERS)
-    }
-
-    fn with_capacity_and_spin(n_bits: usize, spin_iters: u32) -> Self {
-        let n_chunks = ((n_bits.max(1)) + 63) / 64;
+        let n_chunks = (n_bits.max(1) + 63) / 64;
         let cap_bits = n_chunks * 64;
         let mut chunks: Vec<AtomicU64> = Vec::with_capacity(n_chunks);
         for _ in 0..n_chunks { chunks.push(AtomicU64::new(0)); }
         let names: Vec<Option<&'static str>> = vec![None; cap_bits];
         Self {
             chunks:  chunks.into_boxed_slice(),
-            parked:  AtomicBool::new(false),
-            spin_iters,
-            worker:  UnsafeCell::new(None),
+            waiter:  W::default(),
             names:   UnsafeCell::new(names),
             next_id: UnsafeCell::new(0),
         }
     }
+
+    /// Borrow the underlying waiter. Useful for composing this set into
+    /// a larger topology.
+    #[inline]
+    pub fn waiter(&self) -> &W { &self.waiter }
 
     /// Number of `AtomicU64` chunks. `n_chunks() == 1` for the legacy
     /// (≤64-bit) API.
@@ -147,12 +150,13 @@ impl SignalSet {
     #[inline]
     pub fn capacity_bits(&self) -> usize { self.chunks.len() * 64 }
 
-    /// Register a new gate. Returns its typed handle. Callable only while the
-    /// set is unshared (`&mut self` enforces this at compile time).
+    /// Register a new gate. Returns its typed handle. Callable only while
+    /// the set is unshared (`&mut self` enforces this at compile time).
     ///
     /// # Panics
-    /// Panics if `capacity_bits()` gates have already been registered, or if
-    /// the next index would exceed `u8::MAX` (the `SignalId` representation).
+    /// Panics if `capacity_bits()` gates have already been registered, or
+    /// if the next index would exceed `u8::MAX` (the `SignalId`
+    /// representation).
     pub fn create(&mut self, name: &'static str) -> SignalId {
         // Safety: `&mut self` guarantees exclusive access; no concurrent reads.
         let id = unsafe {
@@ -176,10 +180,9 @@ impl SignalSet {
         unsafe { (&*self.names.get()).get(id.0 as usize).copied().flatten() }
     }
 
-    /// Look up a `SignalId` by its registered name. O(N) over registered gates.
-    /// Cold path — do the lookup once at init, not per operation.
+    /// Look up a `SignalId` by its registered name. O(N) over registered
+    /// gates. Cold path — do the lookup once at init, not per operation.
     pub fn id_of(&self, name: &str) -> Option<SignalId> {
-        // Safety: same as `name`.
         let names = unsafe { &*self.names.get() };
         let n = unsafe { *self.next_id.get() } as usize;
         for (i, slot) in names.iter().take(n).enumerate() {
@@ -193,21 +196,26 @@ impl SignalSet {
     /// Number of gates registered so far via `create()`.
     #[inline]
     pub fn registered(&self) -> usize {
-        // Safety: `next_id` is mutated only through `&mut self` (pre-share);
-        // a Relaxed read is sufficient post-share since registration is done.
         unsafe { *self.next_id.get() as usize }
     }
 
-    /// Register the consumer thread. Must be called before the set is shared
-    /// with producers. Typically the consumer calls
+    /// Register the consumer thread (sync waiters only — no-op for async
+    /// waiters). Must be called before the set is shared with producers.
+    /// Typically the consumer calls
     /// `set.set_worker(thread::current())`.
     pub fn set_worker(&self, t: std::thread::Thread) {
-        // Safety: documented pre-share contract.
-        unsafe { *self.worker.get() = Some(t); }
+        self.waiter.set_worker(t);
     }
 
-    /// Open one gate. Lock-free. Wakes the consumer iff it was parked and this
-    /// call actually flipped the bit (coalesces repeated releases).
+    /// `true` iff the underlying waiter has a worker (for sync waiters,
+    /// this means `set_worker` was called; for async waiters, always `true`).
+    #[inline]
+    pub fn has_worker(&self) -> bool {
+        self.waiter.has_worker()
+    }
+
+    /// Open one gate. Lock-free. Wakes the consumer iff this call actually
+    /// flipped the bit 0→1 (coalesces repeated releases).
     ///
     /// Supports `id` in any chunk (≤ `capacity_bits()`).
     #[inline]
@@ -215,22 +223,19 @@ impl SignalSet {
         let chunk = (id.0 as usize) / 64;
         let bit = 1u64 << ((id.0 as usize) % 64);
         let prev = self.chunks[chunk].fetch_or(bit, Ordering::Release);
-        if (prev & bit) == 0 && self.parked.load(Ordering::Relaxed) {
-            // Safety: `parked == true` implies the consumer's `set_worker`
-            // write has happened-before.
-            unsafe {
-                if let Some(t) = &*self.worker.get() {
-                    t.unpark();
-                }
-            }
+        if (prev & bit) == 0 {
+            // Edge 0→1: wake the consumer. The Waiter handles "is consumer
+            // parked?" internally — Park does a Relaxed parked.load + cond.
+            // unpark, Notify always notifies, etc.
+            self.waiter.wake();
         }
     }
 
     /// Close one gate. No wake needed.
     ///
     /// Uses `Release` ordering so that any reads the consumer performed on
-    /// payload memory (e.g. a `Hub` inbound slot) before calling `lock`
-    /// are published before the bit is cleared.
+    /// payload memory (e.g. a `Hub` inbound slot) before calling `lock` are
+    /// published before the bit is cleared.
     #[inline]
     pub fn lock(&self, id: SignalId) {
         let chunk = (id.0 as usize) / 64;
@@ -294,69 +299,75 @@ impl SignalSet {
         }
         false
     }
+}
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Blocking waits
-    // ─────────────────────────────────────────────────────────────────────
+// ── Sync acquire: requires `W: BlockingWaiter` ──────────────────────────
 
+impl<W: BlockingWaiter> SignalSet<W> {
     /// Block until **any** gate in `mask` is open. Must be called from the
     /// thread registered via `set_worker`.
     #[inline]
     pub fn acquire_any(&self, mask: u64) {
-        self.wait_until(|s| (s & mask) != 0);
+        self.waiter.wait_until(|| {
+            (self.chunks[0].load(Ordering::Acquire) & mask) != 0
+        });
     }
 
     /// Block until **every** gate in `mask` is open.
     #[inline]
     pub fn acquire_all(&self, mask: u64) {
-        self.wait_until(|s| (s & mask) == mask);
+        self.waiter.wait_until(|| {
+            (self.chunks[0].load(Ordering::Acquire) & mask) == mask
+        });
     }
 
     /// Block until any gate is open (equivalent to `acquire_any(!0)`).
     #[inline]
     pub fn acquire(&self) {
-        self.wait_until(|s| s != 0);
+        self.waiter.wait_until(|| {
+            self.chunks[0].load(Ordering::Acquire) != 0
+        });
     }
 
-    /// Generic spin-then-park wait over chunk 0 (legacy `u64` mask API).
-    /// For multi-chunk sets use [`Self::wait_until_chunks`].
-    #[inline]
-    fn wait_until(&self, pred: impl Fn(u64) -> bool) {
-        if pred(self.chunks[0].load(Ordering::Acquire)) { return; }
-        for _ in 0..self.spin_iters {
-            if pred(self.chunks[0].load(Ordering::Acquire)) { return; }
-            std::hint::spin_loop();
-        }
-        // `parked.store(true)` needs SeqCst for the same Dekker-race reason
-        // as `Signal`: producer's (fetch_or, parked.load) pair must not be
-        // reorderable past consumer's (parked.store, state.load) pair.
-        // Without SeqCst the producer could see parked=false, skip unpark;
-        // consumer could see bits=0, then park — deadlock. Paid once per
-        // park event, not per hot-path op.
-        self.parked.store(true, Ordering::SeqCst);
-        // Recheck after setting `parked` so a release that sneaks in between
-        // the spin exit and the flag store still wakes us.
-        while !pred(self.chunks[0].load(Ordering::Acquire)) {
-            std::thread::park();
-        }
-        self.parked.store(false, Ordering::Relaxed);
-    }
-
-    /// Block until any bit across ALL chunks is set (multi-chunk variant of
-    /// [`Self::acquire`]). For sets created via [`Self::with_capacity`] with
-    /// `n_bits > 64`, this is the correct way to park: the legacy
+    /// Block until any bit across ALL chunks is set (multi-chunk variant
+    /// of [`Self::acquire`]). For sets created via [`Self::with_capacity`]
+    /// with `n_bits > 64`, this is the correct way to park: the legacy
     /// `acquire*(mask: u64)` only sees chunk 0.
     pub fn acquire_any_chunk(&self) {
-        if self.any_chunk_open() { return; }
-        for _ in 0..self.spin_iters {
-            if self.any_chunk_open() { return; }
-            std::hint::spin_loop();
-        }
-        self.parked.store(true, Ordering::SeqCst);
-        while !self.any_chunk_open() {
-            std::thread::park();
-        }
-        self.parked.store(false, Ordering::Relaxed);
+        self.waiter.wait_until(|| self.any_chunk_open());
+    }
+}
+
+// ── Async acquire: requires `W: AsyncWaiter` ────────────────────────────
+
+#[cfg(feature = "tokio")]
+impl<W: AsyncWaiter> SignalSet<W> {
+    /// Async sibling of [`acquire_any`](Self::acquire_any).
+    pub async fn acquire_any_async(&self, mask: u64) {
+        self.waiter
+            .wait_until(|| (self.chunks[0].load(Ordering::Acquire) & mask) != 0)
+            .await;
+    }
+
+    /// Async sibling of [`acquire_all`](Self::acquire_all).
+    pub async fn acquire_all_async(&self, mask: u64) {
+        self.waiter
+            .wait_until(|| (self.chunks[0].load(Ordering::Acquire) & mask) == mask)
+            .await;
+    }
+
+    /// Async sibling of [`acquire`](Self::acquire).
+    pub async fn acquire_async(&self) {
+        self.waiter
+            .wait_until(|| self.chunks[0].load(Ordering::Acquire) != 0)
+            .await;
+    }
+
+    /// Async sibling of [`acquire_any_chunk`](Self::acquire_any_chunk).
+    pub async fn acquire_any_chunk_async(&self) {
+        self.waiter
+            .wait_until(|| self.any_chunk_open())
+            .await;
     }
 }
 
@@ -367,8 +378,26 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[should_panic(expected = "Park::wait_until reached park path without set_worker")]
+    fn acquire_without_set_worker_panics() {
+        let mut set: SignalSet = SignalSet::new();
+        let _id = set.create("a");
+        // No release was issued and no worker registered → wait_until burns
+        // the spin budget and reaches the park assert (inside ParkWaiter).
+        set.acquire();
+    }
+
+    #[test]
+    #[should_panic(expected = "Park::wait_until reached park path without set_worker")]
+    fn acquire_any_chunk_without_set_worker_panics() {
+        let mut set: SignalSet = SignalSet::with_capacity(128);
+        let _id = set.create("a");
+        set.acquire_any_chunk();
+    }
+
+    #[test]
     fn create_and_lookup() {
-        let mut set = SignalSet::new();
+        let mut set: SignalSet = SignalSet::new();
         let store = set.create("store");
         let drain = set.create("drain");
         assert_eq!(store.index(), 0);
@@ -381,7 +410,7 @@ mod tests {
 
     #[test]
     fn release_lock_is_open() {
-        let mut set = SignalSet::new();
+        let mut set: SignalSet = SignalSet::new();
         let a = set.create("a");
         let b = set.create("b");
         assert!(!set.is_open(a));
@@ -399,7 +428,7 @@ mod tests {
 
     #[test]
     fn acquire_any_wakes_on_first_release() {
-        let mut set = SignalSet::new();
+        let mut set: SignalSet = SignalSet::new();
         let a = set.create("a");
         let b = set.create("b");
         let set = Arc::new(set);
@@ -418,7 +447,7 @@ mod tests {
 
     #[test]
     fn acquire_all_waits_for_full_mask() {
-        let mut set = SignalSet::new();
+        let mut set: SignalSet = SignalSet::new();
         let a = set.create("a");
         let b = set.create("b");
         let set = Arc::new(set);
@@ -441,7 +470,7 @@ mod tests {
     #[test]
     fn many_producers_one_consumer() {
         use std::sync::atomic::AtomicBool;
-        let mut set = SignalSet::new();
+        let mut set: SignalSet = SignalSet::new();
         let ids: Vec<_> = (0..8).map(|i| {
             set.create(Box::leak(format!("g{i}").into_boxed_str()))
         }).collect();
@@ -474,5 +503,52 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         set.release(ids[0]);  // Kick the consumer if parked.
         consumer.join().unwrap();
+    }
+
+    // ── Async-mirror tests (feature `tokio`) ────────────────────────
+
+    #[cfg(feature = "tokio")]
+    mod async_mirror {
+        use super::super::*;
+        use crate::waiter::NotifyWaiter;
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn acquire_any_async_wakes() {
+            let mut set: SignalSet<NotifyWaiter> = SignalSet::new();
+            let a = set.create("a");
+            let b = set.create("b");
+            let set = Arc::new(set);
+            let s = set.clone();
+
+            let producer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                s.release(b);
+            });
+
+            set.acquire_any_async(a.mask() | b.mask()).await;
+            assert!(set.any_open(a.mask() | b.mask()));
+            producer.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn acquire_all_async_waits_for_full_mask() {
+            let mut set: SignalSet<NotifyWaiter> = SignalSet::new();
+            let a = set.create("a");
+            let b = set.create("b");
+            let set = Arc::new(set);
+            let s = set.clone();
+
+            let producer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                s.release(a);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                s.release(b);
+            });
+
+            set.acquire_all_async(a.mask() | b.mask()).await;
+            assert!(set.all_open(a.mask() | b.mask()));
+            producer.join().unwrap();
+        }
     }
 }

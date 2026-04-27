@@ -298,13 +298,24 @@ mod tests {
 
     #[test]
     fn cancel_one_wakes_only_target() {
+        use std::sync::mpsc;
         let l = Arc::new(Lifeline::new());
         let progress = Arc::new(AtomicUsize::new(0));
+
+        // Capture each worker's actual `WaiterId` instead of assuming
+        // spawn order — `register()` returns ids sequentially but the
+        // scheduler may run B before A, in which case B would be
+        // `WaiterId(0)` and the hard-coded `cancel_one(WaiterId(0))`
+        // would target the wrong worker (cancelling B, leaving A
+        // parked forever, `h_a.join()` hangs).
+        let (id_tx_a, id_rx_a) = mpsc::channel::<WaiterId>();
+        let (id_tx_b, id_rx_b) = mpsc::channel::<WaiterId>();
 
         // Two workers, only worker A gets cancelled individually.
         let l_a = l.clone(); let p_a = progress.clone();
         let h_a = thread::spawn(move || {
             let id = l_a.register(thread::current());
+            id_tx_a.send(id).unwrap();
             while !l_a.is_cancelled(id) { thread::park(); }
             p_a.fetch_add(1, Ordering::SeqCst);
         });
@@ -312,15 +323,19 @@ mod tests {
         let l_b = l.clone(); let p_b = progress.clone();
         let h_b = thread::spawn(move || {
             let id = l_b.register(thread::current());
+            id_tx_b.send(id).unwrap();
             while !l_b.is_cancelled(id) { thread::park(); }
             p_b.fetch_add(1, Ordering::SeqCst);
         });
 
+        let id_a = id_rx_a.recv().unwrap();
+        let _id_b = id_rx_b.recv().unwrap();
+
         // Let both park.
         thread::sleep(Duration::from_millis(30));
 
-        // Cancel only the first.
-        l.cancel_one(WaiterId(0));
+        // Cancel only worker A by its captured id.
+        l.cancel_one(id_a);
         h_a.join().unwrap();
         assert_eq!(progress.load(Ordering::SeqCst), 1);
 
