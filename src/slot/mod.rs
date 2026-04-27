@@ -23,6 +23,10 @@
 
 mod channel;
 mod pipe;
+#[cfg(feature = "tokio")]
+mod pipe_async;
 
 pub use channel::{Channel, Client, Server};
 pub use pipe::{NoHook, Pipe, PipeHook};
+#[cfg(feature = "tokio")]
+pub use pipe_async::PipeAsync;
