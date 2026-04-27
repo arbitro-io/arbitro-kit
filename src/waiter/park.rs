@@ -24,6 +24,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use super::{BlockingWaiter, Waiter};
 
@@ -55,7 +56,9 @@ unsafe impl Sync for ParkWaiter {}
 
 impl Default for ParkWaiter {
     #[inline]
-    fn default() -> Self { Self::with_spin(DEFAULT_SPIN_ITERS) }
+    fn default() -> Self {
+        Self::with_spin(DEFAULT_SPIN_ITERS)
+    }
 }
 
 impl ParkWaiter {
@@ -84,12 +87,16 @@ impl ParkWaiter {
         );
         // Phase 1: tight spin (no PAUSE).
         for _ in 0..TIGHT_SPIN {
-            if ready() { return; }
+            if ready() {
+                return;
+            }
             std::hint::black_box(());
         }
         // Phase 2: PAUSE spin.
         for _ in 0..self.spin_iters {
-            if ready() { return; }
+            if ready() {
+                return;
+            }
             std::hint::spin_loop();
         }
         // Phase 3: announce park. SeqCst closes the Dekker race with the
@@ -108,13 +115,76 @@ impl ParkWaiter {
             }
         }
     }
+
+    /// Block until `ready()` returns `true` or `deadline` elapses.
+    /// Returns `true` if the deadline elapsed first, `false` if the
+    /// predicate became true.
+    ///
+    /// Inherent (not part of `BlockingWaiter`) because the trait has no
+    /// deadline-aware variant. Used by `OneSignal::acquire_timeout` and
+    /// any other primitive that needs a timed wait specifically against
+    /// the park backend.
+    pub fn wait_until_deadline<F: FnMut() -> bool>(
+        &self,
+        deadline: Instant,
+        mut ready: F,
+    ) -> bool {
+        if ready() {
+            return false;
+        }
+        assert!(
+            self.has_worker(),
+            "ParkWaiter::wait_until_deadline reached park path without set_worker — register the consumer thread first",
+        );
+        // Tight spin.
+        for _ in 0..TIGHT_SPIN {
+            if ready() {
+                return false;
+            }
+            if Instant::now() >= deadline {
+                return true;
+            }
+            std::hint::black_box(());
+        }
+        // PAUSE spin.
+        for _ in 0..self.spin_iters {
+            if ready() {
+                return false;
+            }
+            if Instant::now() >= deadline {
+                return true;
+            }
+            std::hint::spin_loop();
+        }
+        // Announce park (Dekker).
+        self.parked.store(true, Ordering::SeqCst);
+        if ready() {
+            self.parked.store(false, Ordering::Relaxed);
+            return false;
+        }
+        // Park loop with timeout.
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                self.parked.store(false, Ordering::Relaxed);
+                return !ready();
+            }
+            std::thread::park_timeout(deadline - now);
+            if ready() {
+                self.parked.store(false, Ordering::Relaxed);
+                return false;
+            }
+        }
+    }
 }
 
 impl Waiter for ParkWaiter {
     #[inline]
     fn set_worker(&self, thread: std::thread::Thread) {
         // Safety: caller guarantees pre-share single-threaded access.
-        unsafe { *self.worker.get() = Some(thread); }
+        unsafe {
+            *self.worker.get() = Some(thread);
+        }
     }
 
     #[inline]
@@ -147,7 +217,9 @@ impl BlockingWaiter for ParkWaiter {
     /// called from the thread registered via `set_worker`.
     #[inline]
     fn wait_until<F: FnMut() -> bool>(&self, mut ready: F) {
-        if ready() { return; }
+        if ready() {
+            return;
+        }
         self.wait_slow(&mut ready);
     }
 }
@@ -201,7 +273,9 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(50));
         state.store(1, Ordering::Release);
-        for _ in 0..16 { w.wake(); }
+        for _ in 0..16 {
+            w.wake();
+        }
         h.join().unwrap();
     }
 }

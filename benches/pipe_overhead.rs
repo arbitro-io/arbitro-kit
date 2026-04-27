@@ -22,8 +22,42 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use arbitro_kit::gate::Signal;
+use std::sync::atomic::AtomicBool;
+
 use arbitro_kit::slot::{Pipe, PipeHook};
+use arbitro_kit::waiter::{BlockingWaiter, ParkWaiter, Waiter};
+
+// ─── `Signal` shim ─────────────────────────────────────────────────────────
+//
+// Restores the gate-shaped `release/acquire/lock` API on top of the
+// surviving primitive (`ParkWaiter`). Equivalent to the deleted
+// `gate::Signal`: a `ParkWaiter` + an `AtomicBool` "open" flag.
+//
+// This is the exact composition any caller would write today, and what
+// `Pipe`'s internals reduce to after the `Waiter` migration.
+struct Signal {
+    waiter: ParkWaiter,
+    open:   AtomicBool,
+}
+
+impl Signal {
+    fn new() -> Self {
+        Self { waiter: ParkWaiter::default(), open: AtomicBool::new(false) }
+    }
+    #[inline]
+    fn set_worker(&self, t: std::thread::Thread) { self.waiter.set_worker(t); }
+    #[inline]
+    fn release(&self) {
+        self.open.store(true, Ordering::Release);
+        self.waiter.wake();
+    }
+    #[inline]
+    fn acquire(&self) {
+        self.waiter.wait_until(|| self.open.load(Ordering::Acquire));
+    }
+    #[inline]
+    fn lock(&self) { self.open.store(false, Ordering::Relaxed); }
+}
 
 // We batch K operations per timing sample because Instant::now() on Windows
 // has ~100 ns granularity — timing a single RTT rounds to 0 or 100. With

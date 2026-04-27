@@ -4,7 +4,12 @@
 //! Channel-shaped tests live in `channel_overhead.rs`.
 //!
 //! Primitives under test:
-//!   - `Signal`                        — this crate's Dekker-safe gate.
+//!   - `Signal`                        — `ParkWaiter` + `AtomicBool` open-flag,
+//!                                       i.e. the gate-shaped composition that
+//!                                       used to live in `gate::Signal` before
+//!                                       it was folded into `ParkWaiter`. Built
+//!                                       inline so this bench keeps measuring
+//!                                       the same Dekker-safe wake path.
 //!   - `AtomicBool + spin`             — coherence-floor baseline, no park.
 //!   - `AtomicBool + park/unpark`      — manual Dekker with std's thread park.
 //!   - `Mutex<bool> + Condvar`         — idiomatic std wake.
@@ -34,9 +39,49 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arbitro_kit::gate::Signal;
+use arbitro_kit::gate::OneSignal;
+use arbitro_kit::waiter::{BlockingWaiter, ParkWaiter, Waiter};
 use crossbeam_channel::{bounded as cb_bounded};
 use crossbeam_utils::sync::Parker as CbParker;
+
+// ─── `Signal` shim ─────────────────────────────────────────────────────────
+//
+// Restores the gate-shaped `release/acquire/lock` API on top of the
+// surviving primitive (`ParkWaiter`). Equivalent to the deleted
+// `gate::Signal`: a `ParkWaiter` + an `AtomicBool` "open" flag.
+//
+// This is the exact composition any caller would write today — the bench
+// measures it as a baseline against `Mutex+Condvar`, `crossbeam Parker`,
+// etc. so the migration didn't lose the measurement.
+struct Signal {
+    waiter: ParkWaiter,
+    open:   AtomicBool,
+}
+
+impl Signal {
+    fn new() -> Self {
+        Self { waiter: ParkWaiter::default(), open: AtomicBool::new(false) }
+    }
+    fn with_spin(spin: u32) -> Self {
+        Self { waiter: ParkWaiter::with_spin(spin), open: AtomicBool::new(false) }
+    }
+    #[inline]
+    fn set_worker(&self, t: thread::Thread) { self.waiter.set_worker(t); }
+    /// Producer side: open the gate and wake the consumer if parked.
+    #[inline]
+    fn release(&self) {
+        self.open.store(true, Ordering::Release);
+        self.waiter.wake();
+    }
+    /// Consumer side: block until the gate is open.
+    #[inline]
+    fn acquire(&self) {
+        self.waiter.wait_until(|| self.open.load(Ordering::Acquire));
+    }
+    /// Consumer side: claim the open flag (close it for the next round).
+    #[inline]
+    fn lock(&self) { self.open.store(false, Ordering::Relaxed); }
+}
 
 fn rounds() -> usize {
     std::env::var("BENCH_ROUNDS").ok()
@@ -808,6 +853,133 @@ fn xt_parked_cb_channel() -> Row {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// OneSignal — single-use gate (release once, acquire once, then consumed).
+// Different shape from Signal: each round needs a fresh (Sender, Receiver)
+// pair. Inner state is `Arc<Inner>` so each round pays one Arc allocation.
+//
+// ST measures the full lifecycle (new + release + acquire) per round —
+// that's the real cost a user pays per oneshot wakeup.
+//
+// XT pre-allocates N pairs outside the timed loop and ships Receivers to
+// the consumer up front (via crossbeam channel), so the timed window
+// only measures the wake itself, comparable to Signal's release→acquire.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn st_one_signal() -> Row {
+    for _ in 0..warmup() {
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
+        rx.bind();
+        tx.release();
+        rx.acquire().unwrap();
+    }
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for _ in 0..rounds() {
+        let t0 = Instant::now();
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
+        rx.bind();
+        tx.release();
+        rx.acquire().unwrap();
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    finish("OneSignal (new+release+acquire)", lats, el)
+}
+
+fn xt_hot_one_signal() -> Row {
+    let total = warmup() + rounds();
+    // Pre-allocate every (Sender, Receiver) pair.
+    let mut senders = Vec::with_capacity(total);
+    let (tx_rx, rx_rx) = cb_bounded::<arbitro_kit::gate::OneSignalReceiver<ParkWaiter>>(total);
+    for _ in 0..total {
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
+        senders.push(tx);
+        tx_rx.send(rx).unwrap();
+    }
+    drop(tx_rx); // close the channel so the consumer sees end-of-stream
+
+    let round_nr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rn = round_nr.clone();
+    let h = thread::spawn(move || {
+        let mut seen = 0usize;
+        while let Ok(rx) = rx_rx.recv() {
+            rx.bind();
+            rx.acquire().unwrap();
+            seen += 1;
+            rn.store(seen, Ordering::Release);
+        }
+    });
+
+    // Give the consumer a moment to drain the channel and park on its first
+    // OneSignal so the producer fires straight into the spin window.
+    thread::sleep(Duration::from_micros(50));
+
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall_start = warmup();
+    let mut t_wall = Instant::now();
+    for (i, tx) in senders.into_iter().enumerate() {
+        if i == t_wall_start { t_wall = Instant::now(); }
+        let expect = i + 1;
+        let t0 = Instant::now();
+        tx.release();
+        while round_nr.load(Ordering::Acquire) < expect { std::hint::spin_loop(); }
+        if i >= t_wall_start {
+            lats.push(t0.elapsed().as_nanos() as u64);
+        }
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    h.join().unwrap();
+    finish("OneSignal", lats, el)
+}
+
+fn xt_parked_one_signal() -> Row {
+    let total = warmup() + rounds();
+    let mut senders = Vec::with_capacity(total);
+    let (tx_rx, rx_rx) = cb_bounded::<arbitro_kit::gate::OneSignalReceiver<ParkWaiter>>(total);
+    for _ in 0..total {
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
+        senders.push(tx);
+        tx_rx.send(rx).unwrap();
+    }
+    drop(tx_rx);
+
+    let round_nr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rn = round_nr.clone();
+    let h = thread::spawn(move || {
+        let mut seen = 0usize;
+        while let Ok(rx) = rx_rx.recv() {
+            rx.bind();
+            rx.acquire().unwrap();
+            seen += 1;
+            rn.store(seen, Ordering::Release);
+        }
+    });
+
+    // Warmup: shake out the spin window without pre-sleep.
+    let mut iter = senders.into_iter();
+    for i in 0..warmup() {
+        let tx = iter.next().unwrap();
+        tx.release();
+        while round_nr.load(Ordering::Acquire) < i + 1 { std::hint::spin_loop(); }
+    }
+
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for (k, tx) in iter.enumerate() {
+        thread::sleep(XT_PARKED_PRE_SLEEP);
+        let expect = warmup() + k + 1;
+        let t0 = Instant::now();
+        tx.release();
+        while round_nr.load(Ordering::Acquire) < expect { std::hint::spin_loop(); }
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+
+    h.join().unwrap();
+    finish("OneSignal", lats, el)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn main() {
     println!("=== arbitro-kit gate_overhead (wake-primitive comparison) ===");
@@ -821,6 +993,7 @@ fn main() {
     print_row(st_condvar());
     print_row(st_cb_parker());
     print_row(st_cb_channel());
+    print_row(st_one_signal());
 
     print_scenario_header("Cross-thread HOT (consumer spinning, no pre-sleep)");
     print_row(xt_hot_signal());
@@ -829,6 +1002,7 @@ fn main() {
     print_row(xt_hot_condvar());
     print_row(xt_hot_cb_parker());
     print_row(xt_hot_cb_channel());
+    print_row(xt_hot_one_signal());
 
     print_scenario_header("Cross-thread PARKED (500µs pre-sleep — true wake latency)");
     print_row(xt_parked_signal());
@@ -837,6 +1011,7 @@ fn main() {
     print_row(xt_parked_condvar());
     print_row(xt_parked_cb_parker());
     print_row(xt_parked_cb_channel());
+    print_row(xt_parked_one_signal());
 
     println!("\nDone.");
 }
