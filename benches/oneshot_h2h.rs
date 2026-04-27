@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arbitro_kit::gate::OneSignal;
+use arbitro_kit::waiter::ParkWaiter;
 use arbitro_kit::route::OneShot;
 use arbitro_kit::slot::Pipe;
 
@@ -58,14 +59,14 @@ fn header(title: &str) {
 fn a_one_signal() {
     // Warmup
     for _ in 0..WARMUP {
-        let (tx, rx) = OneSignal::new();
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
         rx.bind();
         tx.release();
         let _ = rx.acquire();
     }
     let mut samples = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
-        let (tx, rx) = OneSignal::new();
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
         rx.bind();
         let t0 = Instant::now();
         tx.release();
@@ -137,7 +138,7 @@ fn a_pipe_kit() {
 fn b_one_signal() {
     let mut samples = Vec::with_capacity(ROUNDS);
     for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = OneSignal::new();
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
         let barrier = Arc::new(Barrier::new(2));
         let b2 = barrier.clone();
         let handle = thread::spawn(move || {
@@ -250,7 +251,7 @@ fn busy_50us() {
 fn c_one_signal() {
     let mut samples = Vec::with_capacity(ROUNDS);
     for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = OneSignal::new();
+        let (tx, rx) = OneSignal::<ParkWaiter>::new();
         let barrier = Arc::new(Barrier::new(2));
         let b2 = barrier.clone();
         let handle = thread::spawn(move || {

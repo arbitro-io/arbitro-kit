@@ -51,7 +51,7 @@ fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
 // ── Baseline: raw SignalSet::release on a single bit, single-thread ──────
 // Matches what HubPort::send does minus the slot write.
 fn bench_baseline_signalset_release() {
-    let mut set = SignalSet::new();
+    let mut set = SignalSet::<arbitro_kit::waiter::ParkWaiter>::new();
     let id = set.create("x");
     set.set_worker(std::thread::current());
 
