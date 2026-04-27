@@ -5,27 +5,32 @@
 //!
 //! ## Modules
 //!
-//! - [`gate`] — synchronization primitives (no payload): [`Signal`],
-//!   [`SignalSet`], [`Park`].
-//! - [`slot`] — single-message transports (one in flight, no buffer):
-//!   [`Pipe`], [`Channel`].
+//! - [`waiter`] — the unified wait/wake contract:
+//!   [`Waiter`] / [`BlockingWaiter`] / [`AsyncWaiter`] +
+//!   [`ParkWaiter`] (sync OS thread) and [`NotifyWaiter`] (async, tokio).
+//! - [`gate`] — coalesced multi-channel signal: [`SignalSet`], plus
+//!   single-use [`OneSignal`] and the lifeline cancellation helper.
+//! - [`slot`] — single-message transports: [`Pipe`], [`Channel`].
 //! - [`stream`] — FIFO transports: [`Ring`] (bounded), [`Stream`]
 //!   (unbounded), [`Duplex`] (bidirectional pair), [`BufferedSender`].
-//! - [`route`] — multiplexed transports (N→1, M→N): [`Hub`], [`Mpmc`].
+//! - [`route`] — multiplexed transports (N→1, M→N): [`Hub`], [`Mpmc`],
+//!   [`Mpsc`], [`OneShot`].
 //!
 //! ## Quick start
 //!
 //! ```no_run
-//! use arbitro_kit::gate::Signal;
 //! use arbitro_kit::slot::Channel;
 //!
-//! let sig = Signal::new();
 //! let (client, server) = Channel::<u64, u64>::spsc();
 //! ```
 //!
-//! [`Signal`]: gate::Signal
+//! Every transport is generic over a [`Waiter`] backend. Default is
+//! sync OS thread; opt into tokio with `feature = "tokio"` and the
+//! `*Async` type aliases (e.g. [`PipeAsync`](slot::PipeAsync),
+//! [`OneShotAsync`](route::OneShotAsync)).
+//!
 //! [`SignalSet`]: gate::SignalSet
-//! [`Park`]: gate::Park
+//! [`OneSignal`]: gate::OneSignal
 //! [`Pipe`]: slot::Pipe
 //! [`Channel`]: slot::Channel
 //! [`Ring`]: stream::Ring
@@ -34,6 +39,8 @@
 //! [`BufferedSender`]: stream::BufferedSender
 //! [`Hub`]: route::Hub
 //! [`Mpmc`]: route::Mpmc
+//! [`Mpsc`]: route::Mpsc
+//! [`OneShot`]: route::OneShot
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

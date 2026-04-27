@@ -7,11 +7,12 @@
 use std::sync::atomic::Ordering;
 
 use crate::gate::{Cancelled, Lifeline, WaiterId};
+use crate::waiter::{BlockingWaiter, Waiter};
 
 use super::segment::Segment;
 use super::stream::Stream;
 
-impl<T> Stream<T> {
+impl<T, W: Waiter> Stream<T, W> {
     /// Non-blocking dequeue. Returns the next item if one is available,
     /// or `None` if the stream is currently empty.
     ///
@@ -47,51 +48,6 @@ impl<T> Stream<T> {
         // head_pos will see "delivered".
         self.head_pos.store(head + 1, Ordering::Release);
         Some(value)
-    }
-
-    /// Blocking dequeue. Parks (phased backoff via `Park`) until at
-    /// least one item is available, then takes it.
-    ///
-    /// Must only be called from the registered consumer thread (see
-    /// [`Stream::set_consumer`]).
-    #[inline]
-    pub fn recv(&self) -> T {
-        loop {
-            if let Some(v) = self.try_recv() { return v; }
-            self.not_empty.wait_until(|| {
-                self.head_pos.load(Ordering::Relaxed)
-                    < self.tail_pos.load(Ordering::Acquire)
-            });
-        }
-    }
-
-    /// Blocking dequeue with cancellation. Returns `Err(Cancelled)` if
-    /// the lifeline cancels this waiter while we are parked or before
-    /// we enter park. Otherwise behaves exactly like [`Stream::recv`].
-    ///
-    /// Performance: adopting this method costs ~1 extra atomic load
-    /// per spin iteration vs `recv()`. The plain `recv()` path is
-    /// **unchanged** — callers that don't use Lifeline pay nothing.
-    #[inline]
-    pub fn recv_or_cancel(
-        &self,
-        life: &Lifeline,
-        id: WaiterId,
-    ) -> Result<T, Cancelled> {
-        loop {
-            if let Some(v) = self.try_recv() { return Ok(v); }
-            if life.is_cancelled(id)        { return Err(Cancelled); }
-
-            // Park's predicate runs in spin and after the SeqCst
-            // `parked.store(true)`. Lifeline::cancel_* unparks the
-            // registered thread; on wake the predicate becomes true
-            // and `wait_until` returns.
-            self.not_empty.wait_until(|| {
-                self.head_pos.load(Ordering::Relaxed)
-                    < self.tail_pos.load(Ordering::Acquire)
-                    || life.is_cancelled(id)
-            });
-        }
     }
 
     /// Drain up to `max` items into `buf`. **Non-blocking** — returns
@@ -135,5 +91,46 @@ impl<T> Stream<T> {
         // or `Stream::new`); we now own it exclusively.
         unsafe { drop(Box::from_raw(cur_seg)); }
         next
+    }
+}
+
+// ── Blocking recv: requires `W: BlockingWaiter` ─────────────────────────────
+
+impl<T, W: BlockingWaiter> Stream<T, W> {
+    /// Blocking dequeue. Parks until at least one item is available,
+    /// then takes it.
+    ///
+    /// Must only be called from the registered consumer thread (see
+    /// [`Stream::set_consumer`]).
+    #[inline]
+    pub fn recv(&self) -> T {
+        loop {
+            if let Some(v) = self.try_recv() { return v; }
+            self.not_empty.wait_until(|| {
+                self.head_pos.load(Ordering::Relaxed)
+                    < self.tail_pos.load(Ordering::Acquire)
+            });
+        }
+    }
+
+    /// Blocking dequeue with cancellation. Returns `Err(Cancelled)` if
+    /// the lifeline cancels this waiter while we are parked or before
+    /// we enter park. Otherwise behaves exactly like [`Stream::recv`].
+    #[inline]
+    pub fn recv_or_cancel(
+        &self,
+        life: &Lifeline,
+        id: WaiterId,
+    ) -> Result<T, Cancelled> {
+        loop {
+            if let Some(v) = self.try_recv() { return Ok(v); }
+            if life.is_cancelled(id)        { return Err(Cancelled); }
+
+            self.not_empty.wait_until(|| {
+                self.head_pos.load(Ordering::Relaxed)
+                    < self.tail_pos.load(Ordering::Acquire)
+                    || life.is_cancelled(id)
+            });
+        }
     }
 }

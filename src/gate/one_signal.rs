@@ -6,8 +6,8 @@
 //! pre-existing data path) and the OneSignal only carries the wake.
 //!
 //! Compare with siblings:
-//! - [`Signal`](super::Signal) — reusable open/close (single bit).
-//! - [`Park`](super::Park) — stateless park/unpark; predicate at call site.
+//! - [`SignalSet`](super::SignalSet) — multi-channel, reusable, bitmap-backed.
+//! - [`ParkWaiter`](crate::waiter::ParkWaiter) — predicate-driven park/unpark.
 //! - **`OneSignal`** — single-use, with `acquire_timeout`. Drop-aware:
 //!   sender drop without release wakes the receiver with `Err(Closed)`.
 //!

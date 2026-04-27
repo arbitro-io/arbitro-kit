@@ -29,13 +29,15 @@
 
 use std::sync::Arc;
 
+use crate::waiter::{ParkWaiter, Waiter};
+
 use super::receipt::Receipt;
 use super::stream::Stream;
 
-/// Wraps a `Stream<T>` to provide transparent batching for callers
+/// Wraps a `Stream<T, W>` to provide transparent batching for callers
 /// that produce items one at a time. See module-level docs.
-pub struct BufferedSender<T> {
-    stream: Arc<Stream<T>>,
+pub struct BufferedSender<T, W: Waiter = ParkWaiter> {
+    stream: Arc<Stream<T, W>>,
     buf: Vec<T>,
     threshold: usize,
     /// Last receipt produced by an automatic or manual flush. Held
@@ -44,7 +46,7 @@ pub struct BufferedSender<T> {
     last_receipt: Option<Receipt>,
 }
 
-impl<T> BufferedSender<T> {
+impl<T, W: Waiter> BufferedSender<T, W> {
     /// Construct a new sender wrapping `stream`. Items push into a
     /// local `Vec`; once the Vec reaches `threshold` items, an
     /// automatic flush via [`Stream::send_iter`] drains them all in
@@ -52,7 +54,7 @@ impl<T> BufferedSender<T> {
     ///
     /// # Panics
     /// Panics if `threshold` is 0.
-    pub fn new(stream: Arc<Stream<T>>, threshold: usize) -> Self {
+    pub fn new(stream: Arc<Stream<T, W>>, threshold: usize) -> Self {
         assert!(threshold > 0, "BufferedSender threshold must be > 0");
         Self {
             stream,
@@ -107,10 +109,10 @@ impl<T> BufferedSender<T> {
     /// Borrow the underlying stream — for cursor inspection,
     /// `wait_for(seq)`, etc.
     #[inline]
-    pub fn stream(&self) -> &Stream<T> { &self.stream }
+    pub fn stream(&self) -> &Stream<T, W> { &self.stream }
 }
 
-impl<T> Drop for BufferedSender<T> {
+impl<T, W: Waiter> Drop for BufferedSender<T, W> {
     /// RAII safety: flush any residual items so they aren't silently
     /// dropped when the sender goes out of scope.
     fn drop(&mut self) { self.flush(); }
@@ -118,18 +120,10 @@ impl<T> Drop for BufferedSender<T> {
 
 // ─── Stream::buffered() helper ────────────────────────────────────────────
 
-impl<T> Stream<T> {
+impl<T, W: Waiter> Stream<T, W> {
     /// Build a [`BufferedSender`] that wraps this stream and
-    /// auto-flushes every `threshold` items. The wrapper clones the
-    /// `Arc<Stream<T>>` it's given.
-    ///
-    /// ```ignore
-    /// let stream = Arc::new(Stream::<u64>::new());
-    /// let mut tx = stream.buffered(64);
-    /// for i in 0..1000 { tx.send(i); }
-    /// // tx is dropped here → final flush.
-    /// ```
-    pub fn buffered(self: &Arc<Self>, threshold: usize) -> BufferedSender<T> {
+    /// auto-flushes every `threshold` items.
+    pub fn buffered(self: &Arc<Self>, threshold: usize) -> BufferedSender<T, W> {
         BufferedSender::new(self.clone(), threshold)
     }
 }

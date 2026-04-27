@@ -42,6 +42,8 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::waiter::{BlockingWaiter, ParkWaiter, Waiter};
+
 use super::receipt::Receipt;
 use super::stream::Stream;
 
@@ -51,12 +53,12 @@ use super::stream::Stream;
 /// Holds `Arc<Stream<Send>>` for outgoing and `Arc<Stream<Recv>>` for
 /// incoming. The peer holds the same two `Arc`s but with the
 /// direction labels swapped.
-pub struct DuplexEnd<S, R> {
-    out:   Arc<Stream<S>>,
-    inbox: Arc<Stream<R>>,
+pub struct DuplexEnd<S, R, W: Waiter = ParkWaiter> {
+    out:   Arc<Stream<S, W>>,
+    inbox: Arc<Stream<R, W>>,
 }
 
-impl<S, R> DuplexEnd<S, R> {
+impl<S, R, W: Waiter> DuplexEnd<S, R, W> {
     // ─── outbound ─────────────────────────────────────────────────────────
 
     /// Send one item to the peer. Returns a [`Receipt`] for the seq
@@ -74,7 +76,7 @@ impl<S, R> DuplexEnd<S, R> {
 
     /// Borrow the outbound stream — for cursor checks, custom flows.
     #[inline]
-    pub fn out_stream(&self) -> &Stream<S> { &self.out }
+    pub fn out_stream(&self) -> &Stream<S, W> { &self.out }
 
     /// Total items WE have produced toward the peer.
     #[inline]
@@ -114,8 +116,34 @@ impl<S, R> DuplexEnd<S, R> {
         self.inbox.try_recv()
     }
 
-    /// Blocking receive — parks (phased backoff via `Park`) until at
-    /// least one item is available. Register the consumer thread via
+    /// Drain up to `max` items into `buf`. Non-blocking.
+    pub fn recv_bulk(&self, buf: &mut Vec<R>, max: usize) -> usize {
+        self.inbox.recv_bulk(buf, max)
+    }
+
+    /// Register the thread that will block on `recv`. Must be called
+    /// before the first blocking `recv` on this end.
+    #[inline]
+    pub fn set_consumer(&self, t: std::thread::Thread) {
+        self.inbox.set_consumer(t);
+    }
+
+    /// Borrow the inbound stream — for cursor checks, custom flows.
+    #[inline]
+    pub fn in_stream(&self) -> &Stream<R, W> { &self.inbox }
+
+    /// Total items WE have drained from the peer's outbound.
+    #[inline]
+    pub fn in_cursor(&self) -> u64 { self.inbox.cursor() }
+
+    /// Total items the PEER has produced toward us.
+    #[inline]
+    pub fn peer_tail(&self) -> u64 { self.inbox.tail() }
+}
+
+impl<S, R, W: BlockingWaiter> DuplexEnd<S, R, W> {
+    /// Blocking receive — parks (phased backoff) until at least one
+    /// item is available. Register the consumer thread via
     /// [`Self::set_consumer`] before the first call.
     #[inline]
     pub fn recv(&self) -> R {
@@ -133,44 +161,20 @@ impl<S, R> DuplexEnd<S, R> {
     ) -> Result<R, crate::gate::Cancelled> {
         self.inbox.recv_or_cancel(life, id)
     }
-
-    /// Drain up to `max` items into `buf`. Non-blocking.
-    pub fn recv_bulk(&self, buf: &mut Vec<R>, max: usize) -> usize {
-        self.inbox.recv_bulk(buf, max)
-    }
-
-    /// Register the thread that will block on `recv`. Must be called
-    /// before the first blocking `recv` on this end.
-    #[inline]
-    pub fn set_consumer(&self, t: std::thread::Thread) {
-        self.inbox.set_consumer(t);
-    }
-
-    /// Borrow the inbound stream — for cursor checks, custom flows.
-    #[inline]
-    pub fn in_stream(&self) -> &Stream<R> { &self.inbox }
-
-    /// Total items WE have drained from the peer's outbound.
-    #[inline]
-    pub fn in_cursor(&self) -> u64 { self.inbox.cursor() }
-
-    /// Total items the PEER has produced toward us.
-    #[inline]
-    pub fn peer_tail(&self) -> u64 { self.inbox.tail() }
 }
 
-// Safety: each Stream<T> is Send + Sync where T: Send. DuplexEnd
+// Safety: each Stream<T, W> is Send + Sync where T: Send. DuplexEnd
 // just holds two Arcs of those, plus PhantomData.
-unsafe impl<S: Send, R: Send> Send for DuplexEnd<S, R> {}
-unsafe impl<S: Send, R: Send> Sync for DuplexEnd<S, R> {}
+unsafe impl<S: Send, R: Send, W: Waiter> Send for DuplexEnd<S, R, W> {}
+unsafe impl<S: Send, R: Send, W: Waiter> Sync for DuplexEnd<S, R, W> {}
 
 /// Bidirectional unbounded SPSC pair.
 ///
 /// `Duplex` is a namespace type; you don't construct an instance.
 /// Use [`Duplex::pair`] to create the two endpoints.
-pub struct Duplex<A, B>(PhantomData<(A, B)>);
+pub struct Duplex<A, B, W: Waiter = ParkWaiter>(PhantomData<(A, B, W)>);
 
-impl<A: Send + 'static, B: Send + 'static> Duplex<A, B> {
+impl<A: Send + 'static, B: Send + 'static, W: Waiter + 'static> Duplex<A, B, W> {
     /// Build a duplex pair.
     ///
     /// Returns `(left, right)` where:
@@ -183,9 +187,9 @@ impl<A: Send + 'static, B: Send + 'static> Duplex<A, B> {
     /// Dekker race that fires when the same thread is producer here
     /// and consumer on the peer stream (the bidirectional pattern
     /// inherent to `Duplex`). Plain `Stream` does not pay this cost.
-    pub fn pair() -> (DuplexEnd<A, B>, DuplexEnd<B, A>) {
-        let a_to_b: Arc<Stream<A>> = Arc::new(Stream::new_strict());
-        let b_to_a: Arc<Stream<B>> = Arc::new(Stream::new_strict());
+    pub fn pair() -> (DuplexEnd<A, B, W>, DuplexEnd<B, A, W>) {
+        let a_to_b: Arc<Stream<A, W>> = Arc::new(Stream::new_strict());
+        let b_to_a: Arc<Stream<B, W>> = Arc::new(Stream::new_strict());
 
         let left = DuplexEnd {
             out:   a_to_b.clone(),

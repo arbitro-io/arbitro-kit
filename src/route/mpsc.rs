@@ -2,8 +2,8 @@
 //!
 //! Per-producer SPSC mini-rings + consumer-side scan for wakeup. Producers
 //! never execute a `LOCK`-prefixed RMW on the send path: the only atomic
-//! they touch outside their own ring is a single `AtomicBool` load
-//! (`consumer_parked`) used to decide whether to `unpark` the consumer.
+//! they touch outside their own ring is the consumer's waiter wake-check
+//! (a single Relaxed load in the common "consumer running" case).
 //!
 //! ## Hot paths
 //!
@@ -11,17 +11,15 @@
 //!   - load this producer's `head` (Relaxed) and `tail` (Acquire);
 //!   - if full → return `Err(value)`;
 //!   - write slot, `head.store(Release)`;
-//!   - `consumer_parked.load(Relaxed)` — if `true`, `unpark` the consumer.
+//!   - `consumer_waiter.wake()` — internal Relaxed parked-flag check.
 //!
 //! Consumer `try_recv`:
 //!   - for `p in 0..M`: load (head, tail) of `ring[p]`; if non-empty, take
-//!     one item and `producer_parks[p].wake()` (only relevant under
+//!     one item and `producer_waiters[p].wake()` (only relevant under
 //!     backpressure).
 //!
-//! Consumer `recv` park path uses a Dekker recheck:
-//!   - `consumer_parked.store(true, SeqCst)`
-//!   - rescan all M rings + shutdown flag
-//!   - if still nothing → `thread::park()`.
+//! Consumer `recv` park path goes through `W::wait_until(predicate)` which
+//! does the Dekker recheck internally.
 //!
 //! ## Why this layout (vs Vyukov-style shared queue)
 //!
@@ -32,19 +30,9 @@
 //! O(M) scan per drain pass, amortised across whatever burst the rings
 //! hold (typically dozens to hundreds of items per pass).
 //!
-//! Bench (`benches/mpsc_overhead.rs`, x86_64, 4 P-cores + 8 E-cores):
-//!
-//! | Topology      | crossbeam mean | this `Mpsc` mean | speed-up |
-//! |---------------|---------------:|-----------------:|---------:|
-//! | 1P/1C cross   |   ~58 ns/op    |     ~6 ns/op     |   ~10×   |
-//! | 4P/1C         |   ~26 ns/op    |     ~2 ns/op     |   ~13×   |
-//! | 8P/1C         |   ~58 ns/op    |     ~2 ns/op     |   ~29×   |
-//! | 100P/1C       |   ~65 ns/op    |    ~36 ns/op     |   ~1.8×  |
-//!
 //! ## When to reach for `Mpsc`
 //!
-//! - True M:1 fan-in with anonymous producers (no per-producer reply
-//!   channel needed — use `Hub` for named ports + replies).
+//! - True M:1 fan-in with anonymous producers.
 //! - When the consumer is a dedicated drain thread that calls `recv` /
 //!   `recv_batch` in a tight loop.
 //! - For M:N fan-in, use [`super::mpmc::Mpmc`] instead.
@@ -55,8 +43,8 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::gate::Park;
 use crate::route::hub::Shutdown;
+use crate::waiter::{BlockingWaiter, ParkWaiter, Waiter};
 
 /// Maximum number of producers per channel.
 pub const MAX_MPSC_PRODUCERS: usize = 255;
@@ -66,8 +54,6 @@ const CACHE_LINE: usize = 64;
 // ─── Per-producer mini-Ring (SPSC) ────────────────────────────────────────
 
 /// Cache-line-padded SPSC ring shared between one producer and the consumer.
-/// `head` and `tail` live on separate cache lines to avoid false sharing on
-/// the cross-core publish path.
 #[repr(C)]
 struct PRing<T: Send, const RING_CAP: usize> {
     head: AtomicUsize,
@@ -100,25 +86,21 @@ impl<T: Send, const RING_CAP: usize> PRing<T, RING_CAP> {
 
 // ─── Shared inner state ───────────────────────────────────────────────────
 
-struct MpscInner<T: Send, const RING_CAP: usize> {
+struct MpscInner<T: Send, const RING_CAP: usize, W: Waiter> {
     rings: Box<[PRing<T, RING_CAP>]>,
-    /// Set by the consumer immediately before parking (with `SeqCst`).
-    /// Producers read with `Relaxed`; on `true` they `unpark` the consumer.
-    consumer_parked: AtomicBool,
-    /// Consumer's `Thread` handle, written once on `bind()` and read by
-    /// producers under the `consumer_parked` Dekker dance.
-    consumer_thread: UnsafeCell<Option<std::thread::Thread>>,
-    /// Per-producer backpressure park: when a producer's ring is full, it
-    /// parks here until the consumer drains and calls `wake()`.
-    producer_parks: Box<[Park]>,
+    /// Consumer waiter — wake on publish, park on drain miss.
+    consumer_waiter: W,
+    /// Per-producer backpressure waiters: producer parks here when its
+    /// ring is full; consumer wakes after draining the producer's ring.
+    producer_waiters: Box<[W]>,
     shutdown: AtomicBool,
     m: usize,
 }
 
-unsafe impl<T: Send, const RING_CAP: usize> Sync for MpscInner<T, RING_CAP> {}
-unsafe impl<T: Send, const RING_CAP: usize> Send for MpscInner<T, RING_CAP> {}
+unsafe impl<T: Send, const RING_CAP: usize, W: Waiter> Sync for MpscInner<T, RING_CAP, W> {}
+unsafe impl<T: Send, const RING_CAP: usize, W: Waiter> Send for MpscInner<T, RING_CAP, W> {}
 
-impl<T: Send, const RING_CAP: usize> MpscInner<T, RING_CAP> {
+impl<T: Send, const RING_CAP: usize, W: Waiter> MpscInner<T, RING_CAP, W> {
     fn new(m: usize) -> Self {
         assert!(
             RING_CAP > 0 && RING_CAP.is_power_of_two(),
@@ -126,41 +108,14 @@ impl<T: Send, const RING_CAP: usize> MpscInner<T, RING_CAP> {
         );
         let rings: Vec<PRing<T, RING_CAP>> =
             (0..m).map(|_| PRing::new()).collect();
-        let producer_parks: Vec<Park> = (0..m).map(|_| Park::new()).collect();
+        let producer_waiters: Vec<W> = (0..m).map(|_| W::default()).collect();
         Self {
             rings: rings.into_boxed_slice(),
-            consumer_parked: AtomicBool::new(false),
-            consumer_thread: UnsafeCell::new(None),
-            producer_parks: producer_parks.into_boxed_slice(),
+            consumer_waiter: W::default(),
+            producer_waiters: producer_waiters.into_boxed_slice(),
             shutdown: AtomicBool::new(false),
             m,
         }
-    }
-
-    /// Wake the consumer if it's parked. Reads the flag with `Relaxed`;
-    /// false negatives are tolerated because the consumer's Dekker recheck
-    /// closes the race (it re-scans every ring after setting `parked = true`
-    /// with `SeqCst`).
-    #[inline]
-    fn maybe_wake_consumer(&self) {
-        if self.consumer_parked.load(Ordering::Relaxed) {
-            // SAFETY: `consumer_thread` is written once in `bind()` before
-            // any producer can publish. After binding it is read-only.
-            unsafe {
-                if let Some(t) = &*self.consumer_thread.get() {
-                    t.unpark();
-                }
-            }
-        }
-    }
-
-    /// `true` iff a consumer thread has been registered via `bind()`.
-    /// Used by `recv` / `recv_batch` to surface a clear panic instead of an
-    /// infinite hang when the caller forgot to bind.
-    #[inline]
-    fn has_consumer_thread(&self) -> bool {
-        // SAFETY: per type invariant, only the consumer reads this field.
-        unsafe { (*self.consumer_thread.get()).is_some() }
     }
 
     /// `true` iff at least one ring has a published-but-not-consumed item.
@@ -177,7 +132,7 @@ impl<T: Send, const RING_CAP: usize> MpscInner<T, RING_CAP> {
     }
 }
 
-impl<T: Send, const RING_CAP: usize> Drop for MpscInner<T, RING_CAP> {
+impl<T: Send, const RING_CAP: usize, W: Waiter> Drop for MpscInner<T, RING_CAP, W> {
     fn drop(&mut self) {
         for p in 0..self.m {
             let ring = &self.rings[p];
@@ -198,9 +153,13 @@ impl<T: Send, const RING_CAP: usize> Drop for MpscInner<T, RING_CAP> {
 
 /// M:1 bounded channel. Each producer owns an SPSC ring of `RING_CAP`
 /// slots; the single consumer drains every ring via a scan.
-pub struct Mpsc<T: Send, const RING_CAP: usize = 64>(PhantomData<T>);
+pub struct Mpsc<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter>(
+    PhantomData<(T, W)>,
+);
 
-impl<T: Send + 'static, const RING_CAP: usize> Mpsc<T, RING_CAP> {
+impl<T: Send + 'static, const RING_CAP: usize, W: Waiter + 'static>
+    Mpsc<T, RING_CAP, W>
+{
     /// Build an `Mpsc` with `m` producers and 1 consumer.
     ///
     /// Returns `(producers, consumer, shutdown)`. The consumer is returned
@@ -213,17 +172,17 @@ impl<T: Send + 'static, const RING_CAP: usize> Mpsc<T, RING_CAP> {
     pub fn new(
         m: usize,
     ) -> (
-        Vec<MpscProducer<T, RING_CAP>>,
-        MpscConsumer<T, RING_CAP>,
-        MpscShutdown<T, RING_CAP>,
+        Vec<MpscProducer<T, RING_CAP, W>>,
+        MpscConsumer<T, RING_CAP, W>,
+        MpscShutdown<T, RING_CAP, W>,
     ) {
         assert!(m > 0, "Mpsc::new: m must be > 0");
         assert!(
             m <= MAX_MPSC_PRODUCERS,
             "Mpsc::new: m must be <= {MAX_MPSC_PRODUCERS}"
         );
-        let inner = Arc::new(MpscInner::<T, RING_CAP>::new(m));
-        let producers: Vec<MpscProducer<T, RING_CAP>> = (0..m)
+        let inner = Arc::new(MpscInner::<T, RING_CAP, W>::new(m));
+        let producers: Vec<MpscProducer<T, RING_CAP, W>> = (0..m)
             .map(|p| MpscProducer {
                 inner: inner.clone(),
                 my_idx: p,
@@ -241,13 +200,13 @@ impl<T: Send + 'static, const RING_CAP: usize> Mpsc<T, RING_CAP> {
 
 // ─── Producer handle ──────────────────────────────────────────────────────
 
-pub struct MpscProducer<T: Send, const RING_CAP: usize = 64> {
-    inner: Arc<MpscInner<T, RING_CAP>>,
+pub struct MpscProducer<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter> {
+    inner: Arc<MpscInner<T, RING_CAP, W>>,
     my_idx: usize,
     _not_sync: PhantomData<Cell<()>>,
 }
 
-impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
+impl<T: Send, const RING_CAP: usize, W: Waiter> MpscProducer<T, RING_CAP, W> {
     #[inline]
     pub fn index(&self) -> usize { self.my_idx }
 
@@ -256,7 +215,7 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
     /// backpressure.
     #[inline]
     pub fn bind(&self) {
-        self.inner.producer_parks[self.my_idx]
+        self.inner.producer_waiters[self.my_idx]
             .set_worker(std::thread::current());
     }
 
@@ -289,7 +248,7 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
     }
 
     /// Non-blocking send. Hot path: 1 Relaxed load + 1 Acquire load + 1
-    /// Release store + 1 Relaxed load. **Zero `LOCK`-prefixed RMW.**
+    /// Release store + 1 Relaxed wake-check. **Zero `LOCK`-prefixed RMW.**
     #[inline]
     pub fn try_send(&self, value: T) -> Result<(), T> {
         let ring = &self.inner.rings[self.my_idx];
@@ -305,7 +264,7 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
             (*ring.slots[h & PRing::<T, RING_CAP>::MASK].get()).write(value);
         }
         ring.head.store(h.wrapping_add(1), Ordering::Release);
-        self.inner.maybe_wake_consumer();
+        self.inner.consumer_waiter.wake();
         Ok(())
     }
 
@@ -330,11 +289,13 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
             h = h.wrapping_add(1);
         }
         ring.head.store(h, Ordering::Release);
-        self.inner.maybe_wake_consumer();
+        self.inner.consumer_waiter.wake();
         take
     }
+}
 
-    /// Blocking send. Parks on this producer's backpressure park if the
+impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpscProducer<T, RING_CAP, W> {
+    /// Blocking send. Parks on this producer's backpressure waiter if the
     /// ring is full; returns silently on shutdown without delivering.
     #[inline]
     pub fn send(&self, mut value: T) {
@@ -343,7 +304,7 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
                 Ok(()) => return,
                 Err(v) => value = v,
             }
-            self.inner.producer_parks[self.my_idx]
+            self.inner.producer_waiters[self.my_idx]
                 .wait_until(|| self.has_room()
                     || self.inner.shutdown.load(Ordering::Acquire));
             if self.inner.shutdown.load(Ordering::Acquire) {
@@ -355,20 +316,16 @@ impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP> {
 
 // ─── Consumer handle ──────────────────────────────────────────────────────
 
-pub struct MpscConsumer<T: Send, const RING_CAP: usize = 64> {
-    inner: Arc<MpscInner<T, RING_CAP>>,
+pub struct MpscConsumer<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter> {
+    inner: Arc<MpscInner<T, RING_CAP, W>>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
-impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
+impl<T: Send, const RING_CAP: usize, W: Waiter> MpscConsumer<T, RING_CAP, W> {
     /// Register the consumer thread. Must be called by the consumer thread
     /// itself before any producer publishes.
     pub fn bind(&self) {
-        // SAFETY: `consumer_thread` is written once before producers can
-        // observe `consumer_parked == true`.
-        unsafe {
-            *self.inner.consumer_thread.get() = Some(std::thread::current());
-        }
+        self.inner.consumer_waiter.set_worker(std::thread::current());
     }
 
     #[inline]
@@ -410,75 +367,10 @@ impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
                     .assume_init_read()
             };
             ring.tail.store(t.wrapping_add(1), Ordering::Release);
-            self.inner.producer_parks[p].wake();
+            self.inner.producer_waiters[p].wake();
             return Some(v);
         }
         None
-    }
-
-    /// Blocking receive. Drains one item, parking on `thread::park` when
-    /// every ring is empty. Returns `Err(Shutdown)` after shutdown is
-    /// signalled and all rings are drained.
-    ///
-    /// # Panics
-    /// Panics if [`bind`](Self::bind) was never called on this consumer.
-    /// Without a registered consumer thread, producers' `unpark` calls
-    /// have no target — `recv` would otherwise hang forever; the panic
-    /// surfaces the bug at the call site instead.
-    pub fn recv(&self) -> Result<T, Shutdown> {
-        loop {
-            if let Some(v) = self.try_recv() { return Ok(v); }
-            if self.inner.shutdown.load(Ordering::Acquire) {
-                return Err(Shutdown);
-            }
-            assert!(
-                self.inner.has_consumer_thread(),
-                "MpscConsumer::recv reached park path without bind() — call bind() on the consumer thread first",
-            );
-            // Dekker park: announce parking, recheck, then park.
-            self.inner.consumer_parked.store(true, Ordering::SeqCst);
-            if self.inner.any_ring_has_work() {
-                self.inner.consumer_parked.store(false, Ordering::Relaxed);
-                continue;
-            }
-            if self.inner.shutdown.load(Ordering::Acquire) {
-                self.inner.consumer_parked.store(false, Ordering::Relaxed);
-                return Err(Shutdown);
-            }
-            std::thread::park();
-            self.inner.consumer_parked.store(false, Ordering::Relaxed);
-        }
-    }
-
-    /// Drain at least one full pass and invoke `f` on every item drained.
-    /// Blocks (parks) when no work is found and the channel is alive.
-    ///
-    /// # Panics
-    /// Panics if [`bind`](Self::bind) was never called on this consumer
-    /// — same reason as [`recv`](Self::recv).
-    pub fn recv_batch<F: FnMut(T)>(&self, mut f: F) -> Result<usize, Shutdown> {
-        loop {
-            let count = self.drain_all(&mut f);
-            if count > 0 { return Ok(count); }
-            if self.inner.shutdown.load(Ordering::Acquire) {
-                return Err(Shutdown);
-            }
-            assert!(
-                self.inner.has_consumer_thread(),
-                "MpscConsumer::recv_batch reached park path without bind() — call bind() on the consumer thread first",
-            );
-            self.inner.consumer_parked.store(true, Ordering::SeqCst);
-            if self.inner.any_ring_has_work() {
-                self.inner.consumer_parked.store(false, Ordering::Relaxed);
-                continue;
-            }
-            if self.inner.shutdown.load(Ordering::Acquire) {
-                self.inner.consumer_parked.store(false, Ordering::Relaxed);
-                return Err(Shutdown);
-            }
-            std::thread::park();
-            self.inner.consumer_parked.store(false, Ordering::Relaxed);
-        }
     }
 
     /// Non-blocking batch drain. Returns the number of items drained on
@@ -512,39 +404,65 @@ impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
                     progress = true;
                 }
                 ring.tail.store(t, Ordering::Release);
-                self.inner.producer_parks[p].wake();
+                self.inner.producer_waiters[p].wake();
             }
             if !progress { return count; }
         }
     }
 }
 
-// ─── Shutdown handle ──────────────────────────────────────────────────────
+impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpscConsumer<T, RING_CAP, W> {
+    /// Blocking receive. Drains one item, parking when every ring is
+    /// empty. Returns `Err(Shutdown)` after shutdown is signalled and all
+    /// rings are drained.
+    pub fn recv(&self) -> Result<T, Shutdown> {
+        loop {
+            if let Some(v) = self.try_recv() { return Ok(v); }
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                return Err(Shutdown);
+            }
+            self.inner.consumer_waiter.wait_until(|| {
+                self.inner.any_ring_has_work()
+                    || self.inner.shutdown.load(Ordering::Acquire)
+            });
+        }
+    }
 
-pub struct MpscShutdown<T: Send, const RING_CAP: usize = 64> {
-    inner: Arc<MpscInner<T, RING_CAP>>,
+    /// Drain at least one full pass and invoke `f` on every item drained.
+    /// Blocks (parks) when no work is found and the channel is alive.
+    pub fn recv_batch<F: FnMut(T)>(&self, mut f: F) -> Result<usize, Shutdown> {
+        loop {
+            let count = self.drain_all(&mut f);
+            if count > 0 { return Ok(count); }
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                return Err(Shutdown);
+            }
+            self.inner.consumer_waiter.wait_until(|| {
+                self.inner.any_ring_has_work()
+                    || self.inner.shutdown.load(Ordering::Acquire)
+            });
+        }
+    }
 }
 
-impl<T: Send, const RING_CAP: usize> Clone for MpscShutdown<T, RING_CAP> {
+// ─── Shutdown handle ──────────────────────────────────────────────────────
+
+pub struct MpscShutdown<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter> {
+    inner: Arc<MpscInner<T, RING_CAP, W>>,
+}
+
+impl<T: Send, const RING_CAP: usize, W: Waiter> Clone for MpscShutdown<T, RING_CAP, W> {
     fn clone(&self) -> Self { Self { inner: self.inner.clone() } }
 }
 
-impl<T: Send, const RING_CAP: usize> MpscShutdown<T, RING_CAP> {
+impl<T: Send, const RING_CAP: usize, W: Waiter> MpscShutdown<T, RING_CAP, W> {
     /// Mark the channel shut down and wake every parked endpoint
     /// (consumer + all producers blocked on backpressure).
     #[inline]
     pub fn signal(&self) {
         self.inner.shutdown.store(true, Ordering::Release);
-        if self.inner.consumer_parked.load(Ordering::Relaxed) {
-            // SAFETY: `consumer_thread` is written once in `bind()` before
-            // any producer can race us.
-            unsafe {
-                if let Some(t) = &*self.inner.consumer_thread.get() {
-                    t.unpark();
-                }
-            }
-        }
-        for p in self.inner.producer_parks.iter() { p.wake(); }
+        self.inner.consumer_waiter.wake();
+        for w in self.inner.producer_waiters.iter() { w.wake(); }
     }
 
     #[inline]
@@ -562,22 +480,6 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
-
-    #[test]
-    #[should_panic(expected = "MpscConsumer::recv reached park path without bind()")]
-    fn recv_without_bind_panics() {
-        // No producers will ever publish; rings are empty and no bind was
-        // called. recv must panic instead of parking forever.
-        let (_ps, c, _sd) = Mpsc::<u64>::new(1);
-        let _ = c.recv();
-    }
-
-    #[test]
-    #[should_panic(expected = "MpscConsumer::recv_batch reached park path without bind()")]
-    fn recv_batch_without_bind_panics() {
-        let (_ps, c, _sd) = Mpsc::<u64>::new(1);
-        let _ = c.recv_batch(|_| {});
-    }
 
     #[test]
     fn single_producer_roundtrip() {
@@ -681,10 +583,6 @@ mod tests {
         assert_eq!(h.join().unwrap(), Err(Shutdown));
     }
 
-    /// Orphan-check 1: `send()` blocked on backpressure when shutdown
-    /// fires. Current behaviour silently drops the value (documented in
-    /// `send` doc comment). This test pins that behaviour so any change
-    /// is intentional.
     #[test]
     fn send_dropped_value_is_destructed_not_leaked() {
         struct Tracked(Arc<AtomicUsize>);
@@ -693,48 +591,36 @@ mod tests {
         }
         let drops = Arc::new(AtomicUsize::new(0));
 
-        // RING_CAP=1, 1 producer. Send one item to fill the ring.
         let (mut ps, c, sd) = Mpsc::<Tracked, 1>::new(1);
         let p = ps.remove(0);
-        p.try_send(Tracked(drops.clone())).ok().unwrap(); // ring full now.
+        p.try_send(Tracked(drops.clone())).ok().unwrap();
 
-        // Spawn a thread that calls send → will park on backpressure.
         let drops2 = drops.clone();
         let h = thread::spawn(move || {
             p.bind();
-            p.send(Tracked(drops2));   // value 2 — gets orphaned by shutdown.
+            p.send(Tracked(drops2));
         });
-        // Give it time to enter the park.
         thread::sleep(Duration::from_millis(50));
         sd.signal();
         h.join().unwrap();
 
-        // After shutdown returned and the producer thread joined, the
-        // orphan from `send` has already been dropped. The in-ring value
-        // is still alive — it lives until MpscInner drops, which requires
-        // ALL handles (consumer + shutdown) to be released.
         assert_eq!(drops.load(Ordering::Relaxed), 1,
             "send() must drop the orphaned value, not leak it");
 
         drop(sd);
-        drop(c); // last strong Arc → MpscInner::drop drains ring.
+        drop(c);
         assert_eq!(drops.load(Ordering::Relaxed), 2,
             "ring drain on Drop must destruct the in-flight value");
     }
 
-    /// Orphan-check 2: items already published to the ring before
-    /// shutdown MUST still be deliverable to the consumer. The consumer
-    /// drains everything before observing `Err(Shutdown)`.
     #[test]
     fn shutdown_drains_published_items_first() {
         let (mut ps, c, sd) = Mpsc::<u64, 16>::new(1);
         let p = ps.remove(0);
         for i in 0..10u64 { p.try_send(i).unwrap(); }
 
-        // Signal shutdown BEFORE the consumer touches anything.
         sd.signal();
 
-        // Consumer must still receive all 10 items.
         let h = thread::spawn(move || {
             c.bind();
             let mut got = Vec::new();

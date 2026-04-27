@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-use crate::gate::Park;
+use crate::waiter::{ParkWaiter, Waiter};
 use super::segment::{Segment, SEG_SIZE};
 
 /// 64-byte cache-line padding to keep `tail_pos` (producer-written) and
@@ -51,10 +51,10 @@ pub(crate) struct CachePad(pub(crate) [u8; 0]);
 /// This collapses round-trip verification into a single Acquire load —
 /// the foundation of the bench's 3 ns/RT result.
 #[repr(C)]
-pub struct Stream<T> {
-    /// Park where the consumer waits when the stream is empty.
+pub struct Stream<T, W: Waiter = ParkWaiter> {
+    /// Waiter the consumer parks on when the stream is empty.
     /// Readiness predicate is evaluated against `head_pos < tail_pos`.
-    pub(crate) not_empty: Park,
+    pub(crate) not_empty: W,
 
     /// Producer cursor: count of items the producer has published.
     /// After writing the slot for seq=N, the producer stores N+1 with
@@ -98,14 +98,14 @@ pub struct Stream<T> {
 // only by producer); `head_seg` is consumer-owned. Cross-thread
 // synchronization on segment writes (slot stores, `next` linkage)
 // flows through the Release/Acquire on `tail_pos`.
-unsafe impl<T: Send> Send for Stream<T> {}
-unsafe impl<T: Send> Sync for Stream<T> {}
+unsafe impl<T: Send, W: Waiter> Send for Stream<T, W> {}
+unsafe impl<T: Send, W: Waiter> Sync for Stream<T, W> {}
 
-impl<T> Default for Stream<T> {
+impl<T, W: Waiter> Default for Stream<T, W> {
     fn default() -> Self { Self::new() }
 }
 
-impl<T> Stream<T> {
+impl<T, W: Waiter> Stream<T, W> {
     /// Create an empty stream with one pre-allocated segment.
     /// Both cursors start at 0; `tail_seg == head_seg == first`.
     pub fn new() -> Self {
@@ -128,7 +128,7 @@ impl<T> Stream<T> {
     fn new_inner(strict_wake: bool) -> Self {
         let first = Segment::<T>::new_boxed(0);
         Self {
-            not_empty: Park::new(),
+            not_empty: W::default(),
             tail_pos: AtomicU64::new(0),
             _pad0: CachePad([]),
             head_pos: AtomicU64::new(0),
@@ -192,7 +192,7 @@ impl<T> Stream<T> {
     }
 }
 
-impl<T> Drop for Stream<T> {
+impl<T, W: Waiter> Drop for Stream<T, W> {
     /// Drain any unread items so RAII payloads (`Box`, `Vec`, `Arc`,
     /// `File`) are released, then free every segment.
     fn drop(&mut self) {

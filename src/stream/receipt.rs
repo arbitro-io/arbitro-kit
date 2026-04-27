@@ -12,6 +12,7 @@
 //! checks the same shared cursor on the `Stream` it was issued from.
 
 use crate::stream::Stream;
+use crate::waiter::Waiter;
 
 /// Sequence-number handle returned by `Stream::send` / `send_iter`.
 ///
@@ -42,7 +43,7 @@ impl Receipt {
     /// message has been delivered. This is the cheap, lock-free way
     /// to confirm delivery without blocking.
     #[inline]
-    pub fn is_delivered<T>(&self, stream: &Stream<T>) -> bool {
+    pub fn is_delivered<T, W: Waiter>(&self, stream: &Stream<T, W>) -> bool {
         stream.cursor() > self.0
     }
 
@@ -52,7 +53,7 @@ impl Receipt {
     /// **Note**: the MVP implementation busy-spins on the cursor. Use
     /// `is_delivered` for polling, or call this only from threads where
     /// burning a core for a few microseconds is acceptable.
-    pub fn wait_delivered<T>(&self, stream: &Stream<T>) {
+    pub fn wait_delivered<T, W: Waiter>(&self, stream: &Stream<T, W>) {
         stream.wait_for(self.0 + 1);
     }
 }

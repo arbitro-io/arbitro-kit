@@ -5,11 +5,13 @@
 
 use std::sync::atomic::Ordering;
 
+use crate::waiter::Waiter;
+
 use super::receipt::Receipt;
 use super::segment::{Segment, SEG_SIZE};
 use super::stream::Stream;
 
-impl<T> Stream<T> {
+impl<T, W: Waiter> Stream<T, W> {
     /// Append one item. Returns a [`Receipt`] carrying its sequence
     /// number. **Never blocks** — if the current segment is full, a
     /// fresh one is allocated on the spot.
