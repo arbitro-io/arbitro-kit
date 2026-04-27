@@ -90,7 +90,9 @@ pub struct OwnedBool(AtomicBool);
 
 impl OwnedBool {
     #[inline]
-    pub const fn new_locked() -> Self { Self(AtomicBool::new(true)) }
+    pub const fn new_locked() -> Self {
+        Self(AtomicBool::new(true))
+    }
 }
 
 impl SignalSource for OwnedBool {
@@ -181,7 +183,9 @@ pub struct Signal<S: SignalSource = OwnedBool> {
 unsafe impl<S: SignalSource + Sync> Sync for Signal<S> {}
 
 impl Default for Signal {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─── Canonical constructors (OwnedBool backing) ──────────────────────────
@@ -190,7 +194,9 @@ impl Default for Signal {
 // `OwnedBool` as its default type parameter. These constructors keep the
 // pre-generic shape exactly.
 impl Signal<OwnedBool> {
-    pub fn new() -> Self { Self::with_spin(DEFAULT_SPIN_ITERS) }
+    pub fn new() -> Self {
+        Self::with_spin(DEFAULT_SPIN_ITERS)
+    }
 
     /// Construct a `Signal` with a custom spin-iteration budget. Higher values
     /// trade CPU for lower wake latency when the producer fires within the
@@ -238,7 +244,10 @@ impl<'a> Signal<BitView<'a>> {
     pub fn from_bit(atomic: &'a AtomicU64, bit: u8) -> Self {
         debug_assert!(bit < 64, "bit index must be < 64");
         Self::with_source(
-            BitView { atomic, mask: 1u64 << bit },
+            BitView {
+                atomic,
+                mask: 1u64 << bit,
+            },
             DEFAULT_SPIN_ITERS,
         )
     }
@@ -263,20 +272,34 @@ impl<S: SignalSource> Signal<S> {
     /// with `gate.set_worker(thread::current())`.
     pub fn set_worker(&self, t: std::thread::Thread) {
         // Safety: caller guarantees pre-share single-threaded access.
-        unsafe { *self.worker.get() = Some(t); }
+        unsafe {
+            *self.worker.get() = Some(t);
+        }
+    }
+
+    /// `true` iff a consumer thread has been registered via `set_worker`.
+    ///
+    /// Composites that block the calling thread (e.g. `Pipe::recv`) use this
+    /// to surface a clear panic instead of an infinite park when the caller
+    /// forgot to register itself.
+    ///
+    /// Safety: read from a single-shot `UnsafeCell`. Must be called from the
+    /// consumer thread (same constraint as `acquire`); if `set_worker` was
+    /// done before the `Signal` was shared, no producer ever touches this
+    /// field, so the load races with nothing.
+    #[inline]
+    pub fn has_worker(&self) -> bool {
+        // Safety: per type invariant, only the consumer reads `worker`.
+        unsafe { (*self.worker.get()).is_some() }
     }
 
     /// Signal pending work. Lock-free, ~0.6 ns common case.
     #[inline]
     pub fn release(&self) {
         self.source.open();
-        if self.parked.load(Ordering::Relaxed) {
-            // Safety: `parked == true` was published by the consumer with a
-            // SeqCst store; its `worker` write is therefore also visible.
-            unsafe {
-                if let Some(t) = &*self.worker.get() {
-                    t.unpark();
-                }
+        unsafe {
+            if let Some(t) = &*self.worker.get() {
+                t.unpark();
             }
         }
     }
@@ -309,13 +332,24 @@ impl<S: SignalSource> Signal<S> {
     /// into `#[cold] acquire_slow` so the fast path stays compact in icache.
     #[inline]
     pub fn acquire(&self) {
-        if self.source.is_open() { return; }
+        if self.source.is_open() {
+            return;
+        }
         self.acquire_slow();
     }
 
     #[cold]
     #[inline(never)]
     fn acquire_slow(&self) {
+        // Invariant: the consumer must have registered itself via
+        // `set_worker` before reaching the park path. Without it the
+        // producer's `release()` finds `worker = None` and skips the
+        // `unpark()`, deadlocking the consumer silently. Surface a clear
+        // panic instead.
+        assert!(
+            self.has_worker(),
+            "Signal::acquire reached park path without set_worker — register the consumer thread first",
+        );
         // Every early-return from this function must synchronize-with the
         // producer's `release()` (Release store) so the caller sees any
         // payload the producer wrote before releasing. That means every
@@ -325,12 +359,16 @@ impl<S: SignalSource> Signal<S> {
         // Phase 1: tight spin (~1-2 ns/iter). Catches intra-socket signals
         // (~100-200 ns coherence) without paying a single PAUSE.
         for _ in 0..TIGHT_SPIN {
-            if self.source.is_open() { return; }
+            if self.source.is_open() {
+                return;
+            }
             std::hint::black_box(());
         }
         // Phase 2: PAUSE spin (~20-40 ns/iter on x86). Covers the ~µs range.
         for _ in 0..self.spin_iters {
-            if self.source.is_open() { return; }
+            if self.source.is_open() {
+                return;
+            }
             std::hint::spin_loop();
         }
         // Phase 3: announce parking. SeqCst store = mfence on x86 / dmb ish
@@ -358,9 +396,18 @@ impl<S: SignalSource> Signal<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    #[should_panic(expected = "Signal::acquire reached park path without set_worker")]
+    fn acquire_without_set_worker_panics() {
+        // Gate is closed, no worker registered → acquire must enter the
+        // slow path and panic instead of deadlocking silently.
+        let gate = Signal::new();
+        gate.acquire();
+    }
 
     #[test]
     fn release_wakes_parked_consumer() {
@@ -401,17 +448,21 @@ mod tests {
             }
         });
 
-        let producers: Vec<_> = (0..8).map(|_| {
-            let g = gate.clone();
-            std::thread::spawn(move || {
-                for _ in 0..50 {
-                    g.release();
-                    std::thread::yield_now();
-                }
+        let producers: Vec<_> = (0..8)
+            .map(|_| {
+                let g = gate.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        g.release();
+                        std::thread::yield_now();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
-        for p in producers { p.join().unwrap(); }
+        for p in producers {
+            p.join().unwrap();
+        }
         stop.store(true, Ordering::Relaxed);
         gate.release();
         consumer.join().unwrap();
@@ -445,7 +496,7 @@ mod tests {
         // Counter acts as our "queue": producer increments, consumer reads.
         let produced = Arc::new(AtomicU64::new(0));
         let consumed = Arc::new(AtomicU64::new(0));
-        let done     = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
 
         let g = gate.clone();
         let p = produced.clone();
@@ -467,7 +518,9 @@ mod tests {
                         g.lock();
                     }
                 }
-                if d.load(Ordering::Acquire) && c.load(Ordering::Relaxed) >= p.load(Ordering::Acquire) {
+                if d.load(Ordering::Acquire)
+                    && c.load(Ordering::Relaxed) >= p.load(Ordering::Acquire)
+                {
                     return;
                 }
             }
@@ -485,8 +538,11 @@ mod tests {
         gate.release();
 
         consumer.join().unwrap();
-        assert_eq!(consumed.load(Ordering::Acquire), N,
-                   "canonical pattern must consume every produced unit");
+        assert_eq!(
+            consumed.load(Ordering::Acquire),
+            N,
+            "canonical pattern must consume every produced unit"
+        );
     }
 
     #[test]
@@ -504,13 +560,17 @@ mod tests {
         // Signal::lock closes the shared atomic.
         sig.lock();
         assert!(!sig.is_open());
-        assert!(!state.load(Ordering::Acquire),
-                "Signal::lock must clear the caller's atomic");
+        assert!(
+            !state.load(Ordering::Acquire),
+            "Signal::lock must clear the caller's atomic"
+        );
 
         // Signal::release opens it.
         sig.release();
-        assert!(state.load(Ordering::Acquire),
-                "Signal::release must set the caller's atomic");
+        assert!(
+            state.load(Ordering::Acquire),
+            "Signal::release must set the caller's atomic"
+        );
     }
 
     #[test]
@@ -518,8 +578,8 @@ mod tests {
         use std::sync::atomic::AtomicU64;
 
         let state = AtomicU64::new(0);
-        let sig0  = Signal::from_bit(&state, 0);
-        let sig3  = Signal::from_bit(&state, 3);
+        let sig0 = Signal::from_bit(&state, 0);
+        let sig3 = Signal::from_bit(&state, 3);
         let sig63 = Signal::from_bit(&state, 63);
 
         assert!(!sig0.is_open() && !sig3.is_open() && !sig63.is_open());
@@ -527,7 +587,7 @@ mod tests {
         // Release bit 3 — only sig3 sees open.
         sig3.release();
         assert!(!sig0.is_open());
-        assert!( sig3.is_open());
+        assert!(sig3.is_open());
         assert!(!sig63.is_open());
         assert_eq!(state.load(Ordering::Acquire), 1u64 << 3);
 
@@ -540,7 +600,7 @@ mod tests {
 
         // Lock bit 3 — bit 0 must stay set.
         sig3.lock();
-        assert!( sig0.is_open());
+        assert!(sig0.is_open());
         assert!(!sig3.is_open());
         assert_eq!(state.load(Ordering::Acquire), 1);
 

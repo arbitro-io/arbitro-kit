@@ -1,8 +1,18 @@
 //! SPSC bounded ring buffer — N-slot pipelined queue.
 //!
-//! [`Ring<T, CAP>`] is the multi-slot sibling of [`Pipe<T>`](crate::slot::Pipe).
+//! [`Ring<T, CAP, W>`] is the multi-slot sibling of [`Pipe<T, W>`](crate::slot::Pipe).
 //! Same SPSC contract (one producer, one consumer), but with `CAP` slots
 //! preallocated inline, so producer and consumer can overlap in time.
+//!
+//! ## Multi-runtime
+//!
+//! `Ring` is generic over the [`Waiter`](crate::waiter::Waiter) backend. The
+//! default `W = ParkWaiter` keeps the same OS-thread `thread::park`/`unpark`
+//! semantics this type has always shipped with. Pass `W = NotifyWaiter`
+//! (feature `tokio`) and the same struct exposes async `send_async` /
+//! `recv_async` that resolve under a tokio runtime. After
+//! monomorphization, both forms compile to the same code paths as
+//! hand-written sync/async equivalents.
 //!
 //! ## When to use Ring instead of Pipe
 //!
@@ -28,16 +38,16 @@
 //!  acquire not_full  (blocks if full)
 //!  write   slot[head & MASK]
 //!  head.store(head+1, Release)
-//!  release not_empty  → coherence →    ─→   acquire not_empty
+//!  not_empty.wake()  → coherence →    ─→   wait_until(!is_empty)
 //!                                            read    slot[tail & MASK]
 //!                                            tail.store(tail+1, Release)
-//!                                            release not_full
+//!                                            not_full.wake()
 //! ```
 //!
-//! Two [`Signal`]s coordinate the two wait states: `not_empty` (consumer
-//! parks when ring is empty) and `not_full` (producer parks when ring is
-//! full). `head` and `tail` sit on separate cache lines to avoid false
-//! sharing.
+//! Two [`Waiter`](crate::waiter::Waiter) instances coordinate the two wait
+//! states: `not_empty` (consumer waits when ring is empty) and `not_full`
+//! (producer waits when ring is full). `head` and `tail` sit on separate
+//! cache lines to avoid false sharing.
 //!
 //! ## Capacity constraint
 //!
@@ -66,7 +76,7 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::gate::Park;
+use crate::waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter, Waiter};
 
 /// Cache-line padding to keep `head` (written by producer) and `tail`
 /// (written by consumer) on separate 64 B lines. Without this, every
@@ -75,52 +85,54 @@ use crate::gate::Park;
 #[repr(align(64))]
 struct CachePad([u8; 0]);
 
-/// SPSC bounded ring buffer with `CAP` slots (power-of-two).
+/// SPSC bounded ring buffer with `CAP` slots (power-of-two), generic over
+/// the [`Waiter`] backend.
 ///
 /// ## Concurrency contract
 ///
 /// - Exactly **one producer** calls [`send`](Self::send) / [`try_send`](Self::try_send).
 /// - Exactly **one consumer** calls [`recv`](Self::recv) / [`try_recv`](Self::try_recv).
-/// - Producer registers via [`set_producer`](Self::set_producer) before the
-///   first blocking [`send`] on a possibly-full ring.
-/// - Consumer registers via [`set_consumer`](Self::set_consumer) before the
-///   first blocking [`recv`] on a possibly-empty ring.
-/// - Usually shared across threads via `Arc<Ring<T, CAP>>`.
+/// - For `W = ParkWaiter` (sync, default): producer registers via
+///   [`set_producer`](Self::set_producer) before the first blocking
+///   [`send`] on a possibly-full ring, consumer registers via
+///   [`set_consumer`](Self::set_consumer) before the first blocking
+///   [`recv`] on a possibly-empty ring. Async waiters ignore both calls.
+/// - Usually shared across threads/tasks via `Arc<Ring<T, CAP, W>>`.
 #[repr(C)]
-pub struct Ring<T, const CAP: usize> {
-    /// Park primitive on which the consumer waits when the ring is empty.
+pub struct Ring<T, const CAP: usize, W: Waiter = ParkWaiter> {
+    /// Waiter on which the consumer blocks when the ring is empty.
     /// Open/closed state is derived directly from `head != tail` — no
     /// duplicated `locked` bit. Saves one Release store per `try_send`.
-    not_empty: Park,
+    not_empty: W,
     /// Write cursor. Monotonic, wraps via `& MASK` at use. Producer owns.
     head: AtomicUsize,
     _pad0: CachePad,
 
-    /// Park primitive on which the producer waits when the ring is full.
+    /// Waiter on which the producer blocks when the ring is full.
     /// Openness derived from `head - tail < CAP` — same reasoning as above.
-    not_full: Park,
+    not_full: W,
     /// Read cursor. Monotonic, wraps via `& MASK` at use. Consumer owns.
     tail: AtomicUsize,
     _pad1: CachePad,
 
     /// Slot storage. Each cell transitions empty → init → empty exactly once
-    /// per wrap, coordinated by the head/tail cursors + signals.
+    /// per wrap, coordinated by the head/tail cursors + waiters.
     slots: [UnsafeCell<MaybeUninit<T>>; CAP],
 }
 
-// Safety: slot access is serialized by the head/tail cursors + signals.
+// Safety: slot access is serialized by the head/tail cursors + waiters.
 // The producer only writes `slot[head & MASK]` when `head - tail < CAP`
 // (i.e. the slot is empty); the consumer only reads `slot[tail & MASK]`
 // when `head > tail` (i.e. the slot is initialized). The Release stores on
 // head/tail publish the writes to the other side.
-unsafe impl<T: Send, const CAP: usize> Send for Ring<T, CAP> {}
-unsafe impl<T: Send, const CAP: usize> Sync for Ring<T, CAP> {}
+unsafe impl<T: Send, const CAP: usize, W: Waiter> Send for Ring<T, CAP, W> {}
+unsafe impl<T: Send, const CAP: usize, W: Waiter> Sync for Ring<T, CAP, W> {}
 
-impl<T, const CAP: usize> Default for Ring<T, CAP> {
+impl<T, const CAP: usize, W: Waiter> Default for Ring<T, CAP, W> {
     fn default() -> Self { Self::new() }
 }
 
-impl<T, const CAP: usize> Ring<T, CAP> {
+impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
     /// Create a fresh ring. Both cursors start at 0; the ring is empty.
     ///
     /// # Panics
@@ -129,10 +141,10 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         assert!(CAP > 0,                "Ring CAP must be > 0");
         assert!(CAP.is_power_of_two(),  "Ring CAP must be a power of two");
 
-        // Park has no state of its own — "is it ready to proceed?" is
+        // Waiters have no payload state — "is it ready to proceed?" is
         // answered by the predicate that `wait_until` evaluates over head/tail.
-        let not_empty = Park::new();
-        let not_full  = Park::new();
+        let not_empty = W::default();
+        let not_full  = W::default();
 
         // Safety: creating an array of `UnsafeCell<MaybeUninit<T>>` is sound;
         // MaybeUninit::uninit() is always valid, UnsafeCell is a transparent
@@ -156,6 +168,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
 
     /// Register the producer thread. Must be called from the producer
     /// thread, before any blocking [`send`](Self::send) on a possibly-full ring.
+    /// No-op for async waiter backends.
     #[inline]
     pub fn set_producer(&self, t: std::thread::Thread) {
         self.not_full.set_worker(t);
@@ -163,6 +176,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
 
     /// Register the consumer thread. Must be called from the consumer
     /// thread, before any blocking [`recv`](Self::recv) on a possibly-empty ring.
+    /// No-op for async waiter backends.
     #[inline]
     pub fn set_consumer(&self, t: std::thread::Thread) {
         self.not_empty.set_worker(t);
@@ -204,7 +218,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         // Safety: slot is empty (head - tail < CAP). We own the write.
         unsafe { (*self.slots[head & Self::MASK].get()).write(value); }
         // Release on head publishes the slot write to the consumer AND is
-        // what opens the `not_empty` Park (the predicate reads head/tail).
+        // what opens the `not_empty` predicate (it reads head/tail).
         // No separate `locked` store — eliminating it halves the cache-line
         // traffic of a send on steady-state.
         self.head.store(head.wrapping_add(1), Ordering::Release);
@@ -213,94 +227,15 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         Ok(())
     }
 
-    /// Blocking enqueue. Parks until the ring has space, then enqueues.
-    ///
-    /// Must only be called from the registered producer thread.
-    ///
-    /// With `Park`, the dance collapses to a single `wait_until` — the
-    /// predicate reads head/tail directly, so the Dekker race between our
-    /// spin-exit and the consumer's drain is closed by `Park`'s internal
-    /// SeqCst store on `parked` + re-check of the predicate.
-    #[inline]
-    pub fn send(&self, mut value: T) {
-        loop {
-            match self.try_send(value) {
-                Ok(()) => return,
-                Err(v) => value = v,
-            }
-            self.not_full.wait_until(|| !self.is_full());
-        }
-    }
-
-    // ── Consumer API ─────────────────────────────────────────────────
-
-    /// Non-blocking dequeue. Returns `None` if the ring is empty.
-    ///
-    /// Must only be called from the single consumer thread.
-    #[inline]
-    pub fn try_recv(&self) -> Option<T> {
-        // Consumer owns `tail`. Acquire on `head` synchronizes-with the
-        // producer's Release when it published a slot.
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if head == tail {
-            return None;
-        }
-        // Safety: head > tail ⇒ slot[tail & MASK] holds an initialized T
-        // published by the producer with Release.
-        let v = unsafe { (*self.slots[tail & Self::MASK].get()).assume_init_read() };
-        // Release on tail publishes the slot-now-free to the producer AND
-        // is what opens the `not_full` Park for a waiting producer.
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        // Wake a possibly-parked producer. Idempotent.
-        self.not_full.wake();
-        Some(v)
-    }
-
-    /// Blocking dequeue. Parks until an item is available, then takes it.
-    ///
-    /// Must only be called from the registered consumer thread.
-    ///
-    /// With `Park`, the dance collapses to a single `wait_until`. Readiness
-    /// is `head != tail`, evaluated inside `Park::wait_until`; any producer
-    /// `head.store(Release)` during the park path will be observed because
-    /// `Park` re-checks the predicate after setting `parked = true (SeqCst)`.
-    #[inline]
-    pub fn recv(&self) -> T {
-        loop {
-            if let Some(v) = self.try_recv() { return v; }
-            self.not_empty.wait_until(|| !self.is_empty());
-        }
-    }
-
-    /// Blocking dequeue with cancellation. Returns `Err(Cancelled)` if
-    /// the lifeline cancels this waiter while we are parked or before
-    /// we enter park. Otherwise behaves exactly like [`Ring::recv`].
-    ///
-    /// The plain [`Ring::recv`] path is unchanged — adopting Lifeline
-    /// costs nothing for callers that don't use it.
-    #[inline]
-    pub fn recv_or_cancel(
-        &self,
-        life: &crate::gate::Lifeline,
-        id: crate::gate::WaiterId,
-    ) -> Result<T, crate::gate::Cancelled> {
-        loop {
-            if let Some(v) = self.try_recv() { return Ok(v); }
-            if life.is_cancelled(id)        { return Err(crate::gate::Cancelled); }
-            self.not_empty.wait_until(|| !self.is_empty() || life.is_cancelled(id));
-        }
-    }
-
     /// Non-blocking batch enqueue. Moves up to
     /// `n = min(src.len(), free_slots)` items from the front of `src`
     /// into the ring, in FIFO order. Returns `n`. The drained prefix is
     /// removed from `src`; the remainder stays.
     ///
-    /// Symmetric counterpart of [`drain_into`]. Amortizes a single `head`
-    /// publication and a single `not_empty.release()` over all `n` items
-    /// — avoiding N separate signal handshakes when the consumer is
-    /// parked under burst load.
+    /// Symmetric counterpart of [`drain_into`](Self::drain_into).
+    /// Amortizes a single `head` publication and a single `not_empty.wake()`
+    /// over all `n` items — avoiding N separate signal handshakes when the
+    /// consumer is parked under burst load.
     ///
     /// Must only be called from the single producer thread.
     pub fn try_send_from(&self, src: &mut Vec<T>) -> usize {
@@ -313,12 +248,12 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         // Drop-guard: if any `write` panics (or `src.drain`'s iterator
         // panics), advance `head` by the number of slots we already
         // initialized so `Ring::drop` drops them and no slot leaks.
-        struct Guard<'a, T, const CAP: usize> {
-            ring: &'a Ring<T, CAP>,
+        struct Guard<'a, T, const CAP: usize, W: Waiter> {
+            ring: &'a Ring<T, CAP, W>,
             head_start: usize,
             written: usize,
         }
-        impl<T, const CAP: usize> Drop for Guard<'_, T, CAP> {
+        impl<T, const CAP: usize, W: Waiter> Drop for Guard<'_, T, CAP, W> {
             fn drop(&mut self) {
                 // Only runs on panic unwind (we `forget` on success).
                 self.ring
@@ -327,7 +262,7 @@ impl<T, const CAP: usize> Ring<T, CAP> {
                 self.ring.not_empty.wake();
             }
         }
-        let mut guard = Guard::<T, CAP> {
+        let mut guard = Guard::<T, CAP, W> {
             ring: self,
             head_start: head,
             written: 0,
@@ -349,13 +284,38 @@ impl<T, const CAP: usize> Ring<T, CAP> {
         n
     }
 
+    // ── Consumer API ─────────────────────────────────────────────────
+
+    /// Non-blocking dequeue. Returns `None` if the ring is empty.
+    ///
+    /// Must only be called from the single consumer thread.
+    #[inline]
+    pub fn try_recv(&self) -> Option<T> {
+        // Consumer owns `tail`. Acquire on `head` synchronizes-with the
+        // producer's Release when it published a slot.
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        // Safety: head > tail ⇒ slot[tail & MASK] holds an initialized T
+        // published by the producer with Release.
+        let v = unsafe { (*self.slots[tail & Self::MASK].get()).assume_init_read() };
+        // Release on tail publishes the slot-now-free to the producer AND
+        // is what opens the `not_full` predicate for a waiting producer.
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        // Wake a possibly-parked producer. Idempotent.
+        self.not_full.wake();
+        Some(v)
+    }
+
     /// Drain up to `max` items into `out`. Returns the number drained.
     ///
     /// **Truly batched**: a single `head` Acquire, a single `tail` Release
-    /// publish, and a single `not_full.release()` cover the whole batch —
-    /// the symmetric counterpart of [`try_send_from`]. Amortizes the ack
-    /// cost (cursor publish + wakeup) across `n` items instead of paying
-    /// it per-item as `try_recv × N` does.
+    /// publish, and a single `not_full.wake()` cover the whole batch —
+    /// the symmetric counterpart of [`try_send_from`](Self::try_send_from).
+    /// Amortizes the ack cost (cursor publish + wakeup) across `n` items
+    /// instead of paying it per-item as `try_recv × N` does.
     ///
     /// Must only be called from the single consumer thread.
     pub fn drain_into(&self, out: &mut Vec<T>, max: usize) -> usize {
@@ -388,7 +348,86 @@ impl<T, const CAP: usize> Ring<T, CAP> {
     }
 }
 
-impl<T, const CAP: usize> Drop for Ring<T, CAP> {
+// ── Sync API (W: BlockingWaiter) ──────────────────────────────────────
+
+impl<T, const CAP: usize, W: BlockingWaiter> Ring<T, CAP, W> {
+    /// Blocking enqueue. Parks until the ring has space, then enqueues.
+    ///
+    /// Must only be called from the registered producer thread.
+    ///
+    /// The Dekker race between our spin-exit and the consumer's drain is
+    /// closed by `BlockingWaiter::wait_until`'s internal SeqCst store on
+    /// `parked` + re-check of the predicate.
+    #[inline]
+    pub fn send(&self, mut value: T) {
+        loop {
+            match self.try_send(value) {
+                Ok(()) => return,
+                Err(v) => value = v,
+            }
+            self.not_full.wait_until(|| !self.is_full());
+        }
+    }
+
+    /// Blocking dequeue. Parks until an item is available, then takes it.
+    ///
+    /// Must only be called from the registered consumer thread.
+    #[inline]
+    pub fn recv(&self) -> T {
+        loop {
+            if let Some(v) = self.try_recv() { return v; }
+            self.not_empty.wait_until(|| !self.is_empty());
+        }
+    }
+
+    /// Blocking dequeue with cancellation. Returns `Err(Cancelled)` if
+    /// the lifeline cancels this waiter while we are parked or before
+    /// we enter park. Otherwise behaves exactly like [`Ring::recv`].
+    ///
+    /// The plain [`Ring::recv`] path is unchanged — adopting Lifeline
+    /// costs nothing for callers that don't use it.
+    #[inline]
+    pub fn recv_or_cancel(
+        &self,
+        life: &crate::gate::Lifeline,
+        id: crate::gate::WaiterId,
+    ) -> Result<T, crate::gate::Cancelled> {
+        loop {
+            if let Some(v) = self.try_recv() { return Ok(v); }
+            if life.is_cancelled(id)        { return Err(crate::gate::Cancelled); }
+            self.not_empty.wait_until(|| !self.is_empty() || life.is_cancelled(id));
+        }
+    }
+}
+
+// ── Async API (W: AsyncWaiter) ────────────────────────────────────────
+
+impl<T: Send, const CAP: usize, W: AsyncWaiter> Ring<T, CAP, W> {
+    /// Async enqueue. Awaits until the ring has space, then enqueues.
+    ///
+    /// Must only be called from the single producer task.
+    pub async fn send_async(&self, mut value: T) {
+        loop {
+            match self.try_send(value) {
+                Ok(()) => return,
+                Err(v) => value = v,
+            }
+            self.not_full.wait_until(|| !self.is_full()).await;
+        }
+    }
+
+    /// Async dequeue. Awaits until an item is available, then takes it.
+    ///
+    /// Must only be called from the single consumer task.
+    pub async fn recv_async(&self) -> T {
+        loop {
+            if let Some(v) = self.try_recv() { return v; }
+            self.not_empty.wait_until(|| !self.is_empty()).await;
+        }
+    }
+}
+
+impl<T, const CAP: usize, W: Waiter> Drop for Ring<T, CAP, W> {
     fn drop(&mut self) {
         // `&mut self` means no other references — safe to drop in-flight.
         let head = *self.head.get_mut();
@@ -562,10 +601,6 @@ mod tests {
     ///   3. **Integrity**    — payload value unchanged in transit.
     ///   4. **FIFO order**   — items arrive in the order sent.
     ///   5. **Drain state**  — ring empty at end.
-    ///
-    /// The checksum test (`cross_thread_high_volume`) collapses factors 1–3
-    /// into a single commutative sum and cannot observe reordering. This
-    /// test separates the factors with a per-item equality check.
     #[test]
     fn cross_thread_factors() {
         const CAP: usize = 64;
@@ -599,12 +634,6 @@ mod tests {
     /// a transformed response. Validates that TWO independent Rings can
     /// be composed into a request/response pipeline without deadlock and
     /// that each response correlates to exactly one request.
-    ///
-    /// Correctness factors isolated:
-    ///   - **Correlation**: response[i] == f(request[i]) for all i
-    ///   - **No cross-talk**: two Rings don't corrupt each other's state
-    ///   - **Bidirectional liveness**: neither side deadlocks under
-    ///     bounded capacity smaller than N
     #[test]
     fn cross_thread_round_trip() {
         const CAP: usize = 32;
@@ -628,17 +657,6 @@ mod tests {
         req.set_producer(std::thread::current());
         rsp.set_consumer(std::thread::current());
 
-        // Interleaved send/recv on the SAME thread exercises the liveness
-        // property: if rsp.recv() blocks prematurely with req still pending
-        // in a full `req` ring, we deadlock. CAP=32 << N=10k forces this
-        // path repeatedly.
-        //
-        // Each iteration = one FULL ROUND-TRIP cycle:
-        //   main.send(req) ──► worker.recv(req)
-        //                       worker.send(rsp)
-        //   main.recv(rsp) ◄────┘
-        // so `elapsed / N` is the mean closed-loop latency per cycle,
-        // including wakeup costs on both rings.
         let t0 = std::time::Instant::now();
         for i in 0..N {
             req.send(i);
@@ -750,5 +768,38 @@ mod tests {
         let r: Ring<u32, 128> = Ring::new();
         for i in 0..100 { assert!(r.try_send(i).is_ok()); }
         assert_eq!(r.len(), 100);
+    }
+
+    // ── Async-mirror tests (W = NotifyWaiter, feature = "tokio") ──────
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn cross_task_basic_notify() {
+        use crate::waiter::NotifyWaiter;
+        // tokio::join! avoids the higher-ranked RPITIT-Send limitation
+        // (rust-lang/rust#100013) that bites `tokio::spawn` when the future
+        // borrows `&Ring<..., NotifyWaiter>` across an await.
+        let r: Ring<u64, 16, NotifyWaiter> = Ring::new();
+        let producer = async {
+            for i in 0..1000u64 { r.send_async(i).await; }
+        };
+        let consumer = async {
+            let mut sum = 0u64;
+            for _ in 0..1000 { sum += r.recv_async().await; }
+            sum
+        };
+        let (_, got) = tokio::join!(producer, consumer);
+        assert_eq!(got, (0..1000u64).sum());
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn wraparound_notify() {
+        use crate::waiter::NotifyWaiter;
+        let r: Ring<u32, 4, NotifyWaiter> = Ring::new();
+        for i in 0..100 {
+            r.send_async(i).await;
+            assert_eq!(r.recv_async().await, i);
+        }
     }
 }

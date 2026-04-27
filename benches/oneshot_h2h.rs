@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use arbitro_kit::gate::OneSignal;
 use arbitro_kit::route::OneShot;
+use arbitro_kit::slot::Pipe;
 
 const ROUNDS: usize = 500;
 const WARMUP: usize = 50;
@@ -112,6 +113,25 @@ fn a_oneshot_tokio() {
     report("tokio::oneshot<u64>", &mut samples);
 }
 
+fn a_pipe_kit() {
+    // Pipe is reusable, but to match the per-round allocation cost of the
+    // other primitives we create a fresh one each round.
+    for _ in 0..WARMUP {
+        let pipe: Pipe<u64> = Pipe::new();
+        pipe.send(42);
+        let _ = pipe.recv();
+    }
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let pipe: Pipe<u64> = Pipe::new();
+        let t0 = Instant::now();
+        pipe.send(42);
+        let _ = pipe.recv();
+        samples.push(t0.elapsed().as_nanos());
+    }
+    report("Pipe<u64> (kit, slot)", &mut samples);
+}
+
 // ─── B. Cross-thread, immediate release ───────────────────────────────────
 
 fn b_one_signal() {
@@ -184,6 +204,30 @@ fn b_oneshot_tokio() {
         }
     }
     report("tokio::oneshot<u64>", &mut samples);
+}
+
+fn b_pipe_kit() {
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for r in 0..(WARMUP + ROUNDS) {
+        let pipe = Arc::new(Pipe::<u64>::new());
+        let barrier = Arc::new(Barrier::new(2));
+        let p2 = pipe.clone();
+        let b2 = barrier.clone();
+        let handle = thread::spawn(move || {
+            p2.set_consumer(thread::current());
+            b2.wait();
+            let t0 = Instant::now();
+            let _ = p2.recv();
+            t0.elapsed().as_nanos()
+        });
+        barrier.wait();
+        pipe.send(42);
+        let dt = handle.join().unwrap();
+        if r >= WARMUP {
+            samples.push(dt);
+        }
+    }
+    report("Pipe<u64> (kit, slot)", &mut samples);
 }
 
 // ─── C. Cross-thread, sender delays so receiver definitely parks ──────────
@@ -282,6 +326,31 @@ fn c_oneshot_tokio() {
     report("tokio::oneshot<u64> (full RT)", &mut samples);
 }
 
+fn c_pipe_kit() {
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for r in 0..(WARMUP + ROUNDS) {
+        let pipe = Arc::new(Pipe::<u64>::new());
+        let barrier = Arc::new(Barrier::new(2));
+        let p2 = pipe.clone();
+        let b2 = barrier.clone();
+        let handle = thread::spawn(move || {
+            p2.set_consumer(thread::current());
+            b2.wait();
+            let t0 = Instant::now();
+            let _ = p2.recv();
+            t0.elapsed().as_nanos()
+        });
+        barrier.wait();
+        busy_50us();
+        pipe.send(42);
+        let dt = handle.join().unwrap();
+        if r >= WARMUP {
+            samples.push(dt);
+        }
+    }
+    report("Pipe<u64> (kit, slot, full RT)", &mut samples);
+}
+
 // ─── Driver ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -291,17 +360,20 @@ fn main() {
     header("A. Same-thread, already-released (pure fast path)");
     a_one_signal();
     a_oneshot_kit();
+    a_pipe_kit();
     a_oneshot_tokio();
 
     header("B. Cross-thread, immediate release (likely caught in spin)");
     b_one_signal();
     b_oneshot_tokio();
     b_oneshot_kit();
+    b_pipe_kit();
 
     header("C. Cross-thread, ~50 µs sender delay (receiver definitely parks; full RT incl. delay)");
     c_one_signal();
     c_oneshot_tokio();
     c_oneshot_kit();
+    c_pipe_kit();
 
     println!("\nDone.");
 }

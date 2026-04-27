@@ -210,6 +210,16 @@ impl<T: Send, const RING_CAP: usize> Shard<T, RING_CAP> {
         }
     }
 
+    /// `true` iff this shard's consumer has registered its thread via
+    /// `MpmcConsumer::bind`. Used by the blocking `recv` / `recv_batch`
+    /// paths to surface a clear panic instead of an infinite hang.
+    #[inline]
+    fn has_consumer_thread(&self) -> bool {
+        // SAFETY: per type invariant, only the shard's consumer reads
+        // `consumer_thread`.
+        unsafe { (*self.consumer_thread.get()).is_some() }
+    }
+
     /// `true` iff at least one ring in this shard has a published-but-not-
     /// consumed item. O(M).
     #[inline]
@@ -713,6 +723,10 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
             }
             // Dekker park: announce parking, recheck, then park.
             let shard = &self.inner.shards[self.shard_idx];
+            assert!(
+                shard.has_consumer_thread(),
+                "MpmcConsumer::recv reached park path without bind() — call bind() on the consumer thread first",
+            );
             shard.consumer_parked.store(true, Ordering::SeqCst);
             if shard.any_ring_has_work() {
                 shard.consumer_parked.store(false, Ordering::Relaxed);
@@ -758,6 +772,10 @@ impl<T: Send, const RING_CAP: usize> MpmcConsumer<T, RING_CAP> {
             }
             // Dekker park.
             let shard = &self.inner.shards[self.shard_idx];
+            assert!(
+                shard.has_consumer_thread(),
+                "MpmcConsumer::recv_batch reached park path without bind() — call bind() on the consumer thread first",
+            );
             shard.consumer_parked.store(true, Ordering::SeqCst);
             if shard.any_ring_has_work() {
                 shard.consumer_parked.store(false, Ordering::Relaxed);
@@ -864,6 +882,22 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    #[should_panic(expected = "MpmcConsumer::recv reached park path without bind()")]
+    fn recv_without_bind_panics() {
+        let (_ps, mut cs, _sd) = Mpmc::<u64>::new(1, 1);
+        let c = cs.remove(0);
+        let _ = c.recv();
+    }
+
+    #[test]
+    #[should_panic(expected = "MpmcConsumer::recv_batch reached park path without bind()")]
+    fn recv_batch_without_bind_panics() {
+        let (_ps, mut cs, _sd) = Mpmc::<u64>::new(1, 1);
+        let c = cs.remove(0);
+        let _ = c.recv_batch(|_| {});
+    }
 
     #[test]
     fn single_shard_single_producer_roundtrip() {

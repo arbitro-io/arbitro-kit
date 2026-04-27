@@ -53,6 +53,32 @@ fn header(title: &str) {
     );
     println!("{}", "─".repeat(94));
 }
+/// Progress helper: prints full lines (with `\n`) so they pass through `tee`
+/// without buffering. Each tick reports the **last batch's ns/op** so you
+/// see live throughput during the run — not just dots. Call
+/// `progress_start(label, n)` → returns a `tick(i, last_batch_ns)` closure
+/// + an `Instant`, then `progress_end(label, t0)` at the end.
+fn progress_start(label: &str, n: usize) -> (impl FnMut(usize, u64), Instant) {
+    let label = label.to_string();
+    eprintln!("    ▶ [{label}] start n={n}");
+    let step = (n / 10).max(1);
+    let label_for_tick = label.clone();
+    let tick = move |i: usize, last_batch_ns: u64| {
+        if i > 0 && i % step == 0 {
+            let pct = (i * 100) / n;
+            let ns_per_op = (last_batch_ns as f64) / (BATCH as f64);
+            eprintln!(
+                "      [{label_for_tick}] {pct}% ({i}/{n})  last={ns_per_op:.2} ns/op"
+            );
+        }
+    };
+    (tick, Instant::now())
+}
+fn progress_end(label: &str, t0: Instant) {
+    let ms = t0.elapsed().as_millis();
+    eprintln!("    ◀ [{label}] done in {ms}ms");
+}
+
 fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
     batch_ns.sort_unstable();
     let samples = batch_ns.len();
@@ -83,12 +109,16 @@ fn bench_single_thread() {
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
+    let (mut tick, prog_t0) = progress_start("A 1P/1C st", n);
     let wall = Instant::now();
-    for _ in 0..n {
+    for i in 0..n {
         let t0 = Instant::now();
         do_batch();
-        lats.push(t0.elapsed().as_nanos() as u64);
+        let dt = t0.elapsed().as_nanos() as u64;
+        lats.push(dt);
+        tick(i, dt);
     }
+    progress_end("A 1P/1C st", prog_t0);
     row("mpsc 1P/1C single-thread", lats, wall.elapsed().as_nanos() as u64);
 
     drop(sd);
@@ -118,12 +148,16 @@ fn bench_spsc_cross_thread() {
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
+    let (mut tick, prog_t0) = progress_start("B 1P/1C xt", n);
     let wall = Instant::now();
-    for _ in 0..n {
+    for i in 0..n {
         let t0 = Instant::now();
         for k in 0..BATCH as u64 { p.send(k); }
-        lats.push(t0.elapsed().as_nanos() as u64);
+        let dt = t0.elapsed().as_nanos() as u64;
+        lats.push(dt);
+        tick(i, dt);
     }
+    progress_end("B 1P/1C xt", prog_t0);
     row("mpsc 1P/1C cross-thread", lats, wall.elapsed().as_nanos() as u64);
 
     sd.signal();
@@ -181,14 +215,18 @@ fn bench_mpsc_fanin<const M: usize, const RING_CAP: usize>(label: &str) {
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
+    let (mut tick, prog_t0) = progress_start(label, n);
     let wall = Instant::now();
-    for _ in 0..n {
+    for i in 0..n {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
         while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
-        lats.push(t0.elapsed().as_nanos() as u64);
+        let dt = t0.elapsed().as_nanos() as u64;
+        lats.push(dt);
+        tick(i, dt);
     }
+    progress_end(label, prog_t0);
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
@@ -244,14 +282,18 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
+    let (mut tick, prog_t0) = progress_start(label, n);
     let wall = Instant::now();
-    for _ in 0..n {
+    for i in 0..n {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
         while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
-        lats.push(t0.elapsed().as_nanos() as u64);
+        let dt = t0.elapsed().as_nanos() as u64;
+        lats.push(dt);
+        tick(i, dt);
     }
+    progress_end(label, prog_t0);
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
@@ -324,14 +366,18 @@ fn bench_mpsc_batched<const M: usize, const RING_CAP: usize>(label: &str, chunk:
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
+    let (mut tick, prog_t0) = progress_start(label, n);
     let wall = Instant::now();
-    for _ in 0..n {
+    for i in 0..n {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
         while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
-        lats.push(t0.elapsed().as_nanos() as u64);
+        let dt = t0.elapsed().as_nanos() as u64;
+        lats.push(dt);
+        tick(i, dt);
     }
+    progress_end(label, prog_t0);
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
@@ -345,29 +391,32 @@ fn main() {
     println!("=== arbitro-kit route::Mpsc overhead bench ===");
     println!("rounds={} batches × BATCH={} ops each", rounds(), BATCH);
 
-    header("A. Single-thread 1P/1C (hot path, no park)");
-    bench_single_thread();
-
-    header("B. 1P/1C cross-thread");
-    bench_spsc_cross_thread();
-
-    header("C. MP/1C fan-in (producer-side wall time per round, total cap=1024)");
-    bench_mpsc_fanin::<2, 512>("mpsc 2P/1C cap=2×512");
-    bench_mpsc_fanin::<4, 256>("mpsc 4P/1C cap=4×256");
-    bench_mpsc_fanin::<8, 128>("mpsc 8P/1C cap=8×128");
-
-    header("D. crossbeam::channel::bounded(1024) baselines");
+    // Order: crossbeam baselines FIRST so the reference numbers print early.
+    // If kit::Mpsc later doesn't beat these, you know immediately the bench
+    // setup is off (instead of waiting until the end).
+    header("1. crossbeam::channel::bounded(1024) baselines (REFERENCE)");
     bench_crossbeam_mpsc::<2>("crossbeam 2P/1C");
     bench_crossbeam_mpsc::<4>("crossbeam 4P/1C");
     bench_crossbeam_mpsc::<8>("crossbeam 8P/1C");
 
-    header("E. MP/1C producer-batched via try_send_batch (chunk=64, total cap=1024)");
+    header("2. Single-thread 1P/1C (hot path, no park)");
+    bench_single_thread();
+
+    header("3. 1P/1C cross-thread");
+    bench_spsc_cross_thread();
+
+    header("4. kit::Mpsc MP/1C fan-in (producer-side wall time per round, total cap=1024)");
+    bench_mpsc_fanin::<2, 512>("mpsc 2P/1C cap=2×512");
+    bench_mpsc_fanin::<4, 256>("mpsc 4P/1C cap=4×256");
+    bench_mpsc_fanin::<8, 128>("mpsc 8P/1C cap=8×128");
+
+    header("5. kit::Mpsc MP/1C producer-batched via try_send_batch (chunk=64, total cap=1024)");
     bench_mpsc_batched::<2, 512>("mpsc 2P/1C batched-64 cap=2×512", 64);
     bench_mpsc_batched::<4, 256>("mpsc 4P/1C batched-64 cap=4×256", 64);
     bench_mpsc_batched::<8, 128>("mpsc 8P/1C batched-64 cap=8×128", 64);
 
-    header("F. High-fanin 100P/1C — mpsc vs crossbeam");
-    bench_mpsc_fanin::<100, 16>("mpsc 100P/1C cap=100×16");
+    header("6. High-fanin 100P/1C — mpsc vs crossbeam (slow section)");
+    bench_mpsc_fanin::<100, 16>("mpsc      100P/1C cap=100×16");
     bench_crossbeam_mpsc::<100>("crossbeam 100P/1C bounded(1024)");
 
     println!("\nDone.");

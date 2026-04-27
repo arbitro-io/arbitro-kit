@@ -154,6 +154,15 @@ impl<T: Send, const RING_CAP: usize> MpscInner<T, RING_CAP> {
         }
     }
 
+    /// `true` iff a consumer thread has been registered via `bind()`.
+    /// Used by `recv` / `recv_batch` to surface a clear panic instead of an
+    /// infinite hang when the caller forgot to bind.
+    #[inline]
+    fn has_consumer_thread(&self) -> bool {
+        // SAFETY: per type invariant, only the consumer reads this field.
+        unsafe { (*self.consumer_thread.get()).is_some() }
+    }
+
     /// `true` iff at least one ring has a published-but-not-consumed item.
     /// O(M).
     #[inline]
@@ -410,12 +419,22 @@ impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
     /// Blocking receive. Drains one item, parking on `thread::park` when
     /// every ring is empty. Returns `Err(Shutdown)` after shutdown is
     /// signalled and all rings are drained.
+    ///
+    /// # Panics
+    /// Panics if [`bind`](Self::bind) was never called on this consumer.
+    /// Without a registered consumer thread, producers' `unpark` calls
+    /// have no target — `recv` would otherwise hang forever; the panic
+    /// surfaces the bug at the call site instead.
     pub fn recv(&self) -> Result<T, Shutdown> {
         loop {
             if let Some(v) = self.try_recv() { return Ok(v); }
             if self.inner.shutdown.load(Ordering::Acquire) {
                 return Err(Shutdown);
             }
+            assert!(
+                self.inner.has_consumer_thread(),
+                "MpscConsumer::recv reached park path without bind() — call bind() on the consumer thread first",
+            );
             // Dekker park: announce parking, recheck, then park.
             self.inner.consumer_parked.store(true, Ordering::SeqCst);
             if self.inner.any_ring_has_work() {
@@ -433,6 +452,10 @@ impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
 
     /// Drain at least one full pass and invoke `f` on every item drained.
     /// Blocks (parks) when no work is found and the channel is alive.
+    ///
+    /// # Panics
+    /// Panics if [`bind`](Self::bind) was never called on this consumer
+    /// — same reason as [`recv`](Self::recv).
     pub fn recv_batch<F: FnMut(T)>(&self, mut f: F) -> Result<usize, Shutdown> {
         loop {
             let count = self.drain_all(&mut f);
@@ -440,6 +463,10 @@ impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP> {
             if self.inner.shutdown.load(Ordering::Acquire) {
                 return Err(Shutdown);
             }
+            assert!(
+                self.inner.has_consumer_thread(),
+                "MpscConsumer::recv_batch reached park path without bind() — call bind() on the consumer thread first",
+            );
             self.inner.consumer_parked.store(true, Ordering::SeqCst);
             if self.inner.any_ring_has_work() {
                 self.inner.consumer_parked.store(false, Ordering::Relaxed);
@@ -535,6 +562,22 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    #[should_panic(expected = "MpscConsumer::recv reached park path without bind()")]
+    fn recv_without_bind_panics() {
+        // No producers will ever publish; rings are empty and no bind was
+        // called. recv must panic instead of parking forever.
+        let (_ps, c, _sd) = Mpsc::<u64>::new(1);
+        let _ = c.recv();
+    }
+
+    #[test]
+    #[should_panic(expected = "MpscConsumer::recv_batch reached park path without bind()")]
+    fn recv_batch_without_bind_panics() {
+        let (_ps, c, _sd) = Mpsc::<u64>::new(1);
+        let _ = c.recv_batch(|_| {});
+    }
 
     #[test]
     fn single_producer_roundtrip() {
@@ -636,6 +679,76 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         sd.signal();
         assert_eq!(h.join().unwrap(), Err(Shutdown));
+    }
+
+    /// Orphan-check 1: `send()` blocked on backpressure when shutdown
+    /// fires. Current behaviour silently drops the value (documented in
+    /// `send` doc comment). This test pins that behaviour so any change
+    /// is intentional.
+    #[test]
+    fn send_dropped_value_is_destructed_not_leaked() {
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        // RING_CAP=1, 1 producer. Send one item to fill the ring.
+        let (mut ps, c, sd) = Mpsc::<Tracked, 1>::new(1);
+        let p = ps.remove(0);
+        p.try_send(Tracked(drops.clone())).ok().unwrap(); // ring full now.
+
+        // Spawn a thread that calls send → will park on backpressure.
+        let drops2 = drops.clone();
+        let h = thread::spawn(move || {
+            p.bind();
+            p.send(Tracked(drops2));   // value 2 — gets orphaned by shutdown.
+        });
+        // Give it time to enter the park.
+        thread::sleep(Duration::from_millis(50));
+        sd.signal();
+        h.join().unwrap();
+
+        // After shutdown returned and the producer thread joined, the
+        // orphan from `send` has already been dropped. The in-ring value
+        // is still alive — it lives until MpscInner drops, which requires
+        // ALL handles (consumer + shutdown) to be released.
+        assert_eq!(drops.load(Ordering::Relaxed), 1,
+            "send() must drop the orphaned value, not leak it");
+
+        drop(sd);
+        drop(c); // last strong Arc → MpscInner::drop drains ring.
+        assert_eq!(drops.load(Ordering::Relaxed), 2,
+            "ring drain on Drop must destruct the in-flight value");
+    }
+
+    /// Orphan-check 2: items already published to the ring before
+    /// shutdown MUST still be deliverable to the consumer. The consumer
+    /// drains everything before observing `Err(Shutdown)`.
+    #[test]
+    fn shutdown_drains_published_items_first() {
+        let (mut ps, c, sd) = Mpsc::<u64, 16>::new(1);
+        let p = ps.remove(0);
+        for i in 0..10u64 { p.try_send(i).unwrap(); }
+
+        // Signal shutdown BEFORE the consumer touches anything.
+        sd.signal();
+
+        // Consumer must still receive all 10 items.
+        let h = thread::spawn(move || {
+            c.bind();
+            let mut got = Vec::new();
+            loop {
+                match c.recv() {
+                    Ok(v) => got.push(v),
+                    Err(Shutdown) => break,
+                }
+            }
+            got
+        });
+        let got = h.join().unwrap();
+        assert_eq!(got, (0..10).collect::<Vec<u64>>(),
+            "items published before shutdown must be delivered");
     }
 
     #[test]

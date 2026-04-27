@@ -88,6 +88,16 @@ impl Park {
         unsafe { *self.worker.get() = Some(t); }
     }
 
+    /// `true` iff a consumer thread has been registered via [`set_worker`].
+    /// Used by composites and the slow-path park guard to surface a clear
+    /// panic instead of an infinite hang when the caller forgot to bind.
+    ///
+    /// Safety: same single-consumer constraint as `wait_until`.
+    #[inline]
+    pub fn has_worker(&self) -> bool {
+        unsafe { (*self.worker.get()).is_some() }
+    }
+
     /// Wake the registered consumer if it is parked. Idempotent, lock-free.
     ///
     /// Cost: one Relaxed load of `parked` (~0.3 ns). Zero stores in the
@@ -127,6 +137,15 @@ impl Park {
     #[cold]
     #[inline(never)]
     fn wait_slow<F: FnMut() -> bool>(&self, ready: &mut F) {
+        // Invariant: the consumer must have registered itself via
+        // `set_worker` before reaching the park path. Without it the
+        // producer's `wake()` finds `worker = None` and skips the
+        // `unpark()`, deadlocking the consumer silently. We surface a
+        // clear panic instead.
+        assert!(
+            self.has_worker(),
+            "Park::wait_until reached park path without set_worker — register the consumer thread first",
+        );
         // Phase 1: tight spin (no PAUSE).
         for _ in 0..TIGHT_SPIN {
             if ready() { return; }
@@ -161,6 +180,16 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    #[should_panic(expected = "Park::wait_until reached park path without set_worker")]
+    fn wait_until_without_set_worker_panics() {
+        // Predicate is always false → wait_until enters the slow path
+        // immediately. Without `set_worker` we'd deadlock; the invariant
+        // panics instead.
+        let park = Park::new();
+        park.wait_until(|| false);
+    }
 
     #[test]
     fn wake_after_state_change_releases_parked_thread() {

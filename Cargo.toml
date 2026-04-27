@@ -7,7 +7,20 @@ description = "Zero-dependency synchronization and utility primitives from the A
 readme = "README.md"
 
 [dependencies]
-# No runtime dependencies. std-only.
+# No runtime dependencies by default. std-only.
+# Optional `tokio` feature pulls tokio::sync only — for the async-flavored
+# primitives (PipeAsync, OneShotAsync) that target the OS-thread→tokio-task
+# wake path. Enable from downstream via `features = ["tokio"]`.
+tokio = { version = "1", features = ["sync"], default-features = false, optional = true }
+
+[features]
+default = []
+# Async (tokio-backed) variants of slot/route primitives. Designed for the
+# specific case where a wake fires from a non-tokio thread (TCP reader,
+# FFI callback, OS-thread worker) and must release a tokio task — where
+# OS-thread `unpark` would land on a cold core and lose to runtime
+# multiplexing. See `slot::PipeAsync` and `route::OneShotAsync`.
+tokio = ["dep:tokio"]
 
 [dev-dependencies]
 # Only for benchmarks: compare our primitives against crossbeam equivalents.
