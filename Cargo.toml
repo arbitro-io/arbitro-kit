@@ -14,6 +14,7 @@ readme = "README.md"
 # Runtime crate itself stays dep-free.
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 
 [[bench]]
 name = "gate_overhead"
@@ -53,6 +54,10 @@ harness = false
 
 [[bench]]
 name = "mpsc_overhead"
+harness = false
+
+[[bench]]
+name = "oneshot_h2h"
 harness = false
 
 [profile.release]

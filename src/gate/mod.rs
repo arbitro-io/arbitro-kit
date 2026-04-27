@@ -14,6 +14,9 @@
 //!   hot-path ops (no string lookup).
 //! - [`Park`] — stateless park/unpark. Lower-level than `Signal`: callers
 //!   carry their own readiness predicate, `Park` only handles the wake.
+//! - [`OneSignal`] — single-use payloadless gate with timeout support.
+//!   The minimal "block until released" primitive; replaces
+//!   `tokio::sync::oneshot` when the payload travels separately.
 //!
 //! ## Semantics (shared by `Signal` and `SignalSet`)
 //!
@@ -26,11 +29,18 @@
 //! `Thread` handle registered via `set_worker`).
 
 mod lifeline;
+mod one_signal;
 mod park;
 mod signal;
 mod signal_set;
 
 pub use lifeline::{Cancelled, Lifeline, WaiterId, MAX_WAITERS};
+pub use one_signal::{
+    AcquireError as OneSignalError,
+    OneSignal,
+    Receiver as OneSignalReceiver,
+    Sender as OneSignalSender,
+};
 pub use park::Park;
 pub use signal::{BitView, BoolView, OwnedBool, Signal, SignalSource, DEFAULT_SPIN_ITERS};
 pub use signal_set::{SignalId, SignalSet, MAX_GATES};
