@@ -341,6 +341,24 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
         h.wrapping_sub(t)
     }
 
+    /// Total messages this producer has published but the consumer has
+    /// not drained yet, summed across all `N` shards. Snapshot value;
+    /// can race with concurrent `try_recv`.
+    ///
+    /// Use case: backpressure decisions — e.g. pause upstream reads when
+    /// `pending() > threshold`.
+    #[inline]
+    pub fn pending(&self) -> usize {
+        let mut total = 0;
+        for s in 0..self.inner.n {
+            let ring = &self.inner.shards[s].rings[self.my_idx];
+            let h = ring.head.load(Ordering::Acquire);
+            let t = ring.tail.load(Ordering::Relaxed);
+            total += h.wrapping_sub(t);
+        }
+        total
+    }
+
     /// Non-blocking send.
     #[inline]
     pub fn try_send(&self, value: T) -> Result<(), T> {
@@ -682,6 +700,115 @@ mod tests {
         let (_ps, mut cs, _sd) = Mpmc::<u64>::new(1, 1);
         let c = cs.remove(0);
         let _ = c.recv_batch(|_| {});
+    }
+
+    #[test]
+    fn capacity_invariants_hold_through_send_and_drain() {
+        // M=3 producers, N=4 shards, RING_CAP=4 → each producer sees 16 slots,
+        // each consumer sees 12 slots (3 producers × 4 cap), total 48 slots.
+        const M: usize = 3;
+        const N: usize = 4;
+        const CAP: usize = 4;
+        let (ps, cs, _sd) = Mpmc::<u64, CAP>::new(M, N);
+
+        // ── Static invariants on a fresh Mpmc ─────────────────────────────
+        for p in &ps {
+            assert_eq!(p.capacity_per_shard(), CAP);
+            assert_eq!(p.total_capacity(), N * CAP);
+            assert_eq!(p.available(), N * CAP);
+            assert_eq!(p.pending(), 0);
+            assert!(p.has_idle_shard());
+            for s in 0..N {
+                assert_eq!(p.available_in_shard(s), CAP);
+                assert_eq!(p.pending_in_shard(s), 0);
+            }
+        }
+        for c in &cs {
+            assert_eq!(c.capacity_per_producer(), CAP);
+            assert_eq!(c.total_capacity(), M * CAP);
+            assert_eq!(c.available(), M * CAP);
+            assert_eq!(c.pending(), 0);
+            assert!(!c.has_pending());
+        }
+
+        // ── Send 5 from p0, 3 from p1, 0 from p2 ──────────────────────────
+        for v in 0..5u64 { ps[0].try_send(v).unwrap(); }
+        for v in 100..103u64 { ps[1].try_send(v).unwrap(); }
+
+        // Producer p0: pending == sum of per-shard pending == 5
+        let p0_per_shard: usize = (0..N).map(|s| ps[0].pending_in_shard(s)).sum();
+        assert_eq!(ps[0].pending(), 5);
+        assert_eq!(ps[0].pending(), p0_per_shard);
+        assert_eq!(ps[0].available(), N * CAP - 5);
+        assert_eq!(ps[0].pending() + ps[0].available(), ps[0].total_capacity());
+
+        // Producer p1: same invariants for 3 sends.
+        assert_eq!(ps[1].pending(), 3);
+        assert_eq!(ps[1].available(), N * CAP - 3);
+        assert_eq!(ps[1].pending() + ps[1].available(), ps[1].total_capacity());
+
+        // Producer p2: untouched.
+        assert_eq!(ps[2].pending(), 0);
+        assert_eq!(ps[2].available(), N * CAP);
+
+        // Consumer side: total pending across all consumers == total sent.
+        let total_pending_cs: usize = cs.iter().map(|c| c.pending()).sum();
+        assert_eq!(total_pending_cs, 5 + 3);
+
+        // Per consumer: pending() == sum of pending_from(p) for p in 0..M.
+        for c in &cs {
+            let per_p_sum: usize = (0..M).map(|p| c.pending_from(p)).sum();
+            assert_eq!(c.pending(), per_p_sum);
+            assert_eq!(
+                c.pending() + c.available(),
+                c.total_capacity(),
+                "consumer pending+available must equal total_capacity"
+            );
+            assert_eq!(c.has_pending(), c.pending() > 0);
+        }
+
+        // ── Drain consumer 0 and verify the deltas reconcile ──────────────
+        let drained_at_c0 = cs[0].try_recv_batch(|_| {});
+        let pending_at_c0_before_drain = 5 + 3 - cs.iter().skip(1).map(|c| c.pending()).sum::<usize>();
+        assert_eq!(drained_at_c0, pending_at_c0_before_drain);
+
+        // After draining c0: c0.pending == 0, the other consumers unchanged.
+        assert_eq!(cs[0].pending(), 0);
+        assert!(!cs[0].has_pending());
+
+        // Total still drained-then-pending balance.
+        let pending_remaining: usize = cs.iter().map(|c| c.pending()).sum();
+        assert_eq!(drained_at_c0 + pending_remaining, 5 + 3);
+
+        // Producer p0 sees fewer pending now (consumed by c0).
+        assert!(ps[0].pending() <= 5);
+        assert_eq!(ps[0].pending() + ps[0].available(), ps[0].total_capacity());
+    }
+
+    #[test]
+    fn producer_pending_aggregates_across_shards() {
+        // M=2 producers, N=4 shards, RING_CAP=4 → each producer has 4×4=16 slots.
+        let (mut ps, cs, _sd) = Mpmc::<u64, 4>::new(2, 4);
+        let p0 = ps.remove(0);
+
+        // No consumer drains: every send accumulates in pending.
+        assert_eq!(p0.pending(), 0);
+        assert_eq!(p0.available(), 16);
+        assert_eq!(p0.total_capacity(), 16);
+
+        for v in 0..7u64 {
+            p0.try_send(v).unwrap();
+        }
+        assert_eq!(p0.pending(), 7);
+        assert_eq!(p0.available(), 9);
+        assert_eq!(p0.pending() + p0.available(), p0.total_capacity());
+
+        // Drain through one consumer; pending should drop accordingly.
+        // Consumer 0 only sees its own shard, so it can drain at most
+        // pending_in_shard(0) items from p0.
+        let drained = cs[0].try_recv_batch(|_| {});
+        assert!(drained <= 7);
+        assert_eq!(p0.pending() + drained, 7);
     }
 
     #[test]

@@ -299,6 +299,7 @@ for observability, never as a correctness gate — the actual
 | `available_in_shard(s)`        | free slots in shard `s` for this producer     |
 | `available()`                  | sum of `available_in_shard(s)` over `0..N`    |
 | `pending_in_shard(s)`          | `head − tail` for this producer in shard `s`  |
+| `pending()`                    | sum of `pending_in_shard(s)` over `0..N`      |
 | `has_idle_shard()`             | `bool` — cheap fast path                      |
 
 | Consumer side                  | Returns                                       |
@@ -317,6 +318,30 @@ Each non-`const` method is a small fixed number of atomic loads (one
 state and never compete with `try_send` / `recv` for cache lines, so
 the hot path is byte-identical with or without these calls in the
 program.
+
+### Backpressure patterns
+
+Common idioms enabled by the snapshot APIs:
+
+```rust
+// Producer-side: stop pulling from upstream when downstream is saturated.
+if producer.available() < BATCH_SIZE {
+    upstream.pause();
+}
+
+// Consumer-side: yield to the runtime once the local shard is drained.
+if consumer.pending() == 0 {
+    tokio::task::yield_now().await;
+}
+
+// Admission control: reject new work above an 80% utilisation threshold.
+let util_pct = consumer.pending() * 100 / consumer.total_capacity();
+if util_pct > 80 { reject_new_connections(); }
+```
+
+Invariant the test suite enforces (`capacity_invariants_hold_through_send_and_drain`):
+`pending() + available() == total_capacity()` on both sides at every
+quiescent point.
 
 ## Drop safety
 
