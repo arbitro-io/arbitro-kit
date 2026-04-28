@@ -131,6 +131,122 @@ Reproduce with:
 cargo bench --bench mpmc_overhead
 ```
 
+## Cost model — analytical formula
+
+> **Caption (v1, to refine).** First-pass closed-form model that predicts
+> per-message send cost as a function of `(M, N, C, ρ, K)`. Validated
+> within ±5% against bench numbers for the unbatched and `K=64`
+> batched regimes on x86_64 / WSL. Future revisions should add: a
+> tail-latency term (CPU pre-emption, p99 jitter when `M > N_cores`),
+> a consumer-side recv cost term (currently lumped into `c_wake`),
+> and an NUMA cross-socket term for cross-die routing. Treat the
+> formulas below as the **steady-state mean** model.
+
+### Variables
+
+| Symbol | Meaning | Typical |
+|---|---|---|
+| `M` | producers | 1–255 |
+| `N` | shards (= consumers) | 1–64 |
+| `C` | `RING_CAP` per ring | 64 |
+| `K` | batch size in `try_send_batch` | 1–`C` |
+| `ρ` | load = `rate_in / rate_out` | [0, ∞) |
+| `q` | P(a given shard is full from a producer's view) | f(ρ) |
+| `p_park` | fraction of time the consumer is parked | f(ρ) |
+
+### Hardware constants (measured, x86_64 / WSL)
+
+| Constant | Value |
+|---|---|
+| `c_load` (Acquire L1 load) | ~0.3 ns |
+| `c_store` (Release store) | ~0.5 ns |
+| `c_seqcst` (SeqCst barrier) | ~20 ns |
+| `c_syscall` (park/unpark) | ~7 000 ns |
+| `c_slot` (write one ring cell) | ~0.6 ns |
+
+### Per-message send cost
+
+Number of probes until a non-full shard is found is geometric (truncated):
+
+```
+                1 - (1 + N(1-q)) · q^N
+E[k | found] = ─────────────────────────
+                  (1-q) · (1 - q^N)
+
+P(block)     =  q^N
+```
+
+Send cost decomposition:
+
+```
+T_send  =  c_hit  +  (E[k] - 1) · c_probe  +  P(block) · c_retry
+
+c_hit   =  2·c_load + 2·c_store + c_wake
+c_probe =  2·c_load             # head + tail per extra shard probed
+c_wake  =  c_load + p_park · (c_seqcst + c_syscall)
+```
+
+Limits:
+
+```
+ρ → 0   (no backpressure)   :  T_send ≈ c_hit               ≈  5 ns
+ρ → ∞   (saturated)         :  T_send → c_hit + (N-1)·c_probe + c_retry
+```
+
+### Batched send (`try_send_batch(K)`)
+
+```
+T_batch(K)  =  c_hit  +  K · c_slot  +  c_publish  +  c_wake
+
+T_msg(K)    =  T_batch(K) / K
+            =  c_slot  +  (c_hit + c_publish + c_wake) / K
+```
+
+Asymptote:
+
+```
+lim T_msg(K)  =  c_slot  ≈  0.6 ns           (per-message floor)
+K → ∞
+```
+
+### System throughput
+
+```
+ops/sec(M, K)  =  min(M, N_cores) · 1 / T_msg(K)
+```
+
+When `M > N_cores`, scheduling pre-emption introduces tail jitter
+(visible as p99 inflation in the bench), not captured by the mean
+formula.
+
+### Backpressure point
+
+```
+slots_free   =  N · C · (1 - ρ)
+
+       ┌─ ρ           ,  ρ < 1
+q  =   ┤
+       └─ 1 - 1/(ρN)  ,  ρ ≥ 1
+```
+
+The first probe almost always hits while `ρ < C`; the geometric tail
+only matters once the system enters saturation.
+
+### Validation against bench numbers
+
+| Regime | Formula | Predicted | Measured |
+|---|---|---|---|
+| 8P/8C, K=1, ρ→0 | `c_hit ≈ 5 ns` | ~5 ns | 5.27 ns ✅ |
+| 8P/8C, K=64, ρ→0 | `c_slot + c_hit/K ≈ 0.6 + 5/64` | 0.68 ns | 0.66 ns ✅ |
+| 4P/4C, K=64, ρ→0 | same | 0.68 ns | 0.73 ns ✅ |
+| 8P/1C fan-in | `c_hit` | ~5 ns | 2.57 ns p50 ✅ (cursor optimization) |
+
+The cursor optimization makes 8P/1C faster than the closed-form
+predicts because each producer's `cursor` settles on its own shard
+after warmup, collapsing the probe sequence to k=1 even with N=1.
+A refinement of `E[k]` that conditions on cursor warm-up state would
+close that gap.
+
 ## When to use per-item vs batched
 
 | Pattern                                    | API                       |
