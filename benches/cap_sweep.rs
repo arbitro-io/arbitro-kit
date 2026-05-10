@@ -204,12 +204,12 @@ fn sync_mpmc<const CAP: usize>() {
 // Async: Mpsc 4P/1C with varying RING_CAP
 // ═══════════════════════════════════════════════════════════════════════════
 
-async fn async_mpsc<const CAP: usize>() {
+async fn async_mpsc_spin<const CAP: usize>() {
     use arbitro_kit::route::MpscAsync;
 
     let batch = batch();
     let per_prod = batch / M;
-    let label = format!("mpsc async 4P/1C  cap={CAP}");
+    let label = format!("mpsc async-spin   4P/1C  cap={CAP}");
 
     let mut samples = Vec::with_capacity(rounds());
     let total_rounds = warmup() + rounds();
@@ -249,6 +249,100 @@ async fn async_mpsc<const CAP: usize>() {
             samples.push(t0.elapsed().as_nanos() as u64);
         }
         shutdown.signal();
+    }
+    row(&label, &mut samples);
+}
+
+async fn async_mpsc_wake<const CAP: usize>() {
+    use arbitro_kit::route::MpscAsync;
+
+    let batch = batch();
+    let per_prod = batch / M;
+    let label = format!("mpsc async-wake   4P/1C  cap={CAP}");
+
+    let mut samples = Vec::with_capacity(rounds());
+    let total_rounds = warmup() + rounds();
+
+    for round in 0..total_rounds {
+        let (producers, consumer, shutdown) = MpscAsync::<u64, CAP>::new(M);
+
+        let t0 = Instant::now();
+
+        let prod_handles: Vec<_> = producers.into_iter().map(|p| {
+            tokio::spawn(async move {
+                for k in 0..per_prod as u64 {
+                    p.send_async_send(k).await;
+                }
+            })
+        }).collect();
+
+        let mut count = 0;
+        while count < batch {
+            match consumer.recv_async_send().await {
+                Ok(_) => count += 1,
+                Err(_) => break,
+            }
+        }
+        for h in prod_handles { h.await.unwrap(); }
+
+        if round >= warmup() {
+            samples.push(t0.elapsed().as_nanos() as u64);
+        }
+        shutdown.signal();
+    }
+    row(&label, &mut samples);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Async: Mpsc 4P/1C with join! (same-task, no spawn overhead)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn async_mpsc_join<const CAP: usize>() {
+    use arbitro_kit::route::MpscAsync;
+
+    let batch = batch();
+    let per_prod = batch / M;
+    let label = format!("mpsc async-join   4P/1C  cap={CAP}");
+
+    let mut samples = Vec::with_capacity(rounds());
+    let total_rounds = warmup() + rounds();
+
+    for round in 0..total_rounds {
+        let (mut producers, consumer, shutdown) = MpscAsync::<u64, CAP>::new(M);
+        let p0 = producers.remove(0);
+        let p1 = producers.remove(0);
+        let p2 = producers.remove(0);
+        let p3 = producers.remove(0);
+
+        let recv_count = Arc::new(AtomicUsize::new(0));
+        let rc = recv_count.clone();
+
+        let t0 = Instant::now();
+        tokio::join!(
+            async { for k in 0..per_prod as u64 { p0.send_async(k).await; } },
+            async { for k in 0..per_prod as u64 { p1.send_async(k).await; } },
+            async { for k in 0..per_prod as u64 { p2.send_async(k).await; } },
+            async { for k in 0..per_prod as u64 { p3.send_async(k).await; } },
+            async {
+                loop {
+                    if rc.load(Ordering::Relaxed) >= batch { break; }
+                    match consumer.recv_async_send().await {
+                        Ok(_) => { rc.fetch_add(1, Ordering::Relaxed); }
+                        Err(_) => break,
+                    }
+                }
+            },
+            async {
+                while recv_count.load(Ordering::Relaxed) < batch {
+                    tokio::task::yield_now().await;
+                }
+                shutdown.signal();
+            }
+        );
+
+        if round >= warmup() {
+            samples.push(t0.elapsed().as_nanos() as u64);
+        }
     }
     row(&label, &mut samples);
 }
@@ -311,6 +405,49 @@ async fn async_mpmc<const CAP: usize>() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Async: tokio::sync::mpsc baseline (spawn pattern, same as server)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn async_tokio_mpsc(cap: usize) {
+    let batch = batch();
+    let per_prod = batch / M;
+    let label = format!("tokio::mpsc spawn  4P/1C  cap={cap}");
+
+    let mut samples = Vec::with_capacity(rounds());
+    let total_rounds = warmup() + rounds();
+
+    for round in 0..total_rounds {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(cap);
+
+        let t0 = Instant::now();
+
+        let prod_handles: Vec<_> = (0..M).map(|_| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                for k in 0..per_prod as u64 {
+                    tx.send(k).await.unwrap();
+                }
+            })
+        }).collect();
+        drop(tx); // drop original sender
+
+        let mut count = 0;
+        while count < batch {
+            match rx.recv().await {
+                Some(_) => count += 1,
+                None => break,
+            }
+        }
+        for h in prod_handles { h.await.unwrap(); }
+
+        if round >= warmup() {
+            samples.push(t0.elapsed().as_nanos() as u64);
+        }
+    }
+    row(&label, &mut samples);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Driver
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -337,17 +474,35 @@ fn main() {
         .unwrap();
 
     rt.block_on(async {
-        header("C. Mpsc async 4P/1C — RING_CAP sweep");
-        async_mpsc::<1>().await;
-        async_mpsc::<8>().await;
-        async_mpsc::<32>().await;
-        async_mpsc::<64>().await;
+        header("C. Mpsc async-spin 4P/1C — try_send+yield [spawn]");
+        async_mpsc_spin::<1>().await;
+        async_mpsc_spin::<8>().await;
+        async_mpsc_spin::<32>().await;
+        async_mpsc_spin::<64>().await;
 
-        header("D. Mpmc async 4P/1C — RING_CAP sweep");
+        header("D. Mpsc async-wake 4P/1C — send_async_send [spawn]");
+        async_mpsc_wake::<1>().await;
+        async_mpsc_wake::<8>().await;
+        async_mpsc_wake::<32>().await;
+        async_mpsc_wake::<64>().await;
+
+        header("E. Mpsc async-join 4P/1C — send_async [join!]");
+        async_mpsc_join::<1>().await;
+        async_mpsc_join::<8>().await;
+        async_mpsc_join::<32>().await;
+        async_mpsc_join::<64>().await;
+
+        header("F. Mpmc async 4P/1C — send_async [join!]");
         async_mpmc::<1>().await;
         async_mpmc::<8>().await;
         async_mpmc::<32>().await;
         async_mpmc::<64>().await;
+
+        header("G. tokio::sync::mpsc 4P/1C — baseline [spawn]");
+        async_tokio_mpsc(1).await;
+        async_tokio_mpsc(8).await;
+        async_tokio_mpsc(32).await;
+        async_tokio_mpsc(64).await;
     });
 
     println!("\nDone.");

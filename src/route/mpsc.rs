@@ -501,6 +501,87 @@ impl<T: Send + 'static, const RING_CAP: usize, W: crate::waiter::AsyncWaiter + '
     }
 }
 
+// ─── Spawn-safe async (NotifyWaiter specialization, zero-box) ────────────
+
+#[cfg(feature = "tokio")]
+impl<T: Send, const RING_CAP: usize> MpscProducer<T, RING_CAP, crate::waiter::NotifyWaiter> {
+    /// Spawn-safe async send — zero heap allocation.
+    ///
+    /// Specialized for [`NotifyWaiter`]: uses `Notify::notified()` directly
+    /// instead of the trait's RPITIT `wait_until`, producing a concrete
+    /// `Send` future without boxing. ~10× faster than the generic boxed
+    /// [`send_async`](MpscProducer::send_async) under backpressure.
+    #[inline]
+    pub fn send_async_send<'a>(
+        &'a self, value: T,
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        let inner = &*self.inner;
+        let my_idx = self.my_idx;
+        async move {
+            let value = value;
+            loop {
+                // Build notified() BEFORE checking — lost-notify prevention.
+                let notified = inner.producer_waiters[my_idx].inner.notified();
+                let ring = &inner.rings[my_idx];
+                let h = ring.head.load(Ordering::Relaxed);
+                let t = ring.tail.load(Ordering::Acquire);
+                if !PRing::<T, RING_CAP>::is_full(h, t) {
+                    // SAFETY: SPSC — this producer is the only writer.
+                    unsafe {
+                        (*ring.slots[h & PRing::<T, RING_CAP>::MASK].get()).write(value);
+                    }
+                    ring.head.store(h.wrapping_add(1), Ordering::Release);
+                    inner.consumer_waiter.wake();
+                    return;
+                }
+                if inner.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP, crate::waiter::NotifyWaiter> {
+    /// Spawn-safe async receive — zero heap allocation.
+    ///
+    /// Specialized for [`NotifyWaiter`]: uses `Notify::notified()` directly,
+    /// producing a concrete `Send` future without boxing.
+    #[inline]
+    pub fn recv_async_send<'a>(
+        &'a self,
+    ) -> impl std::future::Future<Output = Result<T, Shutdown>> + Send + 'a {
+        let inner = &*self.inner;
+        async move {
+            loop {
+                // Build notified() BEFORE checking — lost-notify prevention.
+                let notified = inner.consumer_waiter.inner.notified();
+                // Scan all rings.
+                for p in 0..inner.m {
+                    let ring = &inner.rings[p];
+                    let t = ring.tail.load(Ordering::Relaxed);
+                    let h = ring.head.load(Ordering::Acquire);
+                    if t != h {
+                        let v = unsafe {
+                            (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
+                                .assume_init_read()
+                        };
+                        ring.tail.store(t.wrapping_add(1), Ordering::Release);
+                        inner.producer_waiters[p].wake();
+                        return Ok(v);
+                    }
+                }
+                if inner.shutdown.load(Ordering::Acquire) {
+                    return Err(Shutdown);
+                }
+                notified.await;
+            }
+        }
+    }
+}
+
 impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpscConsumer<T, RING_CAP, W> {
     /// Blocking receive. Drains one item, parking when every ring is
     /// empty. Returns `Err(Shutdown)` after shutdown is signalled and all
