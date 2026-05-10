@@ -314,6 +314,57 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpscProducer<T, RING_CAP
     }
 }
 
+// ── Async send (AsyncWaiter only) ────────────────────────────────────────
+
+#[cfg(feature = "tokio")]
+impl<T: Send + 'static, const RING_CAP: usize, W: crate::waiter::AsyncWaiter + 'static>
+    MpscProducer<T, RING_CAP, W>
+{
+    /// Async send with backpressure. Awaits until the ring has room, then
+    /// enqueues. Returns silently on shutdown without delivering.
+    ///
+    /// This is the async sibling of [`send`](MpscProducer::send). The
+    /// returned future borrows only `Sync` subfields (`Arc<MpscInner>`)
+    /// across the await point — `MpscProducer` itself is `!Sync`, so we
+    /// inline the try-send logic using direct field access rather than
+    /// calling `&self.try_send()` which would capture the non-Send `&self`.
+    pub fn send_async<'a>(
+        &'a self, value: T,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        let inner = &*self.inner;
+        let my_idx = self.my_idx;
+        Box::pin(async move {
+            loop {
+                // Inline try_send: only touch Sync fields through `inner`.
+                let ring = &inner.rings[my_idx];
+                let h = ring.head.load(Ordering::Relaxed);
+                let t = ring.tail.load(Ordering::Acquire);
+                if !PRing::<T, RING_CAP>::is_full(h, t) {
+                    // SAFETY: SPSC — this producer is the only writer.
+                    unsafe {
+                        (*ring.slots[h & PRing::<T, RING_CAP>::MASK].get()).write(value);
+                    }
+                    ring.head.store(h.wrapping_add(1), Ordering::Release);
+                    inner.consumer_waiter.wake();
+                    return;
+                }
+                if inner.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> =
+                    Box::pin(inner.producer_waiters[my_idx].wait_until(move || {
+                        let ring = &inner.rings[my_idx];
+                        let h = ring.head.load(Ordering::Relaxed);
+                        let t = ring.tail.load(Ordering::Acquire);
+                        !PRing::<T, RING_CAP>::is_full(h, t)
+                            || inner.shutdown.load(Ordering::Acquire)
+                    }));
+                fut.await;
+            }
+        })
+    }
+}
+
 // ─── Consumer handle ──────────────────────────────────────────────────────
 
 pub struct MpscConsumer<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter> {
@@ -408,6 +459,45 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpscConsumer<T, RING_CAP, W> {
             }
             if !progress { return count; }
         }
+    }
+}
+
+// ─── Async receive (AsyncWaiter only) ────────────────────────────────────
+
+#[cfg(feature = "tokio")]
+impl<T: Send + 'static, const RING_CAP: usize, W: crate::waiter::AsyncWaiter + 'static>
+    MpscConsumer<T, RING_CAP, W>
+{
+    /// Async receive. Yields one item, awaiting a `Notify` wake when every
+    /// ring is empty. Returns `Err(Shutdown)` after shutdown is signalled
+    /// and all rings are drained.
+    ///
+    /// Returns a boxed future bound to `&self` to sidestep the RPITIT
+    /// lifetime inference limitation (rust-lang/rust#100013) — same fix
+    /// pattern as `OneShotAsync::recv_async` and `PipeAsync::recv_async`.
+    pub fn recv_async<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Shutdown>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            loop {
+                if let Some(v) = self.try_recv() {
+                    return Ok(v);
+                }
+                if self.inner.shutdown.load(Ordering::Acquire) {
+                    return Err(Shutdown);
+                }
+                // Box the wait_until future to detach its `'a` borrow
+                // before the outer async block's auto-trait inference
+                // runs.
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> =
+                    Box::pin(self.inner.consumer_waiter.wait_until(|| {
+                        self.inner.any_ring_has_work()
+                            || self.inner.shutdown.load(Ordering::Acquire)
+                    }));
+                fut.await;
+            }
+        })
     }
 }
 
@@ -665,5 +755,54 @@ mod tests {
         }
         assert_eq!(sum, expected);
         assert_eq!(got, total);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn send_async_basic_roundtrip() {
+        use crate::waiter::NotifyWaiter;
+        let (mut ps, mut c, sd) =
+            Mpsc::<u64, 4, NotifyWaiter>::new(2);
+        let p0 = ps.remove(0);
+        let p1 = ps.remove(0);
+
+        let producer = async move {
+            for k in 0..100u64 { p0.send_async(k).await; }
+            for k in 100..200u64 { p1.send_async(k).await; }
+        };
+        let consumer = async move {
+            let mut sum = 0u64;
+            for _ in 0..200 {
+                sum += c.recv_async().await.unwrap();
+            }
+            sum
+        };
+        let (_, got) = tokio::join!(producer, consumer);
+        assert_eq!(got, (0..200u64).sum());
+        sd.signal();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn send_async_backpressure() {
+        use crate::waiter::NotifyWaiter;
+        // RING_CAP = 2: forces backpressure quickly.
+        let (mut ps, mut c, sd) =
+            Mpsc::<u64, 2, NotifyWaiter>::new(1);
+        let p = ps.remove(0);
+
+        let producer = async move {
+            for k in 0..50u64 { p.send_async(k).await; }
+        };
+        let consumer = async move {
+            let mut got = Vec::new();
+            for _ in 0..50 {
+                got.push(c.recv_async().await.unwrap());
+            }
+            got
+        };
+        let (_, got) = tokio::join!(producer, consumer);
+        assert_eq!(got, (0..50u64).collect::<Vec<_>>());
+        sd.signal();
     }
 }

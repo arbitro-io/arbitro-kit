@@ -70,3 +70,22 @@ pub type HubAsync<In, Out> = Hub<In, Out, NotifyWaiter>;
 /// Async sibling of [`Mpmc<T, CAP>`]: `Mpmc<T, CAP, NotifyWaiter>`.
 #[cfg(feature = "tokio")]
 pub type MpmcAsync<T, const CAP: usize = 64> = Mpmc<T, CAP, NotifyWaiter>;
+
+/// Async sibling of [`Mpsc<T, RING_CAP>`]: `Mpsc<T, RING_CAP, NotifyWaiter>`.
+#[cfg(feature = "tokio")]
+pub type MpscAsync<T, const RING_CAP: usize = 64> = Mpsc<T, RING_CAP, NotifyWaiter>;
+
+/// Async sibling of [`MpscProducer<T, RING_CAP>`].
+#[cfg(feature = "tokio")]
+pub type MpscAsyncProducer<T, const RING_CAP: usize = 64> =
+    MpscProducer<T, RING_CAP, NotifyWaiter>;
+
+/// Async sibling of [`MpscConsumer<T, RING_CAP>`].
+#[cfg(feature = "tokio")]
+pub type MpscAsyncConsumer<T, const RING_CAP: usize = 64> =
+    MpscConsumer<T, RING_CAP, NotifyWaiter>;
+
+/// Async sibling of [`MpscShutdown<T, RING_CAP>`].
+#[cfg(feature = "tokio")]
+pub type MpscAsyncShutdown<T, const RING_CAP: usize = 64> =
+    MpscShutdown<T, RING_CAP, NotifyWaiter>;
