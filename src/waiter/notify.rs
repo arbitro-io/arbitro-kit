@@ -44,7 +44,7 @@ use super::{AsyncWaiter, Waiter};
 /// `Default` produces a fresh `Notify`. No registration step.
 #[derive(Default)]
 pub struct NotifyWaiter {
-    inner: Notify,
+    pub(crate) inner: Notify,
 }
 
 impl Waiter for NotifyWaiter {

@@ -427,6 +427,36 @@ impl<T: Send, const CAP: usize, W: AsyncWaiter> Ring<T, CAP, W> {
     }
 }
 
+// ── Spawn-safe async API (NotifyWaiter specialization) ────────────────
+//
+// The RPITIT future from `AsyncWaiter::wait_until` can't be proven `Send`
+// in generic contexts (rust-lang/rust#100013). For the specific case of
+// `tokio::spawn`'d tasks, we specialize on `NotifyWaiter` and use
+// `Notify::notified()` directly — a concrete `Send` future — avoiding
+// the trait abstraction entirely.
+
+#[cfg(feature = "tokio")]
+impl<T: Send, const CAP: usize> Ring<T, CAP, crate::waiter::NotifyWaiter> {
+    /// Boxed async dequeue — returns `Pin<Box<dyn Future + Send>>`.
+    ///
+    /// Use this variant inside `tokio::spawn`'d tasks where the RPITIT
+    /// future from [`recv_async`](Self::recv_async) can't satisfy the
+    /// `Send` bound. The single heap allocation per call is negligible
+    /// relative to the Notify wake cycle (~300 ns).
+    #[inline]
+    pub fn recv_async_send(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                if let Some(v) = self.try_recv() { return v; }
+                // Bypass trait RPITIT: use concrete Notify::notified() directly.
+                let notified = self.not_empty.inner.notified();
+                if !self.is_empty() { continue; }
+                notified.await;
+            }
+        })
+    }
+}
+
 impl<T, const CAP: usize, W: Waiter> Drop for Ring<T, CAP, W> {
     fn drop(&mut self) {
         // `&mut self` means no other references — safe to drop in-flight.
