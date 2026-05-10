@@ -79,10 +79,6 @@ harness = false
 required-features = ["tokio"]
 
 [[bench]]
-name = "tcp_ping_pong"
-harness = false
-
-[[bench]]
 name = "oneshot_h2h"
 harness = false
 
