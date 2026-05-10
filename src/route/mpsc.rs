@@ -283,6 +283,109 @@ impl<T: Send + 'static, const RING_CAP: usize, W: Waiter + 'static>
         let shutdown = MpscShutdown { inner };
         (sender, consumer, shutdown)
     }
+
+    /// Build an `Mpsc` returning a **`Send + Sync` factory** instead of an
+    /// initial producer.
+    ///
+    /// The factory ([`MpscSender`]) wraps only `Arc<MpscInner>` (which is
+    /// `Sync` since it contains atomics and slot cells protected by the
+    /// SPSC ring contract). It can be cloned cheaply and shared across
+    /// threads / tokio tasks. Each call to
+    /// [`MpscSender::create_producer`](MpscSender::create_producer) atomically
+    /// claims a fresh ring index and returns an owned, `!Sync` producer for
+    /// that thread's exclusive use.
+    ///
+    /// Use this when you need to mint per-thread producers dynamically
+    /// from a shared handle (e.g. one producer per tokio worker thread,
+    /// chosen lazily on first send). Avoids the `Mutex<MpscProducer>`
+    /// workaround entirely.
+    ///
+    /// # Panics
+    /// - `max_producers == 0`
+    /// - `max_producers > MAX_MPSC_PRODUCERS`
+    /// - `RING_CAP` not a power of two ≥ 1
+    pub fn new_sender(
+        max_producers: usize,
+    ) -> (
+        MpscSender<T, RING_CAP, W>,
+        MpscConsumer<T, RING_CAP, W>,
+        MpscShutdown<T, RING_CAP, W>,
+    ) {
+        assert!(max_producers > 0, "Mpsc::new_sender: max_producers must be > 0");
+        assert!(
+            max_producers <= MAX_MPSC_PRODUCERS,
+            "Mpsc::new_sender: max_producers must be <= {MAX_MPSC_PRODUCERS}"
+        );
+        // start_idx = 0 — every producer is created on demand via the factory.
+        let inner = Arc::new(MpscInner::<T, RING_CAP, W>::new(max_producers, 0));
+        let sender = MpscSender { inner: inner.clone() };
+        let consumer = MpscConsumer {
+            inner: inner.clone(),
+            _not_sync: PhantomData,
+        };
+        let shutdown = MpscShutdown { inner };
+        (sender, consumer, shutdown)
+    }
+}
+
+// ─── Sync factory ─────────────────────────────────────────────────────────
+
+/// `Send + Sync` factory for minting per-thread [`MpscProducer`] clones.
+///
+/// `MpscProducer` itself is `!Sync` by design — each clone owns a unique
+/// SPSC ring that only one thread may write to. `MpscSender` wraps the
+/// inner `Arc<MpscInner>` (which IS `Sync`) so the handle can be shared
+/// freely across threads. From any thread, call
+/// [`create_producer`](Self::create_producer) to get an owned producer
+/// bound to that thread's exclusive use.
+///
+/// ## Cost
+///
+/// - `Clone`: one `Arc` clone (~1 ns).
+/// - `create_producer`: one `AcqRel` `fetch_add` on `next_free_idx`
+///   (~5–8 ns). Returns `None` when the pool is exhausted (no panic).
+///
+/// The send/recv hot path on the resulting producer is **bytecode-
+/// identical** to producers minted via [`Mpsc::new`] or [`Mpsc::new_cloneable`].
+pub struct MpscSender<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter> {
+    inner: Arc<MpscInner<T, RING_CAP, W>>,
+}
+
+impl<T: Send, const RING_CAP: usize, W: Waiter> Clone for MpscSender<T, RING_CAP, W> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone() }
+    }
+}
+
+impl<T: Send, const RING_CAP: usize, W: Waiter> MpscSender<T, RING_CAP, W> {
+    /// Maximum number of producers this sender can mint over its lifetime.
+    #[inline]
+    pub fn capacity(&self) -> usize { self.inner.m }
+
+    /// Atomically claim a fresh ring index and return an owned producer.
+    /// Returns `None` if the pool is exhausted (`capacity()` producers
+    /// already created since the channel was built).
+    #[inline]
+    pub fn create_producer(&self) -> Option<MpscProducer<T, RING_CAP, W>> {
+        let idx = self.inner.next_free_idx.fetch_add(1, Ordering::AcqRel);
+        if idx >= self.inner.m {
+            // Restore the counter to prevent unbounded growth across
+            // repeated exhausted calls (cosmetic; correctness doesn't
+            // require it since further calls all see idx >= m).
+            return None;
+        }
+        Some(MpscProducer {
+            inner: self.inner.clone(),
+            my_idx: idx,
+            _not_sync: PhantomData,
+        })
+    }
+
+    /// Returns `true` if at least one more producer can be created.
+    #[inline]
+    pub fn has_capacity(&self) -> bool {
+        self.inner.next_free_idx.load(Ordering::Acquire) < self.inner.m
+    }
 }
 
 // ─── Producer handle ──────────────────────────────────────────────────────
@@ -1045,6 +1148,117 @@ mod tests {
         let (s0, _c, _sd) = Mpsc::<u64, 4>::new_cloneable(2);
         let _s1 = s0.clone();   // ok — idx 1
         let _s2 = s0.clone();   // panic — pool of 2 already handed out
+    }
+
+    // ── MpscSender (Send + Sync factory) ──────────────────────────────────
+
+    #[test]
+    fn sender_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MpscSender<u64>>();
+    }
+
+    #[test]
+    fn sender_create_producer_basic() {
+        let (sender, c, _sd) = Mpsc::<u64>::new_sender(4);
+        assert_eq!(sender.capacity(), 4);
+        assert!(sender.has_capacity());
+
+        let p0 = sender.create_producer().unwrap();
+        let p1 = sender.create_producer().unwrap();
+        assert_eq!(p0.index(), 0);
+        assert_eq!(p1.index(), 1);
+
+        let h = thread::spawn(move || {
+            c.bind();
+            c.recv().unwrap()
+        });
+        thread::sleep(Duration::from_millis(10));
+        p0.bind();
+        p0.send(42);
+        assert_eq!(h.join().unwrap(), 42);
+    }
+
+    #[test]
+    fn sender_create_producer_from_multiple_threads() {
+        // The whole point of MpscSender: clone+share to other threads,
+        // each one mints its own producer with NO Mutex.
+        let (sender, _c, _sd) = Mpsc::<u64>::new_sender(8);
+        let sender = Arc::new(sender);
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = sender.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    b.wait();
+                    s.create_producer().unwrap().index()
+                })
+            })
+            .collect();
+        let mut indices: Vec<usize> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        indices.sort();
+        assert_eq!(indices, (0..8).collect::<Vec<_>>(),
+            "every thread must mint a unique producer index");
+    }
+
+    #[test]
+    fn sender_pool_exhaustion_returns_none() {
+        let (sender, _c, _sd) = Mpsc::<u64>::new_sender(2);
+        assert!(sender.create_producer().is_some());
+        assert!(sender.create_producer().is_some());
+        // Pool exhausted — returns None, no panic.
+        assert!(sender.create_producer().is_none());
+        assert!(!sender.has_capacity());
+    }
+
+    #[test]
+    fn sender_multiple_producers_deliver_all() {
+        const N: usize = 4;
+        const PER: u64 = 200;
+        let (sender, c, sd) = Mpsc::<u64>::new_sender(N);
+        let sd2 = sd.clone();
+
+        let got_count = Arc::new(AtomicUsize::new(0));
+        let got_sum = Arc::new(AtomicUsize::new(0));
+        let consumer_h = {
+            let got_sum = got_sum.clone();
+            let got_count = got_count.clone();
+            thread::spawn(move || {
+                c.bind();
+                loop {
+                    match c.recv_batch(|v| {
+                        got_sum.fetch_add(v as usize, Ordering::Relaxed);
+                        got_count.fetch_add(1, Ordering::Relaxed);
+                    }) {
+                        Ok(_) => continue,
+                        Err(Shutdown) => break,
+                    }
+                }
+            })
+        };
+
+        let sender = Arc::new(sender);
+        let producers: Vec<_> = (0..N).map(|i| {
+            let s = sender.clone();
+            thread::spawn(move || {
+                let p = s.create_producer().expect("pool not exhausted");
+                p.bind();
+                for k in 0..PER { p.send(i as u64 * 10_000 + k); }
+            })
+        }).collect();
+        for h in producers { h.join().unwrap(); }
+
+        thread::sleep(Duration::from_millis(20));
+        sd2.signal();
+        consumer_h.join().unwrap();
+
+        let expected: u64 = (0..N as u64)
+            .map(|i| (0..PER).map(|k| i * 10_000 + k).sum::<u64>())
+            .sum();
+        assert_eq!(got_count.load(Ordering::Relaxed), (N as u64 * PER) as usize);
+        assert_eq!(got_sum.load(Ordering::Relaxed) as u64, expected);
     }
 
     #[test]
