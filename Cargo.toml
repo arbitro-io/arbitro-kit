@@ -70,6 +70,15 @@ name = "mpsc_overhead"
 harness = false
 
 [[bench]]
+name = "mpsc_clone_overhead"
+harness = false
+
+[[bench]]
+name = "mpsc_clone_async_overhead"
+harness = false
+required-features = ["tokio"]
+
+[[bench]]
 name = "oneshot_h2h"
 harness = false
 

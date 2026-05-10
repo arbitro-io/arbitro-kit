@@ -95,13 +95,22 @@ struct MpscInner<T: Send, const RING_CAP: usize, W: Waiter> {
     producer_waiters: Box<[W]>,
     shutdown: AtomicBool,
     m: usize,
+    /// Next free ring index for `MpscProducer::clone()` to claim. Always
+    /// loaded with `AcqRel` `fetch_add` on clone — never touched on the
+    /// send/recv hot path. In non-cloneable mode (`Mpsc::new`) this starts
+    /// at `m`, so `clone()` always trips the bounds assertion.
+    next_free_idx: AtomicUsize,
 }
 
 unsafe impl<T: Send, const RING_CAP: usize, W: Waiter> Sync for MpscInner<T, RING_CAP, W> {}
 unsafe impl<T: Send, const RING_CAP: usize, W: Waiter> Send for MpscInner<T, RING_CAP, W> {}
 
 impl<T: Send, const RING_CAP: usize, W: Waiter> MpscInner<T, RING_CAP, W> {
-    fn new(m: usize) -> Self {
+    /// `start_idx` is the value `next_free_idx` is initialised to. For the
+    /// non-cloneable [`Mpsc::new`] path it equals `m` (clones blocked); for
+    /// [`Mpsc::new_cloneable`] it is `1` (first sender at idx 0, next clone
+    /// claims idx 1).
+    fn new(m: usize, start_idx: usize) -> Self {
         assert!(
             RING_CAP > 0 && RING_CAP.is_power_of_two(),
             "RING_CAP must be a power of two ≥ 1"
@@ -115,6 +124,7 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpscInner<T, RING_CAP, W> {
             producer_waiters: producer_waiters.into_boxed_slice(),
             shutdown: AtomicBool::new(false),
             m,
+            next_free_idx: AtomicUsize::new(start_idx),
         }
     }
 
@@ -129,6 +139,37 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpscInner<T, RING_CAP, W> {
             if h != t { return true; }
         }
         false
+    }
+
+    /// Drain every ring at least once, looping until a full pass finds zero
+    /// new items. Caller invariant: only the unique consumer must call this
+    /// (enforced at the type level by `MpscConsumer` being `!Sync`).
+    #[inline]
+    fn drain_all<F: FnMut(T)>(&self, f: &mut F) -> usize {
+        let m = self.m;
+        let mut count: usize = 0;
+        loop {
+            let mut progress = false;
+            for p in 0..m {
+                let ring = &self.rings[p];
+                let mut t = ring.tail.load(Ordering::Relaxed);
+                let h = ring.head.load(Ordering::Acquire);
+                if t == h { continue; }
+                while t != h {
+                    let v = unsafe {
+                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
+                            .assume_init_read()
+                    };
+                    t = t.wrapping_add(1);
+                    f(v);
+                    count += 1;
+                    progress = true;
+                }
+                ring.tail.store(t, Ordering::Release);
+                self.producer_waiters[p].wake();
+            }
+            if !progress { return count; }
+        }
     }
 }
 
@@ -163,7 +204,9 @@ impl<T: Send + 'static, const RING_CAP: usize, W: Waiter + 'static>
     /// Build an `Mpsc` with `m` producers and 1 consumer.
     ///
     /// Returns `(producers, consumer, shutdown)`. The consumer is returned
-    /// by value (not `Vec`) — there is exactly one.
+    /// by value (not `Vec`) — there is exactly one. Producers returned from
+    /// this constructor are **not cloneable**; for a cloneable single-handle
+    /// API see [`new_cloneable`](Self::new_cloneable).
     ///
     /// # Panics
     /// - `m == 0`
@@ -181,7 +224,8 @@ impl<T: Send + 'static, const RING_CAP: usize, W: Waiter + 'static>
             m <= MAX_MPSC_PRODUCERS,
             "Mpsc::new: m must be <= {MAX_MPSC_PRODUCERS}"
         );
-        let inner = Arc::new(MpscInner::<T, RING_CAP, W>::new(m));
+        // start_idx = m → all rings handed out → clone() trips the bound.
+        let inner = Arc::new(MpscInner::<T, RING_CAP, W>::new(m, m));
         let producers: Vec<MpscProducer<T, RING_CAP, W>> = (0..m)
             .map(|p| MpscProducer {
                 inner: inner.clone(),
@@ -196,6 +240,49 @@ impl<T: Send + 'static, const RING_CAP: usize, W: Waiter + 'static>
         let shutdown = MpscShutdown { inner };
         (producers, consumer, shutdown)
     }
+
+    /// Build a **cloneable** `Mpsc` with up to `max_producers` ring slots.
+    ///
+    /// Returns a single producer handle (idx 0) plus the consumer and
+    /// shutdown handles. Each [`Clone`] of the producer atomically claims
+    /// a fresh ring slot from the pool until `max_producers` is reached;
+    /// further clones panic. Memory for all `max_producers` rings is
+    /// allocated upfront.
+    ///
+    /// **Hot path is identical** to [`new`](Self::new): `try_send` /
+    /// `try_recv` never touch `next_free_idx`. Only `clone()` does, with a
+    /// single `AcqRel` `fetch_add`.
+    ///
+    /// # Panics
+    /// - `max_producers == 0`
+    /// - `max_producers > MAX_MPSC_PRODUCERS`
+    /// - `RING_CAP` not a power of two ≥ 1
+    pub fn new_cloneable(
+        max_producers: usize,
+    ) -> (
+        MpscProducer<T, RING_CAP, W>,
+        MpscConsumer<T, RING_CAP, W>,
+        MpscShutdown<T, RING_CAP, W>,
+    ) {
+        assert!(max_producers > 0, "Mpsc::new_cloneable: max_producers must be > 0");
+        assert!(
+            max_producers <= MAX_MPSC_PRODUCERS,
+            "Mpsc::new_cloneable: max_producers must be <= {MAX_MPSC_PRODUCERS}"
+        );
+        // start_idx = 1 → first sender is idx 0, next clone claims idx 1.
+        let inner = Arc::new(MpscInner::<T, RING_CAP, W>::new(max_producers, 1));
+        let sender = MpscProducer {
+            inner: inner.clone(),
+            my_idx: 0,
+            _not_sync: PhantomData,
+        };
+        let consumer = MpscConsumer {
+            inner: inner.clone(),
+            _not_sync: PhantomData,
+        };
+        let shutdown = MpscShutdown { inner };
+        (sender, consumer, shutdown)
+    }
 }
 
 // ─── Producer handle ──────────────────────────────────────────────────────
@@ -204,6 +291,33 @@ pub struct MpscProducer<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWai
     inner: Arc<MpscInner<T, RING_CAP, W>>,
     my_idx: usize,
     _not_sync: PhantomData<Cell<()>>,
+}
+
+/// Clone claims a fresh ring slot from the pool. Only valid for producers
+/// minted via [`Mpsc::new_cloneable`]; producers from [`Mpsc::new`] panic on
+/// clone (the pool is already fully handed out).
+///
+/// **Cost**: one `AcqRel` `fetch_add` on `next_free_idx` and an `Arc` clone.
+/// The send/recv hot path is untouched — `next_free_idx` is never read on
+/// `try_send` / `try_recv`.
+///
+/// The new producer owns its own ring (SPSC contract preserved). The new
+/// thread that drives the clone must call [`bind`](MpscProducer::bind) once
+/// before its first blocking `send` (sync waiter only).
+impl<T: Send, const RING_CAP: usize, W: Waiter> Clone for MpscProducer<T, RING_CAP, W> {
+    fn clone(&self) -> Self {
+        let idx = self.inner.next_free_idx.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            idx < self.inner.m,
+            "MpscProducer::clone: pool exhausted (max {}). Use Mpsc::new_cloneable with a larger capacity.",
+            self.inner.m
+        );
+        Self {
+            inner: self.inner.clone(),
+            my_idx: idx,
+            _not_sync: PhantomData,
+        }
+    }
 }
 
 impl<T: Send, const RING_CAP: usize, W: Waiter> MpscProducer<T, RING_CAP, W> {
@@ -435,30 +549,7 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpscConsumer<T, RING_CAP, W> {
     /// `p-1` (already passed) commit more work.
     #[inline]
     fn drain_all<F: FnMut(T)>(&self, f: &mut F) -> usize {
-        let m = self.inner.m;
-        let mut count: usize = 0;
-        loop {
-            let mut progress = false;
-            for p in 0..m {
-                let ring = &self.inner.rings[p];
-                let mut t = ring.tail.load(Ordering::Relaxed);
-                let h = ring.head.load(Ordering::Acquire);
-                if t == h { continue; }
-                while t != h {
-                    let v = unsafe {
-                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                            .assume_init_read()
-                    };
-                    t = t.wrapping_add(1);
-                    f(v);
-                    count += 1;
-                    progress = true;
-                }
-                ring.tail.store(t, Ordering::Release);
-                self.inner.producer_waiters[p].wake();
-            }
-            if !progress { return count; }
-        }
+        self.inner.drain_all(f)
     }
 }
 
@@ -573,6 +664,39 @@ impl<T: Send, const RING_CAP: usize> MpscConsumer<T, RING_CAP, crate::waiter::No
                         return Ok(v);
                     }
                 }
+                if inner.shutdown.load(Ordering::Acquire) {
+                    return Err(Shutdown);
+                }
+                notified.await;
+            }
+        }
+    }
+
+    /// Spawn-safe async batch drain — zero heap allocation.
+    ///
+    /// Drains every ring at least once on each wake-up cycle; invokes `f`
+    /// on every item drained. Returns `Ok(count)` after at least one item
+    /// was delivered, or `Err(Shutdown)` if shutdown fired with empty rings.
+    ///
+    /// **Why this exists**: `recv_async_send` returns one item per `await`,
+    /// paying ~70-90 ns per item in async context (Notify polling, future
+    /// state machine, runtime poll). `recv_batch_async_send` amortises that
+    /// cost across N items per await — typical N = dozens to thousands when
+    /// producers run hot. Match for the sync `recv_batch` 14× speedup.
+    ///
+    /// `F` must be `Send + 'a` for the returned future to be `Send`.
+    #[inline]
+    pub fn recv_batch_async_send<'a, F: FnMut(T) + Send + 'a>(
+        &'a self,
+        mut f: F,
+    ) -> impl std::future::Future<Output = Result<usize, Shutdown>> + Send + 'a {
+        let inner = &*self.inner;
+        async move {
+            loop {
+                // Build notified() BEFORE checking — lost-notify prevention.
+                let notified = inner.consumer_waiter.inner.notified();
+                let count = inner.drain_all(&mut f);
+                if count > 0 { return Ok(count); }
                 if inner.shutdown.load(Ordering::Acquire) {
                     return Err(Shutdown);
                 }
@@ -885,5 +1009,229 @@ mod tests {
         let (_, got) = tokio::join!(producer, consumer);
         assert_eq!(got, (0..50u64).collect::<Vec<_>>());
         sd.signal();
+    }
+
+    // ── Cloneable producer (Mpsc::new_cloneable) ────────────────────────────
+
+    #[test]
+    fn cloneable_single_sender_roundtrip() {
+        let (sender, c, _sd) = Mpsc::<u64>::new_cloneable(4);
+        let h = thread::spawn(move || {
+            c.bind();
+            c.recv().unwrap()
+        });
+        thread::sleep(Duration::from_millis(10));
+        sender.bind();
+        sender.send(42);
+        assert_eq!(h.join().unwrap(), 42);
+    }
+
+    #[test]
+    fn cloneable_clones_use_disjoint_rings() {
+        let (s0, _c, _sd) = Mpsc::<u64, 4>::new_cloneable(4);
+        let s1 = s0.clone();
+        let s2 = s0.clone();
+        let s3 = s0.clone();
+        // Each clone owns a distinct ring index.
+        assert_eq!(s0.index(), 0);
+        assert_eq!(s1.index(), 1);
+        assert_eq!(s2.index(), 2);
+        assert_eq!(s3.index(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "pool exhausted")]
+    fn cloneable_pool_exhaustion_panics() {
+        let (s0, _c, _sd) = Mpsc::<u64, 4>::new_cloneable(2);
+        let _s1 = s0.clone();   // ok — idx 1
+        let _s2 = s0.clone();   // panic — pool of 2 already handed out
+    }
+
+    #[test]
+    #[should_panic(expected = "pool exhausted")]
+    fn non_cloneable_clone_always_panics() {
+        let (mut ps, _c, _sd) = Mpsc::<u64>::new(2);
+        let p = ps.remove(0);
+        let _q = p.clone();   // panic — Mpsc::new mints non-cloneable producers
+    }
+
+    #[test]
+    fn cloneable_clones_indices_are_dense_and_unique() {
+        // MpscProducer is !Sync by design — clone on the source thread, move
+        // each clone into its own worker. Fanning out 16 senders is the
+        // typical pattern.
+        const N: usize = 16;
+        let (s0, _c, _sd) = Mpsc::<u64>::new_cloneable(N);
+        let mut senders: Vec<MpscProducer<u64>> =
+            (0..N - 1).map(|_| s0.clone()).collect();
+        senders.insert(0, s0);
+
+        let mut indices: Vec<usize> = senders.iter().map(|s| s.index()).collect();
+        indices.sort();
+        assert_eq!(indices, (0..N).collect::<Vec<_>>(),
+            "every clone must claim a unique idx in [0, N)");
+    }
+
+    // ── Cloneable + NotifyWaiter (async / tokio) ──────────────────────────
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn cloneable_async_basic_roundtrip() {
+        use crate::waiter::NotifyWaiter;
+        // First sender (idx 0) + clone (idx 1). Both drive the same Mpsc
+        // through the NotifyWaiter async path.
+        let (s0, c, sd) = Mpsc::<u64, 4, NotifyWaiter>::new_cloneable(2);
+        let s1 = s0.clone();
+        assert_eq!(s0.index(), 0);
+        assert_eq!(s1.index(), 1);
+
+        let producer = async move {
+            for k in 0..100u64 { s0.send_async(k).await; }
+            for k in 100..200u64 { s1.send_async(k).await; }
+        };
+        let consumer = async move {
+            let mut sum = 0u64;
+            for _ in 0..200 {
+                sum += c.recv_async_send().await.unwrap();
+            }
+            sum
+        };
+        let (_, got) = tokio::join!(producer, consumer);
+        assert_eq!(got, (0..200u64).sum());
+        sd.signal();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn cloneable_async_concurrent_producers_with_backpressure() {
+        use crate::waiter::NotifyWaiter;
+        // RING_CAP = 2 → tight backpressure across both rings.
+        let (s0, c, sd) = Mpsc::<u64, 2, NotifyWaiter>::new_cloneable(2);
+        let s1 = s0.clone();
+
+        let producer = async move {
+            let p0 = async move {
+                for k in 0..50u64 { s0.send_async_send(k).await; }
+            };
+            let p1 = async move {
+                for k in 50..100u64 { s1.send_async_send(k).await; }
+            };
+            tokio::join!(p0, p1);
+        };
+        let consumer = async move {
+            let mut got = Vec::with_capacity(100);
+            for _ in 0..100 {
+                got.push(c.recv_async_send().await.unwrap());
+            }
+            got
+        };
+        let (_, got) = tokio::join!(producer, consumer);
+        // Per-ring FIFO; total set is 0..100.
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..100u64).collect::<Vec<_>>());
+        sd.signal();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn recv_batch_async_drains_multiple_rings() {
+        use crate::waiter::NotifyWaiter;
+        let (s0, c, sd) = Mpsc::<u64, 8, NotifyWaiter>::new_cloneable(2);
+        let s1 = s0.clone();
+
+        let producer = async move {
+            for k in 0..50u64 { s0.send_async_send(k).await; }
+            for k in 50..100u64 { s1.send_async_send(k).await; }
+        };
+        let consumer = async move {
+            let mut got: Vec<u64> = Vec::with_capacity(100);
+            while got.len() < 100 {
+                let _ = c
+                    .recv_batch_async_send(|v| got.push(v))
+                    .await
+                    .unwrap();
+            }
+            got
+        };
+        let (_, got) = tokio::join!(producer, consumer);
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..100u64).collect::<Vec<_>>());
+        sd.signal();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn recv_batch_async_returns_shutdown_when_empty() {
+        use crate::waiter::NotifyWaiter;
+        let (_s0, c, sd) = Mpsc::<u64, 4, NotifyWaiter>::new_cloneable(1);
+        // Signal shutdown without sending anything.
+        sd.signal();
+        let r = c.recv_batch_async_send(|_| {}).await;
+        assert_eq!(r, Err(Shutdown));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn cloneable_async_pool_exhaustion_panics() {
+        use crate::waiter::NotifyWaiter;
+        let (s0, _c, _sd) = Mpsc::<u64, 4, NotifyWaiter>::new_cloneable(2);
+        let _s1 = s0.clone();   // ok — idx 1
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _s2 = s0.clone();   // panic — pool of 2 already handed out
+        }));
+        assert!(result.is_err(), "third clone must panic on exhausted pool");
+    }
+
+    #[test]
+    fn cloneable_multiple_senders_deliver_all() {
+        const N: usize = 4;
+        const PER: u64 = 250;
+
+        let (s0, c, sd) = Mpsc::<u64>::new_cloneable(N);
+        let sd2 = sd.clone();
+
+        let got_count = Arc::new(AtomicUsize::new(0));
+        let got_sum = Arc::new(AtomicUsize::new(0));
+        let consumer_h = {
+            let got_sum = got_sum.clone();
+            let got_count = got_count.clone();
+            thread::spawn(move || {
+                c.bind();
+                loop {
+                    match c.recv_batch(|v| {
+                        got_sum.fetch_add(v as usize, Ordering::Relaxed);
+                        got_count.fetch_add(1, Ordering::Relaxed);
+                    }) {
+                        Ok(_) => continue,
+                        Err(Shutdown) => break,
+                    }
+                }
+            })
+        };
+
+        // Build clones on the main thread (Clone takes &self, MpscProducer is !Sync).
+        let mut senders: Vec<MpscProducer<u64>> =
+            (0..N - 1).map(|_| s0.clone()).collect();
+        senders.insert(0, s0);
+
+        let producers: Vec<_> = senders.into_iter().enumerate().map(|(i, s)| {
+            thread::spawn(move || {
+                s.bind();
+                for k in 0..PER { s.send(i as u64 * 10_000 + k); }
+            })
+        }).collect();
+        for h in producers { h.join().unwrap(); }
+
+        thread::sleep(Duration::from_millis(20));
+        sd2.signal();
+        consumer_h.join().unwrap();
+
+        let expected_sum: u64 = (0..N as u64)
+            .map(|i| (0..PER).map(|k| i * 10_000 + k).sum::<u64>())
+            .sum();
+        assert_eq!(got_count.load(Ordering::Relaxed), (N as u64 * PER) as usize);
+        assert_eq!(got_sum.load(Ordering::Relaxed) as u64, expected_sum);
     }
 }

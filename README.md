@@ -73,7 +73,7 @@ by what's under the hood:
 | `Duplex<A, B, W>` | stream | bidirectional unbounded SPSC (2 × `Stream`) | type-safe paired send/recv each direction, zero-overhead wrapper, 2.0 ns/RT verified at K=512 | [duplex.md](docs/duplex.md) |
 | `Hub<In, Out, W>` | route | N:1 multiplexer (`SignalSet` + N × `Pipe`) | fanout from N producers to 1 drain, with per-port reply + shutdown  | [hub.md](docs/hub.md) |
 | `Mpmc<T, CAP, W>` | route | M:N sharded channel (M×N SPSC mini-rings + per-shard `AtomicBool` wake) | high-throughput broker: M producers → N consumers with batched send; **zero `LOCK`-prefixed RMW** on the producer hot path | [mpmc.md](docs/mpmc.md) |
-| `Mpsc<T, CAP, W>` | route | M:1 fan-in channel (`Waiter` + M SPSC mini-rings) | single-consumer specialisation of `Mpmc`: no shard scan, no producer cursor, ~10% faster `try_send` | [mpsc.md](docs/mpsc.md) |
+| `Mpsc<T, CAP, W>` | route | M:1 fan-in channel (`Waiter` + M SPSC mini-rings) | single-consumer specialisation of `Mpmc`: no shard scan, no producer cursor, ~10% faster `try_send`. `new_cloneable` for `Sender::clone()`-style ergonomics; `recv_batch_async_send` for tokio drain at ~41 ns/op (2.1× over `tokio::mpsc::recv_many`) | [mpsc.md](docs/mpsc.md) |
 
 ### Quick fragments
 
@@ -127,9 +127,22 @@ write (no shard scan, no modulo). After cache-line padding on
 `head` / `tail`: **per-item ~32-44 ns p50** cross-thread (M=4-16),
 **13-21% faster** than `Mpmc::new(M, 1)` in single-thread; with
 `try_send_batch(K=64)` the producer hot path drops to **~15-18 ns/op
-p50 — ~2-2.5× over per-item**. Use it whenever the topology is
-permanently M:1 — same drop-safety, shutdown, and backpressure
-guarantees as `Mpmc`. [→ mpsc.md](docs/mpsc.md)
+p50 — ~2-2.5× over per-item**.
+
+**Two construction modes**: `Mpsc::new(M)` returns a `Vec` of M
+non-cloneable producers (the original API), and
+`Mpsc::new_cloneable(max)` returns a single `Sender::clone()`-style
+handle that claims fresh ring slots on each `clone()` (cost: one
+`AcqRel fetch_add` ≈ 8 ns per clone, never touched on the hot path).
+Send/recv hot path is byte-for-byte identical between the two —
+zero overhead for the cloneable variant.
+
+**Async batch drain (tokio feature)**: `recv_batch_async_send` invokes
+the user closure on every item drained per await. Beats
+`tokio::sync::mpsc::Receiver::recv_many` by **1.3–2.1×** depending on
+M; sync `recv_batch` reaches **1.65 G items/sec** at M=8 (drain_all
+amortises one Acquire load + one Release store across the whole pass).
+[→ mpsc.md](docs/mpsc.md)
 
 **`Stream<T>`** — SPSC unbounded sequenced log. **3.0 ns/op
 cross-thread** send (per-item, no backpressure check), **2.9 ns/op**
@@ -315,7 +328,11 @@ Shipped today:
 - [x] `Mpsc<T, CAP, W>` — M:1 fan-in specialisation of `Mpmc` (N=1
       collapsed). No shard scan, no producer cursor; ~10% faster
       `try_send` than `Mpmc::new(M, 1)` in microbenches. Same drop /
-      shutdown / backpressure guarantees as `Mpmc`
+      shutdown / backpressure guarantees as `Mpmc`. `new_cloneable`
+      for `Sender::clone()`-style handle (per-clone ring claim,
+      ~8 ns cold path, zero hot-path overhead).
+      `recv_batch_async_send` for tokio: **2.1× over
+      `tokio::mpsc::recv_many`** at M=8
 - [x] `Stream<T, W>` — SPSC unbounded sequenced log with `Receipt`-based
       delivery verification; `BufferedSender` accumulator; opt-in
       `strict_wake` mode for bidirectional patterns
@@ -361,6 +378,9 @@ cargo bench --bench pipe_overhead        # Pipe ST/XT + hook zero-cost claim
 cargo bench --bench ring_overhead        # Ring FLOW / ROUND-TRIP / payload sweep
 cargo bench --bench hub_overhead         # Hub throughput + RTT
 cargo bench --bench mpmc_overhead        # Mpmc MP/NC sweep + batched + crossbeam
+cargo bench --bench mpsc_overhead        # Mpsc MP/1C sweep + batched + crossbeam
+cargo bench --bench mpsc_clone_overhead  # Mpsc new vs new_cloneable, ping-pong RTT, recv-1 vs recv-batch
+cargo bench --bench mpsc_clone_async_overhead --features tokio   # Mpsc async + tokio::mpsc baseline + recv_batch_async
 cargo bench --bench stream_overhead      # Stream send / send_iter / ack-RTT / lockstep
 cargo bench --bench duplex_overhead      # Duplex zero-overhead check + RPC patterns + fire-and-forget
 cargo bench --bench lifeline_overhead    # Lifeline cancel / recv_or_cancel overhead

@@ -119,6 +119,115 @@ are never leaked, even if the channel drops with unconsumed messages.
 consumer returns `Err(Shutdown)` from `recv` / `recv_batch` **after**
 draining any pending messages.
 
+## Two construction modes
+
+`Mpsc` ships with two constructors covering different ownership patterns.
+
+### `Mpsc::new(M)` — Vec of M non-cloneable producers
+
+The original API. Caller pre-declares M; receives a `Vec<MpscProducer>`
+with one handle per ring. Producers are **not cloneable** (calling
+`.clone()` panics: the pool is fully handed out at construction).
+
+Use when M is known statically and you fan handles out yourself.
+
+### `Mpsc::new_cloneable(max_producers)` — single cloneable handle
+
+Returns a single `MpscProducer` (idx 0) plus the consumer + shutdown.
+The producer **is `Clone`**: each `.clone()` atomically claims a fresh
+ring slot from a pool of `max_producers`. After exhaustion, further
+clones panic.
+
+Use when handles are spawned dynamically (one per task / per worker).
+Mirrors `tokio::sync::mpsc::Sender::clone()` ergonomics.
+
+```rust
+use arbitro_kit::route::Mpsc;
+
+let (sender, c, sd) = Mpsc::<u64>::new_cloneable(8);
+// Clone on the source thread, move each clone into its own worker.
+for i in 0..8 {
+    let s = sender.clone();
+    std::thread::spawn(move || {
+        s.bind();
+        for k in 0..1000 { s.send(i * 1000 + k); }
+    });
+}
+```
+
+### Cost: `new` vs `new_cloneable`
+
+The send/recv hot path is **bytecode-identical** between the two
+constructors. `next_free_idx` lives on `MpscInner` and is touched
+**only** by `Clone::clone` — never by `try_send` / `try_recv`.
+
+Measured (1M items, RING_CAP/M total cap = 1024, x86_64 8-core, 8P/1C
+fan-in, consumer drains via `recv_batch`):
+
+| Constructor              | Send mean ns/op | Recv mean ns/op | Recv ops/sec |
+| :----------------------- | --------------: | --------------: | -----------: |
+| `Mpsc::new(8)`           |            2.44 |            0.61 |        1.65B |
+| `Mpsc::new_cloneable(8)` |            2.67 |            0.61 |        1.64B |
+
+`Clone::clone()` itself: **~8 ns** per call (`AcqRel fetch_add` +
+`Arc::clone`). One-shot per clone, irrelevant on the steady-state
+hot path.
+
+## Async batch drain — `recv_batch_async_send`
+
+For tokio runtimes, `MpscConsumer<T, RING_CAP, NotifyWaiter>` exposes:
+
+```rust
+pub fn recv_batch_async_send<'a, F: FnMut(T) + Send + 'a>(
+    &'a self,
+    f: F,
+) -> impl Future<Output = Result<usize, Shutdown>> + Send + 'a
+```
+
+Each `await` drains **every** ring at least once and invokes `f` on
+every drained item. Returns `Ok(count)` after at least one item was
+delivered, or `Err(Shutdown)` if shutdown fired with empty rings.
+
+**Why it matters**: `recv_async_send` (single-item) pays ~70-90 ns
+per item for the runtime poll + Notify state machine. With 8
+producers feeding the channel,`recv_batch_async_send` amortises the
+async overhead across all items in flight per pass — measured **2.1×
+faster** than `tokio::sync::mpsc::Receiver::recv_many` (the closest
+tokio equivalent):
+
+| M | kit `recv_batch_async_send` | `tokio::mpsc::recv_many` | Speedup |
+| - | --------------------------: | -----------------------: | ------: |
+| 1 |                    79.6 ns  |                 105.5 ns |    1.3× |
+| 2 |                    53.2 ns  |                  99.6 ns |    1.9× |
+| 4 |                    44.5 ns  |                  92.6 ns |    2.1× |
+| 8 |                    41.4 ns  |                  87.5 ns |    2.1× |
+
+```rust
+use arbitro_kit::route::Mpsc;
+use arbitro_kit::waiter::NotifyWaiter;
+
+#[tokio::main]
+async fn main() {
+    let (sender, c, sd) =
+        Mpsc::<u64, 64, NotifyWaiter>::new_cloneable(4);
+
+    for i in 0..4 {
+        let s = sender.clone();
+        tokio::spawn(async move {
+            for k in 0..1000u64 { s.send_async_send(i * 1000 + k).await; }
+        });
+    }
+
+    // Drain: every await processes everything currently in flight.
+    let mut total = 0usize;
+    while total < 4_000 {
+        let n = c.recv_batch_async_send(|_v| { /* process */ }).await.unwrap();
+        total += n;
+    }
+    sd.signal();
+}
+```
+
 ## Limits
 
 - `M ≤ 255` producers (same as `Mpmc`). Chunks are added as needed
@@ -126,6 +235,9 @@ draining any pending messages.
 - `RING_CAP` must be a power of two ≥ 1. Default: 64.
 - Backing storage: `M × RING_CAP × sizeof(T)` bytes — half of `Mpmc`'s
   for the same `M` (no `N` factor).
+- For `new_cloneable(max)`, all `max` rings are pre-allocated upfront
+  (consumer scan iterates `max` rings regardless of how many clones
+  are actually live — unused rings cost 2 cache loads per pass).
 
 ## Usage
 
