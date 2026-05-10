@@ -78,6 +78,11 @@ name = "async_h2h"
 harness = false
 required-features = ["tokio"]
 
+[[bench]]
+name = "cap_sweep"
+harness = false
+required-features = ["tokio"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"
