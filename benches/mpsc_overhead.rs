@@ -11,6 +11,10 @@
 //!   C. MP/1C fan-in        (M = 2, 4, 8).
 //!   D. crossbeam baselines (same C shapes).
 //!   E. Producer-batched MP/1C via `try_send_batch` (chunk = 64).
+//!   F. High-fanin 100P/1C — mpsc vs crossbeam.
+//!   7. Client scenario: alloc-per-msg vs ptr-reuse (1P/1C cross-thread).
+//!      Simulates what `publish_async` does today (vec![] per send) vs what
+//!      a pre-allocated or pooled buffer path would cost.
 //!
 //! ## Capacity parity
 //!
@@ -387,6 +391,117 @@ fn bench_mpsc_batched<const M: usize, const RING_CAP: usize>(label: &str, chunk:
     let _ = consumer.join().unwrap();
 }
 
+// ── 7. Client scenario: alloc-per-msg vs ptr-reuse ────────────────────
+//
+// Simulates the 1P/1C cross-thread path that `publish_async` walks today:
+//
+//   alloc_per_msg:  vec![0u8; FRAME_SIZE]  +  fill  +  try_send(vec)
+//                   consumer drops the Vec  (mimics write_all + dealloc)
+//
+//   ptr_reuse:      pre-alloc buf, fill in-place, try_send(ptr as usize)
+//                   consumer ignores the value  (zero ownership transfer)
+//
+// The delta between the two rows is the cost the client pays for
+// "one heap allocation per publish".  FRAME_SIZE = 92 B matches a
+// typical PubFrame (16 B header + 8 B body + 4 B subject + 64 B payload).
+
+const FRAME_SIZE: usize = 92;
+
+fn bench_client_alloc_per_msg() {
+    let (mut ps, c, sd) = Mpsc::<Vec<u8>, 1024>::new(1);
+    let p = ps.pop().unwrap();
+
+    let consumer = thread::spawn(move || {
+        c.bind();
+        loop {
+            match c.recv() {
+                Ok(v) => { std::hint::black_box(v); }
+                Err(_) => break,
+            }
+        }
+    });
+
+    p.bind();
+    for _ in 0..warmup_batches() {
+        for _ in 0..BATCH {
+            let mut buf = vec![0u8; FRAME_SIZE];
+            // Simulate encode: write first and last bytes so the compiler
+            // cannot elide the buffer.
+            buf[0] = 0xAB;
+            buf[FRAME_SIZE - 1] = 0xCD;
+            p.send(buf);
+        }
+    }
+
+    let n = rounds();
+    let mut lats = Vec::with_capacity(n);
+    let (mut tick, prog_t0) = progress_start("7 alloc-per-msg", n);
+    let wall = Instant::now();
+    for i in 0..n {
+        let t0 = Instant::now();
+        for _ in 0..BATCH {
+            let mut buf = vec![0u8; FRAME_SIZE];
+            buf[0] = 0xAB;
+            buf[FRAME_SIZE - 1] = 0xCD;
+            p.send(buf);
+        }
+        let dt = t0.elapsed().as_nanos() as u64;
+        lats.push(dt);
+        tick(i, dt);
+    }
+    progress_end("7 alloc-per-msg", prog_t0);
+    row("client: alloc+fill+send (Vec per msg, 92B)", lats, wall.elapsed().as_nanos() as u64);
+
+    sd.signal();
+    let _ = consumer.join();
+}
+
+fn bench_client_ptr_reuse() {
+    let (mut ps, c, sd) = Mpsc::<usize, 1024>::new(1);
+    let p = ps.pop().unwrap();
+
+    let consumer = thread::spawn(move || {
+        c.bind();
+        loop {
+            match c.recv() {
+                Ok(v) => { std::hint::black_box(v); }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut buf = vec![0u8; FRAME_SIZE];
+    p.bind();
+    for _ in 0..warmup_batches() {
+        for _ in 0..BATCH {
+            buf[0] = 0xAB;
+            buf[FRAME_SIZE - 1] = 0xCD;
+            p.send(buf.as_ptr() as usize);
+        }
+    }
+
+    let n = rounds();
+    let mut lats = Vec::with_capacity(n);
+    let (mut tick, prog_t0) = progress_start("7 ptr-reuse", n);
+    let wall = Instant::now();
+    for i in 0..n {
+        let t0 = Instant::now();
+        for _ in 0..BATCH {
+            buf[0] = 0xAB;
+            buf[FRAME_SIZE - 1] = 0xCD;
+            p.send(buf.as_ptr() as usize);
+        }
+        let dt = t0.elapsed().as_nanos() as u64;
+        lats.push(dt);
+        tick(i, dt);
+    }
+    progress_end("7 ptr-reuse", prog_t0);
+    row("ideal:  fill+send (ptr reuse, no alloc, 92B)", lats, wall.elapsed().as_nanos() as u64);
+
+    sd.signal();
+    let _ = consumer.join();
+}
+
 fn main() {
     println!("=== arbitro-kit route::Mpsc overhead bench ===");
     println!("rounds={} batches × BATCH={} ops each", rounds(), BATCH);
@@ -418,6 +533,10 @@ fn main() {
     header("6. High-fanin 100P/1C — mpsc vs crossbeam (slow section)");
     bench_mpsc_fanin::<100, 16>("mpsc      100P/1C cap=100×16");
     bench_crossbeam_mpsc::<100>("crossbeam 100P/1C bounded(1024)");
+
+    header("7. Client scenario: alloc-per-msg vs ptr-reuse (1P/1C cross-thread, FRAME=92B)");
+    bench_client_alloc_per_msg();
+    bench_client_ptr_reuse();
 
     println!("\nDone.");
 }

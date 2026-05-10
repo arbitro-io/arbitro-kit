@@ -198,22 +198,38 @@ impl<T: Send, H: PipeHook<T>, W: BlockingWaiter> Pipe<T, H, W> {
 // ── Async recv: requires `W: AsyncWaiter` ───────────────────────────────
 
 #[cfg(feature = "tokio")]
-impl<T: Send, H: PipeHook<T>, W: AsyncWaiter> Pipe<T, H, W> {
+impl<T: Send, H: PipeHook<T> + Sync, W: AsyncWaiter> Pipe<T, H, W> {
     /// Async receive. Must be polled from a runtime compatible with `W`.
     ///
     /// Naming: this is `recv_async` (not `recv`) because Rust requires
     /// distinct method names even when trait bounds are disjoint. Same
     /// convention as `flume`. The sync sibling is [`recv`](Self::recv)
     /// (gated on `W: BlockingWaiter`).
-    pub async fn recv_async(&self) -> T {
-        self.waiter
-            .wait_until(|| self.has_data.load(Ordering::Acquire))
-            .await;
-        // Safety: predicate returned true; same as `try_recv`.
-        let v = unsafe { (*self.slot.get()).assume_init_read() };
-        self.has_data.store(false, Ordering::Release);
-        self.hook.on_recv(&v);
-        v
+    ///
+    /// Returns a boxed future bound to `&self` to sidestep the RPITIT
+    /// lifetime inference limitation (rust-lang/rust#100013): the inner
+    /// `wait_until` returns `impl Future + Send + 'a`, and an `async fn`
+    /// body that awaits it propagates the `'a` borrow through auto-trait
+    /// inference, which breaks `Send` coercion at downstream
+    /// `tokio::spawn` call sites. Boxing erases the propagation. One
+    /// alloc per receive — amortised against the syscall-class wake.
+    pub fn recv_async<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> {
+        Box::pin(async move {
+            // Box the wait_until future to detach its `'a` borrow before
+            // the outer async block's auto-trait inference runs.
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> =
+                Box::pin(self.waiter.wait_until(|| {
+                    self.has_data.load(Ordering::Acquire)
+                }));
+            fut.await;
+            // Safety: predicate returned true; same as `try_recv`.
+            let v = unsafe { (*self.slot.get()).assume_init_read() };
+            self.has_data.store(false, Ordering::Release);
+            self.hook.on_recv(&v);
+            v
+        })
     }
 }
 

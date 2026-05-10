@@ -157,21 +157,29 @@ impl<W: crate::waiter::AsyncWaiter + 'static> Receiver<W> {
         self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AcquireError>> + Send>>
     {
-        Box::pin(async move {
-            let inner = self.inner;
-            let inner_for_pred = inner.clone();
-            inner
-                .waiter
-                .wait_until(move || {
-                    inner_for_pred.state.load(Ordering::Acquire) != STATE_PENDING
-                })
-                .await;
-            match inner.state.load(Ordering::Acquire) {
-                STATE_RELEASED => Ok(()),
-                STATE_CLOSED => Err(AcquireError::Closed),
-                _ => unreachable!("wait_until returned with state == PENDING"),
-            }
-        })
+        Box::pin(do_acquire_async(self.inner))
+    }
+}
+
+#[cfg(feature = "tokio")]
+async fn do_acquire_async<W: crate::waiter::AsyncWaiter + 'static>(
+    inner: Arc<Inner<W>>,
+) -> Result<(), AcquireError> {
+    let inner_for_pred = inner.clone();
+    // Box the wait_until future to erase its `'a` borrow lifetime — without
+    // this, the outer `async fn` body propagates the RPITIT borrow into its
+    // auto-`Send`/`'static` inference and rust-lang/rust#100013 rejects the
+    // resulting `Pin<Box<dyn Future + Send + 'static>>` coercion at the
+    // call site (kit's only async path that returns a boxed dyn future).
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(inner.waiter.wait_until(move || {
+            inner_for_pred.state.load(Ordering::Acquire) != STATE_PENDING
+        }));
+    fut.await;
+    match inner.state.load(Ordering::Acquire) {
+        STATE_RELEASED => Ok(()),
+        STATE_CLOSED => Err(AcquireError::Closed),
+        _ => unreachable!("wait_until returned with state == PENDING"),
     }
 }
 

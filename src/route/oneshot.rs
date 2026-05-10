@@ -234,19 +234,54 @@ impl<T: Send, W: BlockingWaiter> Receiver<T, W> {
 // ── Async recv: requires `W: AsyncWaiter` ───────────────────────────────
 
 #[cfg(feature = "tokio")]
-impl<T: Send, W: AsyncWaiter> Receiver<T, W> {
+impl<T: Send + 'static, W: AsyncWaiter + 'static> Receiver<T, W> {
     /// Async receive. Must be polled from a runtime compatible with `W`.
     ///
     /// Naming: this is `recv_async` (not `recv`) because Rust requires
     /// distinct method names even when trait bounds are disjoint. Same
     /// convention as `flume`. The sync sibling is [`recv`](Self::recv)
     /// (gated on `W: BlockingWaiter`).
-    pub async fn recv_async(self) -> Result<T, Closed> {
-        self.inner
-            .waiter
-            .wait_until(|| self.inner.state.load(Ordering::Acquire) != STATE_EMPTY)
-            .await;
-        self.try_take().expect("state != EMPTY guaranteed by wait_until")
+    ///
+    /// Returns a boxed future to sidestep an RPITIT lifetime inference
+    /// limitation (rust-lang/rust#100013): the inner `wait_until` future
+    /// is `impl Future + Send + 'a`, and an `async fn` body that awaits
+    /// it propagates the `'a` borrow through auto-trait inference,
+    /// breaking `Send + 'static` coercion at downstream `tokio::spawn`
+    /// call sites. Boxing the inner future erases `'a`. One alloc per
+    /// receive — amortised against the syscall-class wake.
+    pub fn recv_async(
+        self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Closed>> + Send>> {
+        Box::pin(do_recv_async(self.inner))
+    }
+}
+
+#[cfg(feature = "tokio")]
+async fn do_recv_async<T: Send + 'static, W: AsyncWaiter + 'static>(
+    inner: std::sync::Arc<Inner<T, W>>,
+) -> Result<T, Closed> {
+    let inner_for_pred = inner.clone();
+    // Box the wait_until future to erase its `'a` borrow before the outer
+    // `async fn` auto-trait inference runs.
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(inner.waiter.wait_until(move || {
+            inner_for_pred.state.load(Ordering::Acquire) != STATE_EMPTY
+        }));
+    fut.await;
+    // Predicate guarantees state != EMPTY ⇒ try_take returns `Some`.
+    match inner.state.compare_exchange(
+        STATE_FULL,
+        STATE_TAKEN,
+        Ordering::Acquire,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // SAFETY: FULL → TAKEN; sender's Release pairs with our Acquire.
+            let v = unsafe { (*inner.slot.get()).assume_init_read() };
+            Ok(v)
+        }
+        Err(STATE_CLOSED) | Err(STATE_TAKEN) => Err(Closed),
+        Err(_) => unreachable!("state != EMPTY guaranteed by wait_until"),
     }
 }
 
