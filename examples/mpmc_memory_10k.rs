@@ -49,7 +49,7 @@ fn fmt_bytes(b: i64) -> String {
 ///   - m: usize → 8 B
 /// Total inner = MpmcInner header + N × shard + M × ParkWaiter (producer waiters)
 fn analytical(m: usize, n: usize, ring_cap: usize, t_bytes: usize) -> u64 {
-    let pring = 64 + 64 + 24 + ring_cap * t_bytes;       // approx
+    let pring = 64 + 64 + 24 + ring_cap * t_bytes; // approx
     let shard = m * pring + 64 /* waiter */ + 24 /* shard hdr + slice ptr */;
     let producer_waiters = m * 64;
     let inner_hdr = 64;
@@ -63,8 +63,7 @@ fn run<const RING_CAP: usize>(m: usize, n: usize) {
     let before = rss_kb().unwrap_or(0);
 
     // Build and HOLD so we measure resident memory while alive.
-    let (producers, consumers, shutdown) =
-        Mpmc::<u64, RING_CAP>::new(m, n);
+    let (producers, consumers, shutdown) = Mpmc::<u64, RING_CAP>::new(m, n);
 
     // Force first-touch on every page so RSS reflects committed memory,
     // not lazy zero pages.  Touching each consumer's first ring is enough.

@@ -28,7 +28,9 @@ fn rounds() -> usize {
         .unwrap_or(200)
 }
 
-fn warmup() -> usize { 10 }
+fn warmup() -> usize {
+    10
+}
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
@@ -71,7 +73,9 @@ fn sync_mpsc<const CAP: usize>() {
     let consumer = thread::spawn(move || {
         c.bind();
         loop {
-            match c.recv_batch(|v| { std::hint::black_box(v); }) {
+            match c.recv_batch(|v| {
+                std::hint::black_box(v);
+            }) {
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -91,12 +95,19 @@ fn sync_mpsc<const CAP: usize>() {
             let mut last: u64 = 0;
             loop {
                 loop {
-                    if st.load(Ordering::Acquire) { return; }
+                    if st.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = wr.load(Ordering::Acquire);
-                    if r > last { last = r; break; }
+                    if r > last {
+                        last = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { p.send(k); }
+                for k in 0..per_prod as u64 {
+                    p.send(k);
+                }
                 dr.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -105,7 +116,9 @@ fn sync_mpsc<const CAP: usize>() {
     for _ in 0..warmup() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -115,14 +128,18 @@ fn sync_mpsc<const CAP: usize>() {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(&label, &mut lats);
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
     let _ = consumer.join();
 }
@@ -144,7 +161,9 @@ fn sync_mpmc<const CAP: usize>() {
     let consumer = thread::spawn(move || {
         c.bind();
         loop {
-            match c.recv_batch(|v| { std::hint::black_box(v); }) {
+            match c.recv_batch(|v| {
+                std::hint::black_box(v);
+            }) {
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -164,12 +183,19 @@ fn sync_mpmc<const CAP: usize>() {
             let mut last: u64 = 0;
             loop {
                 loop {
-                    if st.load(Ordering::Acquire) { return; }
+                    if st.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = wr.load(Ordering::Acquire);
-                    if r > last { last = r; break; }
+                    if r > last {
+                        last = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { p.send(k); }
+                for k in 0..per_prod as u64 {
+                    p.send(k);
+                }
                 dr.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -178,7 +204,9 @@ fn sync_mpmc<const CAP: usize>() {
     for _ in 0..warmup() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -188,14 +216,18 @@ fn sync_mpmc<const CAP: usize>() {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(&label, &mut lats);
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
     let _ = consumer.join();
 }
@@ -219,22 +251,25 @@ async fn async_mpsc_spin<const CAP: usize>() {
 
         let t0 = Instant::now();
 
-        let prod_handles: Vec<_> = producers.into_iter().map(|p| {
-            tokio::spawn(async move {
-                for k in 0..per_prod as u64 {
-                    let mut v = k;
-                    loop {
-                        match p.try_send(v) {
-                            Ok(()) => break,
-                            Err(returned) => {
-                                v = returned;
-                                tokio::task::yield_now().await;
+        let prod_handles: Vec<_> = producers
+            .into_iter()
+            .map(|p| {
+                tokio::spawn(async move {
+                    for k in 0..per_prod as u64 {
+                        let mut v = k;
+                        loop {
+                            match p.try_send(v) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    v = returned;
+                                    tokio::task::yield_now().await;
+                                }
                             }
                         }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
         let mut count = 0;
         while count < batch {
@@ -243,7 +278,9 @@ async fn async_mpsc_spin<const CAP: usize>() {
                 Err(_) => break,
             }
         }
-        for h in prod_handles { h.await.unwrap(); }
+        for h in prod_handles {
+            h.await.unwrap();
+        }
 
         if round >= warmup() {
             samples.push(t0.elapsed().as_nanos() as u64);
@@ -268,13 +305,16 @@ async fn async_mpsc_wake<const CAP: usize>() {
 
         let t0 = Instant::now();
 
-        let prod_handles: Vec<_> = producers.into_iter().map(|p| {
-            tokio::spawn(async move {
-                for k in 0..per_prod as u64 {
-                    p.send_async_send(k).await;
-                }
+        let prod_handles: Vec<_> = producers
+            .into_iter()
+            .map(|p| {
+                tokio::spawn(async move {
+                    for k in 0..per_prod as u64 {
+                        p.send_async_send(k).await;
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         let mut count = 0;
         while count < batch {
@@ -283,7 +323,9 @@ async fn async_mpsc_wake<const CAP: usize>() {
                 Err(_) => break,
             }
         }
-        for h in prod_handles { h.await.unwrap(); }
+        for h in prod_handles {
+            h.await.unwrap();
+        }
 
         if round >= warmup() {
             samples.push(t0.elapsed().as_nanos() as u64);
@@ -319,15 +361,35 @@ async fn async_mpsc_join<const CAP: usize>() {
 
         let t0 = Instant::now();
         tokio::join!(
-            async { for k in 0..per_prod as u64 { p0.send_async(k).await; } },
-            async { for k in 0..per_prod as u64 { p1.send_async(k).await; } },
-            async { for k in 0..per_prod as u64 { p2.send_async(k).await; } },
-            async { for k in 0..per_prod as u64 { p3.send_async(k).await; } },
+            async {
+                for k in 0..per_prod as u64 {
+                    p0.send_async(k).await;
+                }
+            },
+            async {
+                for k in 0..per_prod as u64 {
+                    p1.send_async(k).await;
+                }
+            },
+            async {
+                for k in 0..per_prod as u64 {
+                    p2.send_async(k).await;
+                }
+            },
+            async {
+                for k in 0..per_prod as u64 {
+                    p3.send_async(k).await;
+                }
+            },
             async {
                 loop {
-                    if rc.load(Ordering::Relaxed) >= batch { break; }
+                    if rc.load(Ordering::Relaxed) >= batch {
+                        break;
+                    }
                     match consumer.recv_async_send().await {
-                        Ok(_) => { rc.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            rc.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(_) => break,
                     }
                 }
@@ -376,15 +438,35 @@ async fn async_mpmc<const CAP: usize>() {
 
         let t0 = Instant::now();
         tokio::join!(
-            async { for k in 0..per_prod as u64 { p0.send_async(k).await; } },
-            async { for k in 0..per_prod as u64 { p1.send_async(k).await; } },
-            async { for k in 0..per_prod as u64 { p2.send_async(k).await; } },
-            async { for k in 0..per_prod as u64 { p3.send_async(k).await; } },
+            async {
+                for k in 0..per_prod as u64 {
+                    p0.send_async(k).await;
+                }
+            },
+            async {
+                for k in 0..per_prod as u64 {
+                    p1.send_async(k).await;
+                }
+            },
+            async {
+                for k in 0..per_prod as u64 {
+                    p2.send_async(k).await;
+                }
+            },
+            async {
+                for k in 0..per_prod as u64 {
+                    p3.send_async(k).await;
+                }
+            },
             async {
                 loop {
-                    if rc.load(Ordering::Relaxed) >= batch { break; }
+                    if rc.load(Ordering::Relaxed) >= batch {
+                        break;
+                    }
                     match c0.recv_async().await {
-                        Ok(_) => { rc.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            rc.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(_) => break,
                     }
                 }
@@ -421,14 +503,16 @@ async fn async_tokio_mpsc(cap: usize) {
 
         let t0 = Instant::now();
 
-        let prod_handles: Vec<_> = (0..M).map(|_| {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                for k in 0..per_prod as u64 {
-                    tx.send(k).await.unwrap();
-                }
+        let prod_handles: Vec<_> = (0..M)
+            .map(|_| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    for k in 0..per_prod as u64 {
+                        tx.send(k).await.unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
         drop(tx); // drop original sender
 
         let mut count = 0;
@@ -438,7 +522,9 @@ async fn async_tokio_mpsc(cap: usize) {
                 None => break,
             }
         }
-        for h in prod_handles { h.await.unwrap(); }
+        for h in prod_handles {
+            h.await.unwrap();
+        }
 
         if round >= warmup() {
             samples.push(t0.elapsed().as_nanos() as u64);
@@ -453,7 +539,12 @@ async fn async_tokio_mpsc(cap: usize) {
 
 fn main() {
     println!("=== cap_sweep: RING_CAP impact on Mpsc/Mpmc throughput ===");
-    println!("batch={}, rounds={} (+ {} warmup), producers={M}", batch(), rounds(), warmup());
+    println!(
+        "batch={}, rounds={} (+ {} warmup), producers={M}",
+        batch(),
+        rounds(),
+        warmup()
+    );
 
     header("A. Mpsc sync 4P/1C — RING_CAP sweep");
     sync_mpsc::<1>();

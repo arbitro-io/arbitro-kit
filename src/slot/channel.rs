@@ -65,12 +65,12 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use crate::waiter::{ParkWaiter, Waiter, BlockingWaiter};
 #[cfg(feature = "tokio")]
 use crate::waiter::AsyncWaiter;
+use crate::waiter::{BlockingWaiter, ParkWaiter, Waiter};
 
 /// Cache-line padding to force the response half onto a separate 64 B line
 /// from the request half.
@@ -88,15 +88,15 @@ struct CachePad([u8; 0]);
 #[repr(C, align(64))]
 pub struct Channel<Req, Resp, W: Waiter = ParkWaiter> {
     // ── request direction (client → server) ─────────────────────────────
-    _pad0:      CachePad,
-    req_open:   AtomicBool,
-    req_slot:   UnsafeCell<MaybeUninit<Req>>,
+    _pad0: CachePad,
+    req_open: AtomicBool,
+    req_slot: UnsafeCell<MaybeUninit<Req>>,
     req_waiter: W,
 
     // ── response direction (server → client) ────────────────────────────
-    _pad1:       CachePad,
-    resp_open:   AtomicBool,
-    resp_slot:   UnsafeCell<MaybeUninit<Resp>>,
+    _pad1: CachePad,
+    resp_open: AtomicBool,
+    resp_slot: UnsafeCell<MaybeUninit<Resp>>,
     resp_waiter: W,
 
     // ── poison flag ─────────────────────────────────────────────────────
@@ -113,29 +113,36 @@ unsafe impl<Req: Send, Resp: Send, W: Waiter> Sync for Channel<Req, Resp, W> {}
 unsafe impl<Req: Send, Resp: Send, W: Waiter> Send for Channel<Req, Resp, W> {}
 
 impl<Req: Send, Resp: Send, W: Waiter> Default for Channel<Req, Resp, W> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<Req: Send, Resp: Send, W: Waiter> Channel<Req, Resp, W> {
     /// Create a fresh channel. Both halves start closed (no pending work).
     pub fn new() -> Self {
         Self {
-            _pad0:       CachePad([]),
-            req_open:    AtomicBool::new(false),
-            req_slot:    UnsafeCell::new(MaybeUninit::uninit()),
-            req_waiter:  W::default(),
-            _pad1:       CachePad([]),
-            resp_open:   AtomicBool::new(false),
-            resp_slot:   UnsafeCell::new(MaybeUninit::uninit()),
+            _pad0: CachePad([]),
+            req_open: AtomicBool::new(false),
+            req_slot: UnsafeCell::new(MaybeUninit::uninit()),
+            req_waiter: W::default(),
+            _pad1: CachePad([]),
+            resp_open: AtomicBool::new(false),
+            resp_slot: UnsafeCell::new(MaybeUninit::uninit()),
             resp_waiter: W::default(),
-            poisoned:    AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
         }
     }
 
     /// Create a channel and return typed `(Client, Server)` handles.
     pub fn spsc() -> (Client<Req, Resp, W>, Server<Req, Resp, W>) {
         let inner = Arc::new(Self::new());
-        (Client { inner: inner.clone() }, Server { inner })
+        (
+            Client {
+                inner: inner.clone(),
+            },
+            Server { inner },
+        )
     }
 
     /// Register the client thread. Must be called from the client thread
@@ -152,11 +159,15 @@ impl<Req: Send, Resp: Send, W: Waiter> Channel<Req, Resp, W> {
 
     /// Non-blocking check for the server: is there a pending request?
     #[inline]
-    pub fn has_request(&self) -> bool { self.req_open.load(Ordering::Acquire) }
+    pub fn has_request(&self) -> bool {
+        self.req_open.load(Ordering::Acquire)
+    }
 
     /// Non-blocking check for the client: has the server replied?
     #[inline]
-    pub fn has_response(&self) -> bool { self.resp_open.load(Ordering::Acquire) }
+    pub fn has_response(&self) -> bool {
+        self.resp_open.load(Ordering::Acquire)
+    }
 }
 
 // ── Sync API: requires `W: BlockingWaiter` ──────────────────────────────────
@@ -173,11 +184,14 @@ impl<Req: Send, Resp: Send, W: BlockingWaiter> Channel<Req, Resp, W> {
     #[inline]
     pub fn call(&self, req: Req) -> Resp {
         // Safety: SPSC contract — sole client, req_slot is empty.
-        unsafe { (*self.req_slot.get()).write(req); }
+        unsafe {
+            (*self.req_slot.get()).write(req);
+        }
         self.req_open.store(true, Ordering::Release);
         self.req_waiter.wake();
 
-        self.resp_waiter.wait_until(|| self.resp_open.load(Ordering::Acquire));
+        self.resp_waiter
+            .wait_until(|| self.resp_open.load(Ordering::Acquire));
 
         if self.poisoned.load(Ordering::Acquire) {
             // Reset the open flag so a re-attempt panics afresh, never reads
@@ -201,7 +215,8 @@ impl<Req: Send, Resp: Send, W: BlockingWaiter> Channel<Req, Resp, W> {
     /// propagates up.
     #[inline]
     pub fn serve_one<F: FnOnce(Req) -> Resp>(&self, f: F) {
-        self.req_waiter.wait_until(|| self.req_open.load(Ordering::Acquire));
+        self.req_waiter
+            .wait_until(|| self.req_open.load(Ordering::Acquire));
         // Safety: client wrote req_slot before storing req_open=true with
         // Release; our wait_until predicate did an Acquire load.
         let req = unsafe { (*self.req_slot.get()).assume_init_read() };
@@ -209,8 +224,8 @@ impl<Req: Send, Resp: Send, W: BlockingWaiter> Channel<Req, Resp, W> {
 
         // Drop-guard: if `f(req)` panics, wake the parked client.
         struct PoisonGuard<'a, W: Waiter> {
-            poisoned:    &'a AtomicBool,
-            resp_open:   &'a AtomicBool,
+            poisoned: &'a AtomicBool,
+            resp_open: &'a AtomicBool,
             resp_waiter: &'a W,
         }
         impl<'a, W: Waiter> Drop for PoisonGuard<'a, W> {
@@ -221,8 +236,8 @@ impl<Req: Send, Resp: Send, W: BlockingWaiter> Channel<Req, Resp, W> {
             }
         }
         let guard = PoisonGuard {
-            poisoned:    &self.poisoned,
-            resp_open:   &self.resp_open,
+            poisoned: &self.poisoned,
+            resp_open: &self.resp_open,
             resp_waiter: &self.resp_waiter,
         };
 
@@ -232,7 +247,9 @@ impl<Req: Send, Resp: Send, W: BlockingWaiter> Channel<Req, Resp, W> {
         std::mem::forget(guard);
 
         // Safety: resp_slot write paired with the following Release store.
-        unsafe { (*self.resp_slot.get()).write(resp); }
+        unsafe {
+            (*self.resp_slot.get()).write(resp);
+        }
         self.resp_open.store(true, Ordering::Release);
         self.resp_waiter.wake();
     }
@@ -254,7 +271,9 @@ impl<Req: Send, Resp: Send, W: BlockingWaiter> Channel<Req, Resp, W> {
         self.resp_open.store(false, Ordering::Relaxed);
 
         // Fire the next request.
-        unsafe { (*self.req_slot.get()).write(req); }
+        unsafe {
+            (*self.req_slot.get()).write(req);
+        }
         self.req_open.store(true, Ordering::Release);
         self.req_waiter.wake();
         Ok(r)
@@ -263,7 +282,9 @@ impl<Req: Send, Resp: Send, W: BlockingWaiter> Channel<Req, Resp, W> {
     /// Server API. Loop forever serving requests with a stateful handler.
     #[inline]
     pub fn serve_loop<F: FnMut(Req) -> Resp>(&self, mut f: F) -> ! {
-        loop { self.serve_one(&mut f); }
+        loop {
+            self.serve_one(&mut f);
+        }
     }
 }
 
@@ -275,7 +296,9 @@ impl<Req: Send, Resp: Send, W: AsyncWaiter> Channel<Req, Resp, W> {
     /// allow a sync and async method to share a name even when bounds are
     /// disjoint.
     pub async fn call_async(&self, req: Req) -> Resp {
-        unsafe { (*self.req_slot.get()).write(req); }
+        unsafe {
+            (*self.req_slot.get()).write(req);
+        }
         self.req_open.store(true, Ordering::Release);
         self.req_waiter.wake();
 
@@ -306,8 +329,8 @@ impl<Req: Send, Resp: Send, W: AsyncWaiter> Channel<Req, Resp, W> {
         self.req_open.store(false, Ordering::Relaxed);
 
         struct PoisonGuard<'a, W: Waiter> {
-            poisoned:    &'a AtomicBool,
-            resp_open:   &'a AtomicBool,
+            poisoned: &'a AtomicBool,
+            resp_open: &'a AtomicBool,
             resp_waiter: &'a W,
         }
         impl<'a, W: Waiter> Drop for PoisonGuard<'a, W> {
@@ -318,8 +341,8 @@ impl<Req: Send, Resp: Send, W: AsyncWaiter> Channel<Req, Resp, W> {
             }
         }
         let guard = PoisonGuard {
-            poisoned:    &self.poisoned,
-            resp_open:   &self.resp_open,
+            poisoned: &self.poisoned,
+            resp_open: &self.resp_open,
             resp_waiter: &self.resp_waiter,
         };
 
@@ -327,7 +350,9 @@ impl<Req: Send, Resp: Send, W: AsyncWaiter> Channel<Req, Resp, W> {
 
         std::mem::forget(guard);
 
-        unsafe { (*self.resp_slot.get()).write(resp); }
+        unsafe {
+            (*self.resp_slot.get()).write(resp);
+        }
         self.resp_open.store(true, Ordering::Release);
         self.resp_waiter.wake();
     }
@@ -338,10 +363,14 @@ impl<Req, Resp, W: Waiter> Drop for Channel<Req, Resp, W> {
         // Safety: `&mut self` ⇒ no other refs. Drain any value left in
         // flight to avoid leaking RAII resources.
         if *self.req_open.get_mut() {
-            unsafe { (*self.req_slot.get()).assume_init_drop(); }
+            unsafe {
+                (*self.req_slot.get()).assume_init_drop();
+            }
         }
         if *self.resp_open.get_mut() && !*self.poisoned.get_mut() {
-            unsafe { (*self.resp_slot.get()).assume_init_drop(); }
+            unsafe {
+                (*self.resp_slot.get()).assume_init_drop();
+            }
         }
     }
 }
@@ -363,23 +392,31 @@ impl<Req: Send, Resp: Send, W: Waiter> Client<Req, Resp, W> {
 
     /// True iff a response is already waiting to be consumed.
     #[inline]
-    pub fn has_response(&self) -> bool { self.inner.has_response() }
+    pub fn has_response(&self) -> bool {
+        self.inner.has_response()
+    }
 }
 
 impl<Req: Send, Resp: Send, W: BlockingWaiter> Client<Req, Resp, W> {
     /// Send `req`, block until the server replies, return `Resp`.
     #[inline]
-    pub fn call(&self, req: Req) -> Resp { self.inner.call(req) }
+    pub fn call(&self, req: Req) -> Resp {
+        self.inner.call(req)
+    }
 
     /// Non-blocking pipelined send. See [`Channel::try_call`].
     #[inline]
-    pub fn try_call(&self, req: Req) -> Result<Resp, Req> { self.inner.try_call(req) }
+    pub fn try_call(&self, req: Req) -> Result<Resp, Req> {
+        self.inner.try_call(req)
+    }
 }
 
 #[cfg(feature = "tokio")]
 impl<Req: Send, Resp: Send, W: AsyncWaiter> Client<Req, Resp, W> {
     /// Async send. See [`Channel::call_async`].
-    pub async fn call_async(&self, req: Req) -> Resp { self.inner.call_async(req).await }
+    pub async fn call_async(&self, req: Req) -> Resp {
+        self.inner.call_async(req).await
+    }
 }
 
 /// Server half of a [`Channel`].
@@ -396,17 +433,23 @@ impl<Req: Send, Resp: Send, W: Waiter> Server<Req, Resp, W> {
 
     /// True iff a request is queued.
     #[inline]
-    pub fn has_request(&self) -> bool { self.inner.has_request() }
+    pub fn has_request(&self) -> bool {
+        self.inner.has_request()
+    }
 }
 
 impl<Req: Send, Resp: Send, W: BlockingWaiter> Server<Req, Resp, W> {
     /// Serve exactly one round-trip.
     #[inline]
-    pub fn serve_one<F: FnOnce(Req) -> Resp>(&self, f: F) { self.inner.serve_one(f) }
+    pub fn serve_one<F: FnOnce(Req) -> Resp>(&self, f: F) {
+        self.inner.serve_one(f)
+    }
 
     /// Serve requests forever with a stateful handler.
     #[inline]
-    pub fn serve_loop<F: FnMut(Req) -> Resp>(&self, f: F) -> ! { self.inner.serve_loop(f) }
+    pub fn serve_loop<F: FnMut(Req) -> Resp>(&self, f: F) -> ! {
+        self.inner.serve_loop(f)
+    }
 }
 
 #[cfg(feature = "tokio")]
@@ -479,7 +522,9 @@ mod tests {
         let h = std::thread::spawn(move || {
             server.bind();
             server.serve_one(|mut req| {
-                for b in req.iter_mut() { *b = b.wrapping_add(1); }
+                for b in req.iter_mut() {
+                    *b = b.wrapping_add(1);
+                }
                 req
             });
         });
@@ -496,7 +541,9 @@ mod tests {
     fn drop_drains_inflight_request() {
         struct Tracked(Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -504,11 +551,17 @@ mod tests {
             let ch = Channel::<Tracked, ()>::new();
             ch.set_client(std::thread::current());
             // Write a Req without ever servicing it.
-            unsafe { (*ch.req_slot.get()).write(Tracked(drops.clone())); }
+            unsafe {
+                (*ch.req_slot.get()).write(Tracked(drops.clone()));
+            }
             ch.req_open.store(true, Ordering::Release);
             // ch drops here — Drop impl must drop the Tracked inside.
         }
-        assert_eq!(drops.load(Ordering::Relaxed), 1, "inflight Req must be dropped");
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "inflight Req must be dropped"
+        );
     }
 
     #[test]
@@ -518,7 +571,9 @@ mod tests {
         let h = std::thread::spawn(move || {
             server.bind();
             server.serve_one(|mut req| {
-                for b in req.iter_mut() { *b = b.wrapping_add(1); }
+                for b in req.iter_mut() {
+                    *b = b.wrapping_add(1);
+                }
                 req
             });
         });
@@ -563,7 +618,10 @@ mod tests {
         client.bind();
 
         let res = catch_unwind(AssertUnwindSafe(|| client.call(42)));
-        assert!(res.is_err(), "client.call must panic when channel is poisoned");
+        assert!(
+            res.is_err(),
+            "client.call must panic when channel is poisoned"
+        );
 
         h.join().unwrap();
     }
@@ -573,7 +631,7 @@ mod tests {
         // The two halves must sit on distinct cache lines.
         let ch: Box<Channel<u64, u64>> = Box::new(Channel::new());
         let base = (&*ch) as *const _ as usize;
-        let req_off  = (&ch.req_open)  as *const _ as usize - base;
+        let req_off = (&ch.req_open) as *const _ as usize - base;
         let resp_off = (&ch.resp_open) as *const _ as usize - base;
         assert_eq!(base % 64, 0, "Channel alloc must align to 64 B");
         assert!(resp_off >= req_off + 64,
@@ -582,7 +640,7 @@ mod tests {
         // Larger payload — same invariant.
         let ch2: Box<Channel<[u8; 256], [u8; 256]>> = Box::new(Channel::new());
         let base = (&*ch2) as *const _ as usize;
-        let req_off  = (&ch2.req_open)  as *const _ as usize - base;
+        let req_off = (&ch2.req_open) as *const _ as usize - base;
         let resp_off = (&ch2.resp_open) as *const _ as usize - base;
         assert_eq!(base % 64, 0);
         assert!(resp_off >= req_off + 64);
@@ -594,7 +652,9 @@ mod tests {
 
         struct Tracked(Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -620,8 +680,11 @@ mod tests {
             h.join().unwrap();
         }
 
-        assert_eq!(drops.load(Ordering::Relaxed), 0,
-            "poisoned channel must not drop uninit resp_slot");
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "poisoned channel must not drop uninit resp_slot"
+        );
     }
 
     // ── Async-mirror tests (feature = "tokio") ──────────────────────────

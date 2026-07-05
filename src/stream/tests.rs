@@ -23,10 +23,10 @@ fn send_recv_single_thread() {
 fn send_iter_returns_last_seq() {
     let s: Stream<u64> = Stream::new();
     let r = s.send_iter([10, 20, 30]).unwrap();
-    assert_eq!(r.seq(), 2);                 // last item, 3rd sent
+    assert_eq!(r.seq(), 2); // last item, 3rd sent
     assert_eq!(s.tail(), 3);
     assert!(s.send_iter(std::iter::empty::<u64>()).is_none());
-    assert_eq!(s.tail(), 3);                // unchanged
+    assert_eq!(s.tail(), 3); // unchanged
 }
 
 #[test]
@@ -44,7 +44,9 @@ fn cross_segment_boundary() {
     // SEG_SIZE = 256. Send enough to span 3 segments and back.
     let s: Stream<u64> = Stream::new();
     const N: u64 = 700;
-    for i in 0..N { s.send(i); }
+    for i in 0..N {
+        s.send(i);
+    }
     assert_eq!(s.tail(), N);
     for i in 0..N {
         assert_eq!(s.try_recv(), Some(i), "seq {} mismatched", i);
@@ -60,10 +62,14 @@ fn cross_thread_spsc_blocking() {
     let handle = thread::spawn(move || {
         s2.set_consumer(thread::current());
         let mut sum = 0u64;
-        for _ in 0..1000 { sum = sum.wrapping_add(s2.recv()); }
+        for _ in 0..1000 {
+            sum = sum.wrapping_add(s2.recv());
+        }
         sum
     });
-    for i in 0..1000u64 { s.send(i); }
+    for i in 0..1000u64 {
+        s.send(i);
+    }
     let sum = handle.join().unwrap();
     assert_eq!(sum, (0..1000u64).sum());
 }
@@ -85,7 +91,9 @@ fn cross_thread_recv_bulk() {
         }
         total
     });
-    for i in 0..500u64 { s.send(i); }
+    for i in 0..500u64 {
+        s.send(i);
+    }
     let total = handle.join().unwrap();
     assert_eq!(total, 500);
 }
@@ -98,10 +106,10 @@ fn receipt_is_delivered() {
     assert!(!r0.is_delivered(&s));
     assert!(!r1.is_delivered(&s));
     s.try_recv();
-    assert!( r0.is_delivered(&s));
+    assert!(r0.is_delivered(&s));
     assert!(!r1.is_delivered(&s));
     s.try_recv();
-    assert!( r1.is_delivered(&s));
+    assert!(r1.is_delivered(&s));
 }
 
 #[test]
@@ -119,7 +127,9 @@ fn receipt_seq_is_per_message() {
 fn drop_drains_remaining_payload() {
     struct Tracked(Arc<AtomicUsize>);
     impl Drop for Tracked {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     let drops = Arc::new(AtomicUsize::new(0));
@@ -130,7 +140,9 @@ fn drop_drains_remaining_payload() {
             s.send(Tracked(drops.clone()));
         }
         // Drain a few — those drops happen in try_recv.
-        for _ in 0..100 { drop(s.try_recv().unwrap()); }
+        for _ in 0..100 {
+            drop(s.try_recv().unwrap());
+        }
         // The remaining 500 must be dropped when `s` goes out of scope.
     }
     assert_eq!(drops.load(Ordering::Relaxed), 600);
@@ -145,7 +157,10 @@ fn box_payload_zero_copy() {
     s.send(b);
     let got = s.try_recv().unwrap();
     let got_raw = Box::as_ref(&got) as *const u64;
-    assert_eq!(raw, got_raw, "Box pointer must be preserved (zero-copy transfer)");
+    assert_eq!(
+        raw, got_raw,
+        "Box pointer must be preserved (zero-copy transfer)"
+    );
     assert_eq!(*got, 0xDEAD_BEEF);
 }
 
@@ -185,8 +200,10 @@ fn buffered_accumulates_until_threshold() {
 fn buffered_explicit_flush() {
     let stream = Arc::new(Stream::<u64>::new());
     let mut tx = stream.buffered(64);
-    for i in 0..10u64 { tx.send(i); }
-    assert_eq!(stream.tail(), 0);   // below threshold, nothing sent
+    for i in 0..10u64 {
+        tx.send(i);
+    }
+    assert_eq!(stream.tail(), 0); // below threshold, nothing sent
     let r = tx.flush().unwrap();
     assert_eq!(r.seq(), 9);
     assert_eq!(stream.tail(), 10);
@@ -201,8 +218,10 @@ fn buffered_drop_flushes_residue() {
     let stream = Arc::new(Stream::<u64>::new());
     {
         let mut tx = stream.buffered(64);
-        for i in 0..5u64 { tx.send(i); }
-        assert_eq!(stream.tail(), 0);   // nothing sent yet
+        for i in 0..5u64 {
+            tx.send(i);
+        }
+        assert_eq!(stream.tail(), 0); // nothing sent yet
     } // tx dropped → flush
     assert_eq!(stream.tail(), 5);
     for i in 0..5u64 {
@@ -214,14 +233,18 @@ fn buffered_drop_flushes_residue() {
 fn buffered_drop_with_payload_drops_remaining() {
     struct Tracked(Arc<AtomicUsize>);
     impl Drop for Tracked {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     let drops = Arc::new(AtomicUsize::new(0));
     let stream: Arc<Stream<Tracked>> = Arc::new(Stream::new());
     {
         let mut tx = stream.buffered(64);
-        for _ in 0..10 { tx.send(Tracked(drops.clone())); }
+        for _ in 0..10 {
+            tx.send(Tracked(drops.clone()));
+        }
         // 10 < 64 — items live in tx's local Vec.
         assert_eq!(drops.load(Ordering::Relaxed), 0);
     } // tx drops → flush sends 10 to stream; stream still alive.
@@ -238,12 +261,16 @@ fn buffered_cross_thread_with_consumer() {
     let consumer = thread::spawn(move || {
         s2.set_consumer(thread::current());
         let mut sum = 0u64;
-        for _ in 0..1000 { sum = sum.wrapping_add(s2.recv()); }
+        for _ in 0..1000 {
+            sum = sum.wrapping_add(s2.recv());
+        }
         sum
     });
     let mut tx = stream.buffered(64);
-    for i in 0..1000u64 { tx.send(i); }
-    drop(tx);   // flush residue (1000 % 64 = 40 final items)
+    for i in 0..1000u64 {
+        tx.send(i);
+    }
+    drop(tx); // flush residue (1000 % 64 = 40 final items)
     let sum = consumer.join().unwrap();
     assert_eq!(sum, (0..1000u64).sum());
 }
@@ -256,11 +283,11 @@ fn buffered_last_receipt_tracks_flushes() {
     tx.send(0);
     tx.send(1);
     tx.send(2);
-    tx.send(3);   // auto-flush at K=4
+    tx.send(3); // auto-flush at K=4
     assert_eq!(tx.last_receipt().unwrap().seq(), 3);
     tx.send(4);
     tx.send(5);
-    assert_eq!(tx.last_receipt().unwrap().seq(), 3);   // unchanged before flush
+    assert_eq!(tx.last_receipt().unwrap().seq(), 3); // unchanged before flush
     let r = tx.flush().unwrap();
     assert_eq!(r.seq(), 5);
     assert_eq!(tx.last_receipt().unwrap().seq(), 5);
@@ -276,8 +303,10 @@ fn buffered_threshold_zero_panics() {
 #[test]
 fn many_segments_then_drain_all() {
     let s: Stream<u64> = Stream::new();
-    const N: u64 = 5_000;       // ~20 segments
-    for i in 0..N { s.send(i); }
+    const N: u64 = 5_000; // ~20 segments
+    for i in 0..N {
+        s.send(i);
+    }
     let mut buf = Vec::with_capacity(N as usize);
     while !s.is_empty() {
         s.recv_bulk(&mut buf, 256);
@@ -346,14 +375,16 @@ fn recv_or_cancel_one_target_only() {
     let (id_tx_a, id_rx_a) = mpsc::channel::<crate::gate::WaiterId>();
     let (id_tx_b, id_rx_b) = mpsc::channel::<crate::gate::WaiterId>();
 
-    let sa = s_a.clone(); let la = life.clone();
+    let sa = s_a.clone();
+    let la = life.clone();
     let h_a = thread::spawn(move || {
         sa.set_consumer(thread::current());
         let id = la.register(thread::current());
         id_tx_a.send(id).unwrap();
         sa.recv_or_cancel(&la, id).map(|_| ()).map_err(|_| ())
     });
-    let sb = s_b.clone(); let lb = life.clone();
+    let sb = s_b.clone();
+    let lb = life.clone();
     let h_b = thread::spawn(move || {
         sb.set_consumer(thread::current());
         let id = lb.register(thread::current());
@@ -367,7 +398,7 @@ fn recv_or_cancel_one_target_only() {
 
     // Cancel only worker A by its captured id.
     life.cancel_one(id_a);
-    let _ = h_a.join().unwrap();   // Worker A returns Err.
+    let _ = h_a.join().unwrap(); // Worker A returns Err.
 
     // Worker B is still parked. Send data → returns Ok.
     s_b.send(42);

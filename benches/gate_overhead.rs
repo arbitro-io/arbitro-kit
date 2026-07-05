@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use arbitro_kit::gate::OneSignal;
 use arbitro_kit::waiter::{BlockingWaiter, ParkWaiter, Waiter};
-use crossbeam_channel::{bounded as cb_bounded};
+use crossbeam_channel::bounded as cb_bounded;
 use crossbeam_utils::sync::Parker as CbParker;
 
 // ─── `Signal` shim ─────────────────────────────────────────────────────────
@@ -55,18 +55,26 @@ use crossbeam_utils::sync::Parker as CbParker;
 // etc. so the migration didn't lose the measurement.
 struct Signal {
     waiter: ParkWaiter,
-    open:   AtomicBool,
+    open: AtomicBool,
 }
 
 impl Signal {
     fn new() -> Self {
-        Self { waiter: ParkWaiter::default(), open: AtomicBool::new(false) }
+        Self {
+            waiter: ParkWaiter::default(),
+            open: AtomicBool::new(false),
+        }
     }
     fn with_spin(spin: u32) -> Self {
-        Self { waiter: ParkWaiter::with_spin(spin), open: AtomicBool::new(false) }
+        Self {
+            waiter: ParkWaiter::with_spin(spin),
+            open: AtomicBool::new(false),
+        }
     }
     #[inline]
-    fn set_worker(&self, t: thread::Thread) { self.waiter.set_worker(t); }
+    fn set_worker(&self, t: thread::Thread) {
+        self.waiter.set_worker(t);
+    }
     /// Producer side: open the gate and wake the consumer if parked.
     #[inline]
     fn release(&self) {
@@ -80,16 +88,22 @@ impl Signal {
     }
     /// Consumer side: claim the open flag (close it for the next round).
     #[inline]
-    fn lock(&self) { self.open.store(false, Ordering::Relaxed); }
+    fn lock(&self) {
+        self.open.store(false, Ordering::Relaxed);
+    }
 }
 
 fn rounds() -> usize {
-    std::env::var("BENCH_ROUNDS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(1000)
+    std::env::var("BENCH_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000)
 }
 fn warmup() -> usize {
-    std::env::var("BENCH_WARMUP").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(100)
+    std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
 }
 
 /// Pre-fire sleep for the XT-parked scenario. 500µs is well beyond any
@@ -107,14 +121,18 @@ struct Row {
 
 fn print_scenario_header(name: &str) {
     println!("\n── {} ──", name);
-    println!("{:<32} {:>10} {:>10} {:>14}",
-             "primitive", "p50_ns", "p99_ns", "ops/sec");
+    println!(
+        "{:<32} {:>10} {:>10} {:>14}",
+        "primitive", "p50_ns", "p99_ns", "ops/sec"
+    );
     println!("{}", "─".repeat(70));
 }
 
 fn print_row(r: Row) {
-    println!("{:<32} {:>10} {:>10} {:>14}",
-             r.primitive, r.p50_ns, r.p99_ns, r.ops_per_sec);
+    println!(
+        "{:<32} {:>10} {:>10} {:>14}",
+        r.primitive, r.p50_ns, r.p99_ns, r.ops_per_sec
+    );
 }
 
 fn finish(primitive: &'static str, mut lats: Vec<u64>, elapsed_ns: u64) -> Row {
@@ -182,7 +200,9 @@ fn st_atomic_park() -> Row {
     let flag = AtomicBool::new(false);
     for _ in 0..warmup() {
         flag.store(true, Ordering::Release);
-        if !flag.load(Ordering::Acquire) { thread::park(); }
+        if !flag.load(Ordering::Acquire) {
+            thread::park();
+        }
         flag.store(false, Ordering::Release);
     }
     let mut lats = Vec::with_capacity(rounds());
@@ -190,7 +210,9 @@ fn st_atomic_park() -> Row {
     for _ in 0..rounds() {
         let t0 = Instant::now();
         flag.store(true, Ordering::Release);
-        if !flag.load(Ordering::Acquire) { thread::park(); }
+        if !flag.load(Ordering::Acquire) {
+            thread::park();
+        }
         flag.store(false, Ordering::Release);
         lats.push(t0.elapsed().as_nanos() as u64);
     }
@@ -202,19 +224,35 @@ fn st_condvar() -> Row {
     let m = Mutex::new(false);
     let cv = Condvar::new();
     for _ in 0..warmup() {
-        { let mut g = m.lock().unwrap(); *g = true; cv.notify_one(); }
-        { let mut g = m.lock().unwrap();
-          while !*g { g = cv.wait(g).unwrap(); }
-          *g = false; }
+        {
+            let mut g = m.lock().unwrap();
+            *g = true;
+            cv.notify_one();
+        }
+        {
+            let mut g = m.lock().unwrap();
+            while !*g {
+                g = cv.wait(g).unwrap();
+            }
+            *g = false;
+        }
     }
     let mut lats = Vec::with_capacity(rounds());
     let t_wall = Instant::now();
     for _ in 0..rounds() {
         let t0 = Instant::now();
-        { let mut g = m.lock().unwrap(); *g = true; cv.notify_one(); }
-        { let mut g = m.lock().unwrap();
-          while !*g { g = cv.wait(g).unwrap(); }
-          *g = false; }
+        {
+            let mut g = m.lock().unwrap();
+            *g = true;
+            cv.notify_one();
+        }
+        {
+            let mut g = m.lock().unwrap();
+            while !*g {
+                g = cv.wait(g).unwrap();
+            }
+            *g = false;
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     let el = t_wall.elapsed().as_nanos() as u64;
@@ -269,7 +307,9 @@ fn xt_hot_signal() -> Row {
             rn.store(seen, Ordering::Release);
         }
     });
-    while !ready.load(Ordering::Acquire) { thread::yield_now(); }
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
 
     let total = warmup() + rounds();
     let mut lats = Vec::with_capacity(rounds());
@@ -280,10 +320,14 @@ fn xt_hot_signal() -> Row {
         // Fire immediately — consumer is either in spin window or just parked
         // from the last round's `lock()`. Measures spin-catch path.
         let expect = i + 1;
-        if i == t_wall_start_round { t_wall = Instant::now(); }
+        if i == t_wall_start_round {
+            t_wall = Instant::now();
+        }
         let t0 = Instant::now();
         sig.release();
-        while round_nr.load(Ordering::Acquire) < expect { std::hint::spin_loop(); }
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
         if i >= t_wall_start_round {
             lats.push(t0.elapsed().as_nanos() as u64);
         }
@@ -305,14 +349,14 @@ fn xt_hot_atomic_spin() -> Row {
     let g = go.clone();
     let a = ack.clone();
     let d = done.clone();
-    let h = thread::spawn(move || {
-        loop {
-            while !g.load(Ordering::Acquire) {
-                if d.load(Ordering::Relaxed) { return; }
+    let h = thread::spawn(move || loop {
+        while !g.load(Ordering::Acquire) {
+            if d.load(Ordering::Relaxed) {
+                return;
             }
-            g.store(false, Ordering::Relaxed);
-            a.store(true, Ordering::Release);
         }
+        g.store(false, Ordering::Relaxed);
+        a.store(true, Ordering::Release);
     });
 
     let total = warmup() + rounds();
@@ -321,10 +365,14 @@ fn xt_hot_atomic_spin() -> Row {
     let mut t_wall = Instant::now();
 
     for i in 0..total {
-        if i == t_wall_start_round { t_wall = Instant::now(); }
+        if i == t_wall_start_round {
+            t_wall = Instant::now();
+        }
         let t0 = Instant::now();
         go.store(true, Ordering::Release);
-        while !ack.load(Ordering::Acquire) { std::hint::spin_loop(); }
+        while !ack.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         ack.store(false, Ordering::Relaxed);
         if i >= t_wall_start_round {
             lats.push(t0.elapsed().as_nanos() as u64);
@@ -356,14 +404,20 @@ fn xt_hot_atomic_park() -> Row {
             // Tight spin window (match Signal's TIGHT_SPIN = 64).
             let mut spun = 0;
             while !g.load(Ordering::Acquire) {
-                if d.load(Ordering::Relaxed) { return; }
+                if d.load(Ordering::Relaxed) {
+                    return;
+                }
                 spun += 1;
-                if spun >= 64 { break; }
+                if spun >= 64 {
+                    break;
+                }
             }
             if !g.load(Ordering::Acquire) {
                 p.store(true, Ordering::SeqCst);
                 while !g.load(Ordering::Acquire) {
-                    if d.load(Ordering::Relaxed) { return; }
+                    if d.load(Ordering::Relaxed) {
+                        return;
+                    }
                     thread::park();
                 }
                 p.store(false, Ordering::Relaxed);
@@ -374,7 +428,9 @@ fn xt_hot_atomic_park() -> Row {
     });
     // wait for worker registered
     loop {
-        if worker.lock().unwrap().is_some() { break; }
+        if worker.lock().unwrap().is_some() {
+            break;
+        }
         thread::yield_now();
     }
 
@@ -384,13 +440,19 @@ fn xt_hot_atomic_park() -> Row {
     let mut t_wall = Instant::now();
 
     for i in 0..total {
-        if i == t_wall_start_round { t_wall = Instant::now(); }
+        if i == t_wall_start_round {
+            t_wall = Instant::now();
+        }
         let t0 = Instant::now();
         go.store(true, Ordering::Release);
         if parked.load(Ordering::Relaxed) {
-            if let Some(t) = worker.lock().unwrap().as_ref() { t.unpark(); }
+            if let Some(t) = worker.lock().unwrap().as_ref() {
+                t.unpark();
+            }
         }
-        while !ack.load(Ordering::Acquire) { std::hint::spin_loop(); }
+        while !ack.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         ack.store(false, Ordering::Relaxed);
         if i >= t_wall_start_round {
             lats.push(t0.elapsed().as_nanos() as u64);
@@ -400,7 +462,9 @@ fn xt_hot_atomic_park() -> Row {
 
     done.store(true, Ordering::Relaxed);
     go.store(true, Ordering::Release);
-    if let Some(t) = worker.lock().unwrap().as_ref() { t.unpark(); }
+    if let Some(t) = worker.lock().unwrap().as_ref() {
+        t.unpark();
+    }
     h.join().unwrap();
     finish("AtomicBool + park/unpark", lats, el)
 }
@@ -412,18 +476,18 @@ fn xt_hot_condvar() -> Row {
 
     let st = state.clone();
     let d = done.clone();
-    let h = thread::spawn(move || {
-        loop {
-            let mut g = st.0.lock().unwrap();
-            while !g.0 {
-                if d.load(Ordering::Relaxed) { return; }
-                g = st.1.wait(g).unwrap();
+    let h = thread::spawn(move || loop {
+        let mut g = st.0.lock().unwrap();
+        while !g.0 {
+            if d.load(Ordering::Relaxed) {
+                return;
             }
-            g.0 = false;
-            g.1 = true;
-            drop(g);
-            st.2.notify_one();
+            g = st.1.wait(g).unwrap();
         }
+        g.0 = false;
+        g.1 = true;
+        drop(g);
+        st.2.notify_one();
     });
 
     let total = warmup() + rounds();
@@ -432,7 +496,9 @@ fn xt_hot_condvar() -> Row {
     let mut t_wall = Instant::now();
 
     for i in 0..total {
-        if i == t_wall_start_round { t_wall = Instant::now(); }
+        if i == t_wall_start_round {
+            t_wall = Instant::now();
+        }
         let t0 = Instant::now();
         {
             let mut g = state.0.lock().unwrap();
@@ -442,7 +508,9 @@ fn xt_hot_condvar() -> Row {
         }
         {
             let mut g = state.0.lock().unwrap();
-            while !g.1 { g = state.2.wait(g).unwrap(); }
+            while !g.1 {
+                g = state.2.wait(g).unwrap();
+            }
             g.1 = false;
         }
         if i >= t_wall_start_round {
@@ -471,12 +539,12 @@ fn xt_hot_cb_parker() -> Row {
     let done = Arc::new(AtomicBool::new(false));
 
     let d = done.clone();
-    let h = thread::spawn(move || {
-        loop {
-            p_go.park();
-            if d.load(Ordering::Relaxed) { return; }
-            u_ack.unpark();
+    let h = thread::spawn(move || loop {
+        p_go.park();
+        if d.load(Ordering::Relaxed) {
+            return;
         }
+        u_ack.unpark();
     });
 
     let total = warmup() + rounds();
@@ -485,7 +553,9 @@ fn xt_hot_cb_parker() -> Row {
     let mut t_wall = Instant::now();
 
     for i in 0..total {
-        if i == t_wall_start_round { t_wall = Instant::now(); }
+        if i == t_wall_start_round {
+            t_wall = Instant::now();
+        }
         let t0 = Instant::now();
         u_go.unpark();
         p_ack.park();
@@ -530,12 +600,16 @@ fn xt_parked_signal() -> Row {
             rn.store(seen, Ordering::Release);
         }
     });
-    while !ready.load(Ordering::Acquire) { thread::yield_now(); }
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
 
     // warmup: no pre-sleep, just shake out
     for i in 0..warmup() {
         sig.release();
-        while round_nr.load(Ordering::Acquire) < i + 1 { std::hint::spin_loop(); }
+        while round_nr.load(Ordering::Acquire) < i + 1 {
+            std::hint::spin_loop();
+        }
     }
 
     let mut lats = Vec::with_capacity(rounds());
@@ -545,7 +619,9 @@ fn xt_parked_signal() -> Row {
         let expect = warmup() + i + 1;
         let t0 = Instant::now();
         sig.release();
-        while round_nr.load(Ordering::Acquire) < expect { std::hint::spin_loop(); }
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     let el = t_wall.elapsed().as_nanos() as u64;
@@ -566,20 +642,22 @@ fn xt_parked_atomic_spin() -> Row {
     let g = go.clone();
     let a = ack.clone();
     let d = done.clone();
-    let h = thread::spawn(move || {
-        loop {
-            while !g.load(Ordering::Acquire) {
-                if d.load(Ordering::Relaxed) { return; }
-                std::hint::spin_loop();
+    let h = thread::spawn(move || loop {
+        while !g.load(Ordering::Acquire) {
+            if d.load(Ordering::Relaxed) {
+                return;
             }
-            g.store(false, Ordering::Relaxed);
-            a.store(true, Ordering::Release);
+            std::hint::spin_loop();
         }
+        g.store(false, Ordering::Relaxed);
+        a.store(true, Ordering::Release);
     });
 
     for _ in 0..warmup() {
         go.store(true, Ordering::Release);
-        while !ack.load(Ordering::Acquire) { std::hint::spin_loop(); }
+        while !ack.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         ack.store(false, Ordering::Relaxed);
     }
 
@@ -589,7 +667,9 @@ fn xt_parked_atomic_spin() -> Row {
         thread::sleep(XT_PARKED_PRE_SLEEP);
         let t0 = Instant::now();
         go.store(true, Ordering::Release);
-        while !ack.load(Ordering::Acquire) { std::hint::spin_loop(); }
+        while !ack.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         ack.store(false, Ordering::Relaxed);
         lats.push(t0.elapsed().as_nanos() as u64);
     }
@@ -616,10 +696,14 @@ fn xt_parked_atomic_park() -> Row {
     let h = thread::spawn(move || {
         *w.lock().unwrap() = Some(thread::current());
         loop {
-            if d.load(Ordering::Relaxed) { return; }
+            if d.load(Ordering::Relaxed) {
+                return;
+            }
             p.store(true, Ordering::SeqCst);
             while !g.load(Ordering::Acquire) {
-                if d.load(Ordering::Relaxed) { return; }
+                if d.load(Ordering::Relaxed) {
+                    return;
+                }
                 thread::park();
             }
             p.store(false, Ordering::Relaxed);
@@ -628,16 +712,22 @@ fn xt_parked_atomic_park() -> Row {
         }
     });
     loop {
-        if worker.lock().unwrap().is_some() { break; }
+        if worker.lock().unwrap().is_some() {
+            break;
+        }
         thread::yield_now();
     }
 
     for _ in 0..warmup() {
         go.store(true, Ordering::Release);
         if parked.load(Ordering::Relaxed) {
-            if let Some(t) = worker.lock().unwrap().as_ref() { t.unpark(); }
+            if let Some(t) = worker.lock().unwrap().as_ref() {
+                t.unpark();
+            }
         }
-        while !ack.load(Ordering::Acquire) { std::hint::spin_loop(); }
+        while !ack.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         ack.store(false, Ordering::Relaxed);
     }
 
@@ -648,9 +738,13 @@ fn xt_parked_atomic_park() -> Row {
         let t0 = Instant::now();
         go.store(true, Ordering::Release);
         if parked.load(Ordering::Relaxed) {
-            if let Some(t) = worker.lock().unwrap().as_ref() { t.unpark(); }
+            if let Some(t) = worker.lock().unwrap().as_ref() {
+                t.unpark();
+            }
         }
-        while !ack.load(Ordering::Acquire) { std::hint::spin_loop(); }
+        while !ack.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         ack.store(false, Ordering::Relaxed);
         lats.push(t0.elapsed().as_nanos() as u64);
     }
@@ -658,7 +752,9 @@ fn xt_parked_atomic_park() -> Row {
 
     done.store(true, Ordering::Relaxed);
     go.store(true, Ordering::Release);
-    if let Some(t) = worker.lock().unwrap().as_ref() { t.unpark(); }
+    if let Some(t) = worker.lock().unwrap().as_ref() {
+        t.unpark();
+    }
     h.join().unwrap();
     finish("AtomicBool + park/unpark", lats, el)
 }
@@ -669,26 +765,33 @@ fn xt_parked_condvar() -> Row {
 
     let st = state.clone();
     let d = done.clone();
-    let h = thread::spawn(move || {
-        loop {
-            let mut g = st.0.lock().unwrap();
-            while !g.0 {
-                if d.load(Ordering::Relaxed) { return; }
-                g = st.1.wait(g).unwrap();
+    let h = thread::spawn(move || loop {
+        let mut g = st.0.lock().unwrap();
+        while !g.0 {
+            if d.load(Ordering::Relaxed) {
+                return;
             }
-            g.0 = false;
-            g.1 = true;
-            drop(g);
-            st.2.notify_one();
+            g = st.1.wait(g).unwrap();
         }
+        g.0 = false;
+        g.1 = true;
+        drop(g);
+        st.2.notify_one();
     });
 
     for _ in 0..warmup() {
-        { let mut g = state.0.lock().unwrap(); g.0 = true; }
+        {
+            let mut g = state.0.lock().unwrap();
+            g.0 = true;
+        }
         state.1.notify_one();
-        { let mut g = state.0.lock().unwrap();
-          while !g.1 { g = state.2.wait(g).unwrap(); }
-          g.1 = false; }
+        {
+            let mut g = state.0.lock().unwrap();
+            while !g.1 {
+                g = state.2.wait(g).unwrap();
+            }
+            g.1 = false;
+        }
     }
 
     let mut lats = Vec::with_capacity(rounds());
@@ -704,7 +807,9 @@ fn xt_parked_condvar() -> Row {
         }
         {
             let mut g = state.0.lock().unwrap();
-            while !g.1 { g = state.2.wait(g).unwrap(); }
+            while !g.1 {
+                g = state.2.wait(g).unwrap();
+            }
             g.1 = false;
         }
         lats.push(t0.elapsed().as_nanos() as u64);
@@ -729,12 +834,12 @@ fn xt_parked_cb_parker() -> Row {
     let done = Arc::new(AtomicBool::new(false));
 
     let d = done.clone();
-    let h = thread::spawn(move || {
-        loop {
-            p_go.park();
-            if d.load(Ordering::Relaxed) { return; }
-            u_ack.unpark();
+    let h = thread::spawn(move || loop {
+        p_go.park();
+        if d.load(Ordering::Relaxed) {
+            return;
         }
+        u_ack.unpark();
     });
 
     for _ in 0..warmup() {
@@ -791,8 +896,12 @@ fn xt_hot_cb_channel() -> Row {
     let d = done.clone();
     let h = thread::spawn(move || {
         while rx_go.recv().is_ok() {
-            if d.load(Ordering::Relaxed) { return; }
-            if tx_ack.send(()).is_err() { return; }
+            if d.load(Ordering::Relaxed) {
+                return;
+            }
+            if tx_ack.send(()).is_err() {
+                return;
+            }
         }
     });
 
@@ -825,8 +934,12 @@ fn xt_parked_cb_channel() -> Row {
     let d = done.clone();
     let h = thread::spawn(move || {
         while rx_go.recv().is_ok() {
-            if d.load(Ordering::Relaxed) { return; }
-            if tx_ack.send(()).is_err() { return; }
+            if d.load(Ordering::Relaxed) {
+                return;
+            }
+            if tx_ack.send(()).is_err() {
+                return;
+            }
         }
     });
 
@@ -918,11 +1031,15 @@ fn xt_hot_one_signal() -> Row {
     let t_wall_start = warmup();
     let mut t_wall = Instant::now();
     for (i, tx) in senders.into_iter().enumerate() {
-        if i == t_wall_start { t_wall = Instant::now(); }
+        if i == t_wall_start {
+            t_wall = Instant::now();
+        }
         let expect = i + 1;
         let t0 = Instant::now();
         tx.release();
-        while round_nr.load(Ordering::Acquire) < expect { std::hint::spin_loop(); }
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
         if i >= t_wall_start {
             lats.push(t0.elapsed().as_nanos() as u64);
         }
@@ -960,7 +1077,9 @@ fn xt_parked_one_signal() -> Row {
     for i in 0..warmup() {
         let tx = iter.next().unwrap();
         tx.release();
-        while round_nr.load(Ordering::Acquire) < i + 1 { std::hint::spin_loop(); }
+        while round_nr.load(Ordering::Acquire) < i + 1 {
+            std::hint::spin_loop();
+        }
     }
 
     let mut lats = Vec::with_capacity(rounds());
@@ -970,7 +1089,9 @@ fn xt_parked_one_signal() -> Row {
         let expect = warmup() + k + 1;
         let t0 = Instant::now();
         tx.release();
-        while round_nr.load(Ordering::Acquire) < expect { std::hint::spin_loop(); }
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     let el = t_wall.elapsed().as_nanos() as u64;
@@ -983,8 +1104,12 @@ fn xt_parked_one_signal() -> Row {
 
 fn main() {
     println!("=== arbitro-kit gate_overhead (wake-primitive comparison) ===");
-    println!("rounds={}  warmup={}  xt_parked_pre_sleep={}µs",
-             rounds(), warmup(), XT_PARKED_PRE_SLEEP.as_micros());
+    println!(
+        "rounds={}  warmup={}  xt_parked_pre_sleep={}µs",
+        rounds(),
+        warmup(),
+        XT_PARKED_PRE_SLEEP.as_micros()
+    );
 
     print_scenario_header("Single-thread (release + acquire same thread)");
     print_row(st_signal());

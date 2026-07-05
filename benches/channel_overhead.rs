@@ -37,12 +37,16 @@ use std::time::Instant;
 use arbitro_kit::slot::Channel;
 
 fn rounds() -> usize {
-    std::env::var("BENCH_ROUNDS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(1000)
+    std::env::var("BENCH_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000)
 }
 fn warmup() -> usize {
-    std::env::var("BENCH_WARMUP").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(100)
+    std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
 }
 
 /// Cap rounds for big-payload scenarios so the total bench stays inside the
@@ -51,11 +55,12 @@ fn warmup() -> usize {
 fn rounds_for_size(bytes: usize) -> usize {
     let base = rounds();
     match bytes {
-        0..=4_096         => base,
-        4_097..=65_536    => base / 2,
+        0..=4_096 => base,
+        4_097..=65_536 => base / 2,
         65_537..=1_048_576 => base / 10,
-        _                 => base / 50,    // 16 MB → base/50 = 20 for rounds=1000
-    }.max(20)
+        _ => base / 50, // 16 MB → base/50 = 20 for rounds=1000
+    }
+    .max(20)
 }
 
 struct Row {
@@ -73,20 +78,28 @@ fn print_scenario_header(name: &str, payload_bytes: usize) {
         let sz = human(payload_bytes);
         println!("\n── {} (payload = {}) ──", name, sz);
     }
-    println!("{:<20} {:>10} {:>10} {:>14} {:>14}",
-             "primitive", "p50_ns", "p99_ns", "ops/sec", "MB/s");
+    println!(
+        "{:<20} {:>10} {:>10} {:>14} {:>14}",
+        "primitive", "p50_ns", "p99_ns", "ops/sec", "MB/s"
+    );
     println!("{}", "─".repeat(72));
 }
 
 fn human(b: usize) -> String {
-    if b >= 1 << 20 { format!("{} MB", b >> 20) }
-    else if b >= 1 << 10 { format!("{} KB", b >> 10) }
-    else { format!("{} B", b) }
+    if b >= 1 << 20 {
+        format!("{} MB", b >> 20)
+    } else if b >= 1 << 10 {
+        format!("{} KB", b >> 10)
+    } else {
+        format!("{} B", b)
+    }
 }
 
 fn print_row(r: Row) {
-    println!("{:<20} {:>10} {:>10} {:>14} {:>14.1}",
-             r.primitive, r.p50_ns, r.p99_ns, r.ops_per_sec, r.mb_per_sec);
+    println!(
+        "{:<20} {:>10} {:>10} {:>14} {:>14.1}",
+        r.primitive, r.p50_ns, r.p99_ns, r.ops_per_sec, r.mb_per_sec
+    );
 }
 
 /// Compute ops/sec and MB/s from latencies + total elapsed.
@@ -113,11 +126,7 @@ fn finish(
 // CROSS-THREAD runners
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn xt_channel<Req, Resp, MkReq, Handler>(
-    payload_bytes: usize,
-    mk: MkReq,
-    handler: Handler,
-) -> Row
+fn xt_channel<Req, Resp, MkReq, Handler>(payload_bytes: usize, mk: MkReq, handler: Handler) -> Row
 where
     Req: Send + 'static,
     Resp: Send + 'static,
@@ -139,10 +148,14 @@ where
         }
     });
 
-    while !ready.load(Ordering::Acquire) { thread::yield_now(); }
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
     client.bind();
 
-    for i in 0..warmup() { let _ = client.call(mk(i as u64)); }
+    for i in 0..warmup() {
+        let _ = client.call(mk(i as u64));
+    }
 
     let mut lats = Vec::with_capacity(rounds);
     let t_wall = Instant::now();
@@ -161,11 +174,7 @@ where
     finish("Channel", lats, elapsed_ns, payload_bytes)
 }
 
-fn xt_cbpair<Req, Resp, MkReq, Handler>(
-    payload_bytes: usize,
-    mk: MkReq,
-    handler: Handler,
-) -> Row
+fn xt_cbpair<Req, Resp, MkReq, Handler>(payload_bytes: usize, mk: MkReq, handler: Handler) -> Row
 where
     Req: Send + 'static,
     Resp: Send + 'static,
@@ -179,7 +188,9 @@ where
     let h = thread::spawn(move || {
         while let Ok(req) = rx_req.recv() {
             let resp = handler(req);
-            if tx_resp.send(resp).is_err() { return; }
+            if tx_resp.send(resp).is_err() {
+                return;
+            }
         }
     });
 
@@ -205,11 +216,7 @@ where
     finish("crossbeam pair", lats, elapsed_ns, payload_bytes)
 }
 
-fn xt_mpscpair<Req, Resp, MkReq, Handler>(
-    payload_bytes: usize,
-    mk: MkReq,
-    handler: Handler,
-) -> Row
+fn xt_mpscpair<Req, Resp, MkReq, Handler>(payload_bytes: usize, mk: MkReq, handler: Handler) -> Row
 where
     Req: Send + 'static,
     Resp: Send + 'static,
@@ -223,7 +230,9 @@ where
     let h = thread::spawn(move || {
         while let Ok(req) = rx_req.recv() {
             let resp = handler(req);
-            if tx_resp.send(resp).is_err() { return; }
+            if tx_resp.send(resp).is_err() {
+                return;
+            }
         }
     });
 
@@ -309,8 +318,7 @@ fn compare<Req, Resp, MkReq, Handler>(
     payload_bytes: usize,
     mk: MkReq,
     handler: Handler,
-)
-where
+) where
     Req: Send + 'static,
     Resp: Send + 'static,
     MkReq: Fn(u64) -> Req + Clone,
@@ -334,11 +342,15 @@ fn main() {
     // to give a reference for their send+recv mutex overhead without
     // cross-core coherence traffic.
     println!("\n── SINGLE-THREAD (u64 by-value, payload = 8 B) ──");
-    println!("{:<20} {:>10} {:>10} {:>14} {:>14}",
-             "primitive", "p50_ns", "p99_ns", "ops/sec", "MB/s");
+    println!(
+        "{:<20} {:>10} {:>10} {:>14} {:>14}",
+        "primitive", "p50_ns", "p99_ns", "ops/sec", "MB/s"
+    );
     println!("{}", "─".repeat(72));
-    println!("{:<20} {:>10} {:>10} {:>14} {:>14}",
-             "Channel", "—", "—", "—", "(cross-thread by design)");
+    println!(
+        "{:<20} {:>10} {:>10} {:>14} {:>14}",
+        "Channel", "—", "—", "—", "(cross-thread by design)"
+    );
     print_row(st_cbpair_u64());
     print_row(st_mpscpair_u64());
 
@@ -353,29 +365,55 @@ fn main() {
 
     // Small by-value
     compare::<u64, u64, _, _>("XT u64 by-value", 8, |i| i, |r| r.wrapping_add(1));
-    compare::<[u8; 64], [u8; 64], _, _>("XT [u8; 64] by-value", 64,
-        |i| { let mut a = [0u8; 64]; a[0] = i as u8; a },
+    compare::<[u8; 64], [u8; 64], _, _>(
+        "XT [u8; 64] by-value",
+        64,
+        |i| {
+            let mut a = [0u8; 64];
+            a[0] = i as u8;
+            a
+        },
         |r| r,
     );
-    compare::<[u8; 256], [u8; 256], _, _>("XT [u8; 256] by-value", 256,
-        |i| { let mut a = [0u8; 256]; a[0] = i as u8; a },
+    compare::<[u8; 256], [u8; 256], _, _>(
+        "XT [u8; 256] by-value",
+        256,
+        |i| {
+            let mut a = [0u8; 256];
+            a[0] = i as u8;
+            a
+        },
         |r| r,
     );
 
     // Medium by-value
-    compare::<[u8; 1024], [u8; 1024], _, _>("XT [u8; 1024] by-value", 1024,
-        |i| { let mut a = [0u8; 1024]; a[0] = i as u8; a },
+    compare::<[u8; 1024], [u8; 1024], _, _>(
+        "XT [u8; 1024] by-value",
+        1024,
+        |i| {
+            let mut a = [0u8; 1024];
+            a[0] = i as u8;
+            a
+        },
         |r| r,
     );
-    compare::<[u8; 4096], [u8; 4096], _, _>("XT [u8; 4096] by-value", 4096,
-        |i| { let mut a = [0u8; 4096]; a[0] = i as u8; a },
+    compare::<[u8; 4096], [u8; 4096], _, _>(
+        "XT [u8; 4096] by-value",
+        4096,
+        |i| {
+            let mut a = [0u8; 4096];
+            a[0] = i as u8;
+            a
+        },
         |r| r,
     );
 
     // Ownership transfer Vec<u8> (zero-copy)
     for size in [4 * 1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
         let sz = size;
-        compare::<Vec<u8>, Vec<u8>, _, _>("XT Vec<u8> ownership transfer", sz,
+        compare::<Vec<u8>, Vec<u8>, _, _>(
+            "XT Vec<u8> ownership transfer",
+            sz,
             move |i| {
                 let mut v = vec![0u8; sz];
                 v[0] = i as u8;
@@ -390,7 +428,9 @@ fn main() {
         let sz = size;
         let shared: Arc<Vec<u8>> = Arc::new(vec![0xA5; sz]);
         let mk_shared = shared.clone();
-        compare::<Arc<Vec<u8>>, Arc<Vec<u8>>, _, _>("XT Arc<Vec<u8>> shared", sz,
+        compare::<Arc<Vec<u8>>, Arc<Vec<u8>>, _, _>(
+            "XT Arc<Vec<u8>> shared",
+            sz,
             move |_| mk_shared.clone(),
             |r| r,
         );

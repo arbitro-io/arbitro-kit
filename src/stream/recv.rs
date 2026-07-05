@@ -34,7 +34,9 @@ impl<T, W: Waiter> Stream<T, W> {
         // every `SEG_SIZE` items at the wrap-around.
         loop {
             let seg_ref = unsafe { &*seg };
-            if seg_ref.contains(head) { break; }
+            if seg_ref.contains(head) {
+                break;
+            }
             seg = self.advance_seg(seg);
         }
 
@@ -60,7 +62,10 @@ impl<T, W: Waiter> Stream<T, W> {
         let mut drained = 0;
         for _ in 0..max {
             match self.try_recv() {
-                Some(v) => { buf.push(v); drained += 1; }
+                Some(v) => {
+                    buf.push(v);
+                    drained += 1;
+                }
                 None => break,
             }
         }
@@ -89,7 +94,9 @@ impl<T, W: Waiter> Stream<T, W> {
         // Safety: we are the only consumer. `cur_seg` was allocated
         // by the producer via `Box::into_raw` (in `Segment::new_boxed`
         // or `Stream::new`); we now own it exclusively.
-        unsafe { drop(Box::from_raw(cur_seg)); }
+        unsafe {
+            drop(Box::from_raw(cur_seg));
+        }
         next
     }
 }
@@ -105,10 +112,11 @@ impl<T, W: BlockingWaiter> Stream<T, W> {
     #[inline]
     pub fn recv(&self) -> T {
         loop {
-            if let Some(v) = self.try_recv() { return v; }
+            if let Some(v) = self.try_recv() {
+                return v;
+            }
             self.not_empty.wait_until(|| {
-                self.head_pos.load(Ordering::Relaxed)
-                    < self.tail_pos.load(Ordering::Acquire)
+                self.head_pos.load(Ordering::Relaxed) < self.tail_pos.load(Ordering::Acquire)
             });
         }
     }
@@ -117,18 +125,17 @@ impl<T, W: BlockingWaiter> Stream<T, W> {
     /// the lifeline cancels this waiter while we are parked or before
     /// we enter park. Otherwise behaves exactly like [`Stream::recv`].
     #[inline]
-    pub fn recv_or_cancel(
-        &self,
-        life: &Lifeline,
-        id: WaiterId,
-    ) -> Result<T, Cancelled> {
+    pub fn recv_or_cancel(&self, life: &Lifeline, id: WaiterId) -> Result<T, Cancelled> {
         loop {
-            if let Some(v) = self.try_recv() { return Ok(v); }
-            if life.is_cancelled(id)        { return Err(Cancelled); }
+            if let Some(v) = self.try_recv() {
+                return Ok(v);
+            }
+            if life.is_cancelled(id) {
+                return Err(Cancelled);
+            }
 
             self.not_empty.wait_until(|| {
-                self.head_pos.load(Ordering::Relaxed)
-                    < self.tail_pos.load(Ordering::Acquire)
+                self.head_pos.load(Ordering::Relaxed) < self.tail_pos.load(Ordering::Acquire)
                     || life.is_cancelled(id)
             });
         }

@@ -155,8 +155,7 @@ impl<W: crate::waiter::AsyncWaiter + 'static> Receiver<W> {
     /// allocation per acquire is amortised against a syscall-class wake.
     pub fn acquire_async(
         self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AcquireError>> + Send>>
-    {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AcquireError>> + Send>> {
         Box::pin(do_acquire_async(self.inner))
     }
 }
@@ -171,10 +170,11 @@ async fn do_acquire_async<W: crate::waiter::AsyncWaiter + 'static>(
     // auto-`Send`/`'static` inference and rust-lang/rust#100013 rejects the
     // resulting `Pin<Box<dyn Future + Send + 'static>>` coercion at the
     // call site (kit's only async path that returns a boxed dyn future).
-    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        Box::pin(inner.waiter.wait_until(move || {
-            inner_for_pred.state.load(Ordering::Acquire) != STATE_PENDING
-        }));
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(
+        inner
+            .waiter
+            .wait_until(move || inner_for_pred.state.load(Ordering::Acquire) != STATE_PENDING),
+    );
     fut.await;
     match inner.state.load(Ordering::Acquire) {
         STATE_RELEASED => Ok(()),

@@ -50,6 +50,6 @@ pub mod slot;
 pub mod stream;
 pub mod waiter;
 
-pub use waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter, Waiter};
 #[cfg(feature = "tokio")]
 pub use waiter::NotifyWaiter;
+pub use waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter, Waiter};

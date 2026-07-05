@@ -27,7 +27,9 @@ fn pct(samples: &mut Vec<f64>, p: f64) -> f64 {
 }
 
 fn collect<F: FnMut() -> f64>(mut f: F) -> (f64, f64) {
-    for _ in 0..WARMUP { let _ = f(); }
+    for _ in 0..WARMUP {
+        let _ = f();
+    }
     let mut s: Vec<f64> = (0..ROUNDS).map(|_| f()).collect();
     let min = s.iter().cloned().fold(f64::INFINITY, f64::min);
     let p50 = pct(&mut s, 0.50);
@@ -35,8 +37,13 @@ fn collect<F: FnMut() -> f64>(mut f: F) -> (f64, f64) {
 }
 
 fn row(name: &str, min: f64, p50: f64) {
-    println!("{:<48} {:>10.1} {:>10.1} {:>14.0}",
-             name, min, p50, 1e9 / min);
+    println!(
+        "{:<48} {:>10.1} {:>10.1} {:>14.0}",
+        name,
+        min,
+        p50,
+        1e9 / min
+    );
 }
 
 // ─── A. Hot-path overhead: recv() vs recv_or_cancel() ───────────────────
@@ -50,10 +57,14 @@ fn xt_recv_baseline() -> f64 {
     let s2 = s.clone();
     let h = thread::spawn(move || {
         s2.set_consumer(thread::current());
-        for _ in 0..N_MSGS { let _ = s2.recv(); }
+        for _ in 0..N_MSGS {
+            let _ = s2.recv();
+        }
     });
     let t0 = Instant::now();
-    for i in 0..N_MSGS as u64 { s.send(i); }
+    for i in 0..N_MSGS as u64 {
+        s.send(i);
+    }
     h.join().unwrap();
     t0.elapsed().as_nanos() as f64 / N_MSGS as f64
 }
@@ -71,7 +82,9 @@ fn xt_recv_or_cancel() -> f64 {
         }
     });
     let t0 = Instant::now();
-    for i in 0..N_MSGS as u64 { s.send(i); }
+    for i in 0..N_MSGS as u64 {
+        s.send(i);
+    }
     h.join().unwrap();
     t0.elapsed().as_nanos() as f64 / N_MSGS as f64
 }
@@ -88,7 +101,9 @@ fn st_is_cancelled() -> f64 {
     let t0 = Instant::now();
     let mut hits = 0u64;
     for _ in 0..n {
-        if life.is_cancelled(id) { hits += 1; }
+        if life.is_cancelled(id) {
+            hits += 1;
+        }
     }
     let ns = t0.elapsed().as_nanos() as f64;
     std::hint::black_box(hits);
@@ -159,40 +174,55 @@ fn cancel_all_latency_n_ns(n_workers: usize) -> f64 {
 
     let t0 = Instant::now();
     life.cancel_all();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     t0.elapsed().as_nanos() as f64
 }
 
 fn main() {
     println!("=== Lifeline overhead bench ===");
-    println!("{} msgs / 1M is_cancelled() iters; best-of-{} (after {} warmup).\n",
-             N_MSGS, ROUNDS, WARMUP);
-    println!("{:<48} {:>10} {:>10} {:>14}",
-             "scenario", "min ns", "p50 ns", "ops/sec (min)");
+    println!(
+        "{} msgs / 1M is_cancelled() iters; best-of-{} (after {} warmup).\n",
+        N_MSGS, ROUNDS, WARMUP
+    );
+    println!(
+        "{:<48} {:>10} {:>10} {:>14}",
+        "scenario", "min ns", "p50 ns", "ops/sec (min)"
+    );
     println!("{}", "─".repeat(86));
 
     println!("\n── A. Hot-path: recv() vs recv_or_cancel() ──");
     let (m, p) = collect(xt_recv_baseline);
-    row("Stream::recv() baseline",                         m, p);
+    row("Stream::recv() baseline", m, p);
     let (m, p) = collect(xt_recv_or_cancel);
-    row("Stream::recv_or_cancel(life, id)",                m, p);
+    row("Stream::recv_or_cancel(life, id)", m, p);
 
     println!("\n── B. Lifeline::is_cancelled hot loop (single-thread) ──");
     let (m, p) = collect(st_is_cancelled);
-    row("Lifeline::is_cancelled per call",                 m, p);
+    row("Lifeline::is_cancelled per call", m, p);
 
     println!("\n── C. Cancel latency (parked worker → observes) ──");
     // For latency, samples are noisier; smaller round count.
     let mut samples: Vec<f64> = (0..10).map(|_| cancel_one_latency_ns()).collect();
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    println!("cancel_one → 1 worker join: min={:.0} ns, p50={:.0} ns, max={:.0} ns",
-             samples[0], samples[samples.len() / 2], samples[samples.len() - 1]);
+    println!(
+        "cancel_one → 1 worker join: min={:.0} ns, p50={:.0} ns, max={:.0} ns",
+        samples[0],
+        samples[samples.len() / 2],
+        samples[samples.len() - 1]
+    );
 
     for &n in &[4usize, 16, 32] {
         let mut samples: Vec<f64> = (0..10).map(|_| cancel_all_latency_n_ns(n)).collect();
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("cancel_all → {:>2} workers join: min={:.0} ns, p50={:.0} ns, max={:.0} ns",
-                 n, samples[0], samples[samples.len() / 2], samples[samples.len() - 1]);
+        println!(
+            "cancel_all → {:>2} workers join: min={:.0} ns, p50={:.0} ns, max={:.0} ns",
+            n,
+            samples[0],
+            samples[samples.len() / 2],
+            samples[samples.len() - 1]
+        );
     }
 
     println!("\nDone.");

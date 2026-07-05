@@ -25,15 +25,21 @@ use arbitro_kit::route::{Hub, Shutdown};
 const BATCH: usize = 1000;
 
 fn rounds() -> usize {
-    std::env::var("BENCH_ROUNDS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(500)
+    std::env::var("BENCH_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500)
 }
-fn warmup_batches() -> usize { 10 }
+fn warmup_batches() -> usize {
+    10
+}
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
-    println!("{:<30} {:>12} {:>12} {:>12} {:>14}",
-             "variant", "mean_ns/op", "p50_ns/op", "p99_ns/op", "ops/sec");
+    println!(
+        "{:<30} {:>12} {:>12} {:>12} {:>14}",
+        "variant", "mean_ns/op", "p50_ns/op", "p99_ns/op", "ops/sec"
+    );
     println!("{}", "─".repeat(82));
 }
 fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
@@ -44,8 +50,10 @@ fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
     let mean = total_elapsed_ns as f64 / total_ops as f64;
     let p50 = batch_ns[samples / 2] as f64 / BATCH as f64;
     let p99 = batch_ns[samples * 99 / 100] as f64 / BATCH as f64;
-    println!("{:<30} {:>12.2} {:>12.2} {:>12.2} {:>14}",
-             name, mean, p50, p99, ops as u64);
+    println!(
+        "{:<30} {:>12.2} {:>12.2} {:>12.2} {:>14}",
+        name, mean, p50, p99, ops as u64
+    );
 }
 
 // ── Baseline: raw SignalSet::release on a single bit, single-thread ──────
@@ -61,7 +69,9 @@ fn bench_baseline_signalset_release() {
             set.lock(id); // keep cost symmetric with hub's bit cycling
         }
     };
-    for _ in 0..warmup_batches() { do_batch(); }
+    for _ in 0..warmup_batches() {
+        do_batch();
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -71,7 +81,11 @@ fn bench_baseline_signalset_release() {
         do_batch();
         lats.push(t0.elapsed().as_nanos() as u64);
     }
-    row("signalset_release+lock (raw)", lats, t_wall.elapsed().as_nanos() as u64);
+    row(
+        "signalset_release+lock (raw)",
+        lats,
+        t_wall.elapsed().as_nanos() as u64,
+    );
 }
 
 // ── Hub send only, no drain thread running ──────────────────────────────
@@ -91,7 +105,9 @@ fn bench_hub_send_no_drain() {
             drain.try_recv_batch(|_, _, _reply| { /* drop reply */ });
         }
     };
-    for b in 0..warmup_batches() { do_batch((b * BATCH) as u64); }
+    for b in 0..warmup_batches() {
+        do_batch((b * BATCH) as u64);
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -101,7 +117,11 @@ fn bench_hub_send_no_drain() {
         do_batch((b * BATCH) as u64);
         lats.push(t0.elapsed().as_nanos() as u64);
     }
-    row("hub_send + local drain", lats, t_wall.elapsed().as_nanos() as u64);
+    row(
+        "hub_send + local drain",
+        lats,
+        t_wall.elapsed().as_nanos() as u64,
+    );
 }
 
 // ── Hub full RTT, one port, cross-thread ────────────────────────────────
@@ -113,7 +133,9 @@ fn bench_hub_rtt_1port() {
     let h = thread::spawn(move || {
         drain.bind();
         loop {
-            match drain.recv_batch(|_, msg, reply| { reply.send(msg.wrapping_add(1)); }) {
+            match drain.recv_batch(|_, msg, reply| {
+                reply.send(msg.wrapping_add(1));
+            }) {
                 Ok(()) => continue,
                 Err(Shutdown) => break,
             }
@@ -122,7 +144,9 @@ fn bench_hub_rtt_1port() {
 
     p.bind();
     for i in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { let _ = p.call(k + i as u64); }
+        for k in 0..BATCH as u64 {
+            let _ = p.call(k + i as u64);
+        }
     }
 
     let n = rounds();
@@ -130,10 +154,16 @@ fn bench_hub_rtt_1port() {
     let t_wall = Instant::now();
     for b in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { std::hint::black_box(p.call(k + b as u64)); }
+        for k in 0..BATCH as u64 {
+            std::hint::black_box(p.call(k + b as u64));
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
-    row("hub_rtt_1port (xthread)", lats, t_wall.elapsed().as_nanos() as u64);
+    row(
+        "hub_rtt_1port (xthread)",
+        lats,
+        t_wall.elapsed().as_nanos() as u64,
+    );
 
     shutdown.signal();
     h.join().unwrap();
@@ -148,34 +178,45 @@ fn bench_hub_rtt_4ports() {
     let h = thread::spawn(move || {
         drain.bind();
         loop {
-            match drain.recv_batch(|_, msg, reply| { reply.send(msg.wrapping_add(1)); }) {
+            match drain.recv_batch(|_, msg, reply| {
+                reply.send(msg.wrapping_add(1));
+            }) {
                 Ok(()) => continue,
                 Err(Shutdown) => break,
             }
         }
     });
 
-    let n = rounds();  // per-thread batches
+    let n = rounds(); // per-thread batches
     let per_thread_ops = n * BATCH;
     let stop = Arc::new(AtomicBool::new(false));
 
     let t_wall = Instant::now();
-    let handles: Vec<_> = ports.into_iter().map(|p| {
-        let stop = stop.clone();
-        thread::spawn(move || {
-            p.bind();
-            // warmup
-            for i in 0..warmup_batches() {
-                for k in 0..BATCH as u64 { let _ = p.call(k + i as u64); }
-            }
-            let t0 = Instant::now();
-            for b in 0..n {
-                for k in 0..BATCH as u64 { std::hint::black_box(p.call(k + b as u64)); }
-                if stop.load(Ordering::Relaxed) { break; }
-            }
-            t0.elapsed().as_nanos() as u64
+    let handles: Vec<_> = ports
+        .into_iter()
+        .map(|p| {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                p.bind();
+                // warmup
+                for i in 0..warmup_batches() {
+                    for k in 0..BATCH as u64 {
+                        let _ = p.call(k + i as u64);
+                    }
+                }
+                let t0 = Instant::now();
+                for b in 0..n {
+                    for k in 0..BATCH as u64 {
+                        std::hint::black_box(p.call(k + b as u64));
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                t0.elapsed().as_nanos() as u64
+            })
         })
-    }).collect();
+        .collect();
 
     let per_thread_ns: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let wall_ns = t_wall.elapsed().as_nanos() as u64;
@@ -185,8 +226,7 @@ fn bench_hub_rtt_4ports() {
 
     let total_ops = per_thread_ops * 4;
     let ops_aggregate = (total_ops as f64) / (wall_ns as f64 / 1e9);
-    let ns_per_op_each = per_thread_ns.iter().sum::<u64>() as f64
-        / (per_thread_ops as f64 * 4.0);
+    let ns_per_op_each = per_thread_ns.iter().sum::<u64>() as f64 / (per_thread_ops as f64 * 4.0);
 
     println!("\n── 4-port aggregate ──");
     println!("per-thread mean ns/op : {:.2}", ns_per_op_each);

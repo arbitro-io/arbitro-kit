@@ -45,19 +45,19 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::waiter::{ParkWaiter, Waiter};
 #[cfg(feature = "tokio")]
 use crate::waiter::AsyncWaiter;
 use crate::waiter::BlockingWaiter;
+use crate::waiter::{ParkWaiter, Waiter};
 
 /// State of the OneShot's slot. Transitions are one-way:
 /// `EMPTY` → `FULL` (sender sent), or `EMPTY` → `CLOSED` (sender dropped).
 /// Once `FULL`, a successful `try_take` swaps to `TAKEN` so subsequent
 /// reads return `Closed` instead of double-reading the slot.
-const STATE_EMPTY:  u8 = 0;
-const STATE_FULL:   u8 = 1;
+const STATE_EMPTY: u8 = 0;
+const STATE_FULL: u8 = 1;
 const STATE_CLOSED: u8 = 2;
-const STATE_TAKEN:  u8 = 3;
+const STATE_TAKEN: u8 = 3;
 
 /// Error returned when the [`Sender`] dropped without sending, or when
 /// the value has already been taken.
@@ -67,14 +67,14 @@ pub struct Closed;
 #[repr(C, align(64))]
 struct Inner<T: Send, W: Waiter> {
     /// State machine: EMPTY / FULL / CLOSED / TAKEN.
-    state:  AtomicU8,
+    state: AtomicU8,
     /// Wait/wake backend. The trait is generic — `ParkWaiter` for sync
     /// OS-thread, `NotifyWaiter` for tokio, future impls for io_uring.
     waiter: W,
     /// Slot storage. Written once by the sender on `send`; read once by
     /// the receiver on a successful FULL→TAKEN CAS. Drop of `Inner`
     /// runs `assume_init_drop` if `state == FULL` (no one read it).
-    slot:   UnsafeCell<MaybeUninit<T>>,
+    slot: UnsafeCell<MaybeUninit<T>>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -90,7 +90,9 @@ impl<T: Send, W: Waiter> Drop for Inner<T, W> {
         // If a value was sent but never received, drop it.
         if self.state.load(Ordering::Acquire) == STATE_FULL {
             // Safety: state == FULL ⇒ slot is initialised and untaken.
-            unsafe { (*self.slot.get()).assume_init_drop(); }
+            unsafe {
+                (*self.slot.get()).assume_init_drop();
+            }
         }
     }
 }
@@ -107,13 +109,16 @@ impl<T: Send, W: Waiter> OneShot<T, W> {
     #[inline]
     pub fn new() -> (Sender<T, W>, Receiver<T, W>) {
         let inner = Arc::new(Inner {
-            state:  AtomicU8::new(STATE_EMPTY),
+            state: AtomicU8::new(STATE_EMPTY),
             waiter: W::default(),
-            slot:   UnsafeCell::new(MaybeUninit::uninit()),
+            slot: UnsafeCell::new(MaybeUninit::uninit()),
             _marker: PhantomData,
         });
         (
-            Sender { inner: inner.clone(), sent: false },
+            Sender {
+                inner: inner.clone(),
+                sent: false,
+            },
             Receiver { inner },
         )
     }
@@ -122,7 +127,7 @@ impl<T: Send, W: Waiter> OneShot<T, W> {
 /// Producer half. Fires exactly one value or drops without firing.
 pub struct Sender<T: Send, W: Waiter = ParkWaiter> {
     inner: Arc<Inner<T, W>>,
-    sent:  bool,
+    sent: bool,
 }
 
 impl<T: Send, W: Waiter> Sender<T, W> {
@@ -133,7 +138,9 @@ impl<T: Send, W: Waiter> Sender<T, W> {
         // Safety: state is EMPTY (we are the only sender, no concurrent
         // writer to the slot exists yet); Release store on state makes
         // the slot's contents visible to the receiver's Acquire CAS.
-        unsafe { (*self.inner.slot.get()).write(value); }
+        unsafe {
+            (*self.inner.slot.get()).write(value);
+        }
         self.inner.state.store(STATE_FULL, Ordering::Release);
         self.inner.waiter.wake();
         self.sent = true;
@@ -170,7 +177,9 @@ impl<T: Send, W: Waiter> Receiver<T, W> {
     /// into a larger topology that wants to register the consumer
     /// through a different path than `bind`.
     #[inline]
-    pub fn waiter(&self) -> &W { &self.inner.waiter }
+    pub fn waiter(&self) -> &W {
+        &self.inner.waiter
+    }
 
     /// Non-blocking poll. Returns `Ok(Some(v))` if a value is ready,
     /// `Err(Closed)` if the sender dropped without sending (or the
@@ -223,11 +232,12 @@ impl<T: Send, W: BlockingWaiter> Receiver<T, W> {
     /// waiter's `wait_until` panics rather than deadlock silently.
     #[inline]
     pub fn recv(self) -> Result<T, Closed> {
-        self.inner.waiter.wait_until(|| {
-            self.inner.state.load(Ordering::Acquire) != STATE_EMPTY
-        });
+        self.inner
+            .waiter
+            .wait_until(|| self.inner.state.load(Ordering::Acquire) != STATE_EMPTY);
         // Predicate guarantees state != EMPTY ⇒ try_take returns `Some`.
-        self.try_take().expect("state != EMPTY guaranteed by wait_until")
+        self.try_take()
+            .expect("state != EMPTY guaranteed by wait_until")
     }
 }
 
@@ -263,10 +273,11 @@ async fn do_recv_async<T: Send + 'static, W: AsyncWaiter + 'static>(
     let inner_for_pred = inner.clone();
     // Box the wait_until future to erase its `'a` borrow before the outer
     // `async fn` auto-trait inference runs.
-    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        Box::pin(inner.waiter.wait_until(move || {
-            inner_for_pred.state.load(Ordering::Acquire) != STATE_EMPTY
-        }));
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(
+        inner
+            .waiter
+            .wait_until(move || inner_for_pred.state.load(Ordering::Acquire) != STATE_EMPTY),
+    );
     fut.await;
     // Predicate guarantees state != EMPTY ⇒ try_take returns `Some`.
     match inner.state.compare_exchange(
@@ -373,15 +384,20 @@ mod tests {
 
         let received = h.join().unwrap();
         assert_eq!(received.as_slice(), &[1, 2, 3, 4]);
-        assert_eq!(received.as_ptr() as usize, ptr_before,
-                   "Box must be transferred zero-copy");
+        assert_eq!(
+            received.as_ptr() as usize,
+            ptr_before,
+            "Box must be transferred zero-copy"
+        );
     }
 
     #[test]
     fn dropped_value_runs_destructor() {
         struct Tracked(Arc<AtomicUsize>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let drops = Arc::new(AtomicUsize::new(0));
         {

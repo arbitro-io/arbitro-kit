@@ -65,8 +65,13 @@ impl<T> Segment<T> {
     /// Index within `slots` for `seq`. Caller must ensure `contains(seq)`.
     #[inline]
     pub(crate) fn idx(&self, seq: u64) -> usize {
-        debug_assert!(self.contains(seq), "seq {} not in segment [{}, {})",
-                      seq, self.base_seq, self.base_seq + SEG_SIZE as u64);
+        debug_assert!(
+            self.contains(seq),
+            "seq {} not in segment [{}, {})",
+            seq,
+            self.base_seq,
+            self.base_seq + SEG_SIZE as u64
+        );
         (seq - self.base_seq) as usize
     }
 }

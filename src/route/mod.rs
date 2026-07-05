@@ -77,15 +77,12 @@ pub type MpscAsync<T, const RING_CAP: usize = 64> = Mpsc<T, RING_CAP, NotifyWait
 
 /// Async sibling of [`MpscProducer<T, RING_CAP>`].
 #[cfg(feature = "tokio")]
-pub type MpscAsyncProducer<T, const RING_CAP: usize = 64> =
-    MpscProducer<T, RING_CAP, NotifyWaiter>;
+pub type MpscAsyncProducer<T, const RING_CAP: usize = 64> = MpscProducer<T, RING_CAP, NotifyWaiter>;
 
 /// Async sibling of [`MpscConsumer<T, RING_CAP>`].
 #[cfg(feature = "tokio")]
-pub type MpscAsyncConsumer<T, const RING_CAP: usize = 64> =
-    MpscConsumer<T, RING_CAP, NotifyWaiter>;
+pub type MpscAsyncConsumer<T, const RING_CAP: usize = 64> = MpscConsumer<T, RING_CAP, NotifyWaiter>;
 
 /// Async sibling of [`MpscShutdown<T, RING_CAP>`].
 #[cfg(feature = "tokio")]
-pub type MpscAsyncShutdown<T, const RING_CAP: usize = 64> =
-    MpscShutdown<T, RING_CAP, NotifyWaiter>;
+pub type MpscAsyncShutdown<T, const RING_CAP: usize = 64> = MpscShutdown<T, RING_CAP, NotifyWaiter>;

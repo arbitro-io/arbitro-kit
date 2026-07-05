@@ -15,8 +15,8 @@
 //! Conforms to bench_safety: BATCH = 1000, BENCH_ROUNDS env-configurable,
 //! tee log expected from runner, no background work.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use arbitro_kit::route::{Mpsc, MpscProducer};
@@ -32,7 +32,9 @@ fn rounds() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200)
 }
-fn warmup_batches() -> usize { 5 }
+fn warmup_batches() -> usize {
+    5
+}
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
@@ -52,9 +54,7 @@ fn progress_start(label: &str, n: usize) -> (impl FnMut(usize, u64), Instant) {
         if i > 0 && i % step == 0 {
             let pct = (i * 100) / n;
             let ns_per_op = (last_batch_ns as f64) / (BATCH as f64);
-            eprintln!(
-                "      [{label_for_tick}] {pct}% ({i}/{n})  last={ns_per_op:.2} ns/op"
-            );
+            eprintln!("      [{label_for_tick}] {pct}% ({i}/{n})  last={ns_per_op:.2} ns/op");
         }
     };
     (tick, Instant::now())
@@ -83,14 +83,15 @@ fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
 // ─────────────────────────────────────────────────────────────────────────
 
 async fn bench_a_old_async() {
-    let (mut ps, c, sd) =
-        Mpsc::<u64, 1024, NotifyWaiter>::new(1);
+    let (mut ps, c, sd) = Mpsc::<u64, 1024, NotifyWaiter>::new(1);
     let p = ps.pop().unwrap();
 
     let consumer = tokio::spawn(async move {
         loop {
             match c.recv_async_send().await {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
@@ -98,7 +99,9 @@ async fn bench_a_old_async() {
 
     // Warmup
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { p.send_async_send(k).await; }
+        for k in 0..BATCH as u64 {
+            p.send_async_send(k).await;
+        }
     }
 
     let n = rounds();
@@ -107,33 +110,42 @@ async fn bench_a_old_async() {
     let wall = Instant::now();
     for i in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { p.send_async_send(k).await; }
+        for k in 0..BATCH as u64 {
+            p.send_async_send(k).await;
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
     }
     progress_end("A old 1P/1C async", prog_t0);
-    row("Mpsc::new(1)               1P/1C async", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "Mpsc::new(1)               1P/1C async",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.await;
 }
 
 async fn bench_a_cloneable_async() {
-    let (sender, c, sd) =
-        Mpsc::<u64, 1024, NotifyWaiter>::new_cloneable(1);
+    let (sender, c, sd) = Mpsc::<u64, 1024, NotifyWaiter>::new_cloneable(1);
 
     let consumer = tokio::spawn(async move {
         loop {
             match c.recv_async_send().await {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
     });
 
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { sender.send_async_send(k).await; }
+        for k in 0..BATCH as u64 {
+            sender.send_async_send(k).await;
+        }
     }
 
     let n = rounds();
@@ -142,13 +154,19 @@ async fn bench_a_cloneable_async() {
     let wall = Instant::now();
     for i in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { sender.send_async_send(k).await; }
+        for k in 0..BATCH as u64 {
+            sender.send_async_send(k).await;
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
     }
     progress_end("A cloneable 1P/1C async", prog_t0);
-    row("Mpsc::new_cloneable(1)     1P/1C async", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "Mpsc::new_cloneable(1)     1P/1C async",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.await;
@@ -183,8 +201,12 @@ async fn run_fanin_async<const M: usize, const RING_CAP: usize>(
         handles.push(tokio::spawn(async move {
             loop {
                 start.wait().await;
-                if stop.load(Ordering::Acquire) { return; }
-                for k in 0..per_prod { s.send_async_send(k).await; }
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                for k in 0..per_prod {
+                    s.send_async_send(k).await;
+                }
                 end.wait().await;
             }
         }));
@@ -212,19 +234,22 @@ async fn run_fanin_async<const M: usize, const RING_CAP: usize>(
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
-    start.wait().await;   // release producers so they exit on the stop check
-    for h in handles { let _ = h.await; }
+    start.wait().await; // release producers so they exit on the stop check
+    for h in handles {
+        let _ = h.await;
+    }
     sd.signal();
     let _ = consumer_handle.await;
 }
 
 async fn bench_b_old_async<const M: usize, const RING_CAP: usize>(label: &str) {
-    let (ps, c, sd) =
-        Mpsc::<u64, RING_CAP, NotifyWaiter>::new(M);
+    let (ps, c, sd) = Mpsc::<u64, RING_CAP, NotifyWaiter>::new(M);
     let consumer = tokio::spawn(async move {
         loop {
             match c.recv_async_send().await {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
@@ -233,12 +258,13 @@ async fn bench_b_old_async<const M: usize, const RING_CAP: usize>(label: &str) {
 }
 
 async fn bench_b_cloneable_async<const M: usize, const RING_CAP: usize>(label: &str) {
-    let (sender, c, sd) =
-        Mpsc::<u64, RING_CAP, NotifyWaiter>::new_cloneable(M);
+    let (sender, c, sd) = Mpsc::<u64, RING_CAP, NotifyWaiter>::new_cloneable(M);
     let consumer = tokio::spawn(async move {
         loop {
             match c.recv_async_send().await {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
@@ -261,7 +287,9 @@ async fn bench_b_tokio_mpsc<const M: usize>(label: &str) {
     let consumer = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Some(v) => { std::hint::black_box(v); }
+                Some(v) => {
+                    std::hint::black_box(v);
+                }
                 None => break,
             }
         }
@@ -281,8 +309,12 @@ async fn bench_b_tokio_mpsc<const M: usize>(label: &str) {
         handles.push(tokio::spawn(async move {
             loop {
                 start.wait().await;
-                if stop.load(Ordering::Acquire) { return; }
-                for k in 0..per_prod { let _ = tx.send(k).await; }
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                for k in 0..per_prod {
+                    let _ = tx.send(k).await;
+                }
                 end.wait().await;
             }
         }));
@@ -311,7 +343,9 @@ async fn bench_b_tokio_mpsc<const M: usize>(label: &str) {
 
     stop.store(true, Ordering::Release);
     start.wait().await;
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
     let _ = consumer.await;
 }
 
@@ -321,14 +355,18 @@ async fn bench_a_tokio_mpsc() {
     let consumer = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Some(v) => { std::hint::black_box(v); }
+                Some(v) => {
+                    std::hint::black_box(v);
+                }
                 None => break,
             }
         }
     });
 
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { let _ = tx.send(k).await; }
+        for k in 0..BATCH as u64 {
+            let _ = tx.send(k).await;
+        }
     }
 
     let n = rounds();
@@ -337,13 +375,19 @@ async fn bench_a_tokio_mpsc() {
     let wall = Instant::now();
     for i in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { let _ = tx.send(k).await; }
+        for k in 0..BATCH as u64 {
+            let _ = tx.send(k).await;
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
     }
     progress_end("A tokio::mpsc 1P/1C", prog_t0);
-    row("tokio::mpsc::channel(1024)  1P/1C async", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "tokio::mpsc::channel(1024)  1P/1C async",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     drop(tx);
     let _ = consumer.await;
@@ -361,7 +405,8 @@ const D_TOTAL: usize = 200_000;
 
 /// Async batch drain — uses `recv_batch_async_send` (drain_all per await).
 async fn bench_d_kit_recv_batch_async<const M: usize, const RING_CAP: usize>(
-    label: &str, cloneable: bool,
+    label: &str,
+    cloneable: bool,
 ) {
     let (senders, c, sd): (Vec<MpscProducer<u64, RING_CAP, NotifyWaiter>>, _, _) = if cloneable {
         let (s0, c, sd) = Mpsc::<u64, RING_CAP, NotifyWaiter>::new_cloneable(M);
@@ -382,13 +427,17 @@ async fn bench_d_kit_recv_batch_async<const M: usize, const RING_CAP: usize>(
         let stop = stop.clone();
         let go = go.clone();
         handles.push(tokio::spawn(async move {
-            while !go.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            while !go.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
             let mut sent = 0u64;
             while sent < per_prod {
                 if s.try_send(sent).is_ok() {
                     sent += 1;
                 } else {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     tokio::task::yield_now().await;
                 }
             }
@@ -401,13 +450,20 @@ async fn bench_d_kit_recv_batch_async<const M: usize, const RING_CAP: usize>(
     let mut received: usize = 0;
     let t0 = Instant::now();
     while received < D_TOTAL {
-        let n = c.recv_batch_async_send(|_v| { received += 1; }).await.unwrap();
+        let n = c
+            .recv_batch_async_send(|_v| {
+                received += 1;
+            })
+            .await
+            .unwrap();
         let _ = n;
     }
     let dt = t0.elapsed();
 
     stop.store(true, Ordering::Release);
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
     sd.signal();
 
     let mean = dt.as_nanos() as f64 / D_TOTAL as f64;
@@ -431,13 +487,17 @@ async fn bench_d_tokio_recv_many<const M: usize>(label: &str) {
         let stop = stop.clone();
         let go = go.clone();
         handles.push(tokio::spawn(async move {
-            while !go.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            while !go.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
             let mut sent = 0u64;
             while sent < per_prod {
                 if tx.try_send(sent).is_ok() {
                     sent += 1;
                 } else {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     tokio::task::yield_now().await;
                 }
             }
@@ -453,14 +513,20 @@ async fn bench_d_tokio_recv_many<const M: usize>(label: &str) {
     let t0 = Instant::now();
     while received < D_TOTAL {
         let n = rx.recv_many(&mut buf, 1024).await;
-        if n == 0 { break; }
-        for v in buf.drain(..) { std::hint::black_box(v); }
+        if n == 0 {
+            break;
+        }
+        for v in buf.drain(..) {
+            std::hint::black_box(v);
+        }
         received += n;
     }
     let dt = t0.elapsed();
 
     stop.store(true, Ordering::Release);
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
 
     let mean = dt.as_nanos() as f64 / D_TOTAL as f64;
     let ops = D_TOTAL as f64 / dt.as_secs_f64();
@@ -470,7 +536,10 @@ async fn bench_d_tokio_recv_many<const M: usize>(label: &str) {
     );
 }
 
-async fn bench_d_kit_recv_async<const M: usize, const RING_CAP: usize>(label: &str, cloneable: bool) {
+async fn bench_d_kit_recv_async<const M: usize, const RING_CAP: usize>(
+    label: &str,
+    cloneable: bool,
+) {
     let (senders, c, sd): (Vec<MpscProducer<u64, RING_CAP, NotifyWaiter>>, _, _) = if cloneable {
         let (s0, c, sd) = Mpsc::<u64, RING_CAP, NotifyWaiter>::new_cloneable(M);
         let mut v: Vec<_> = (0..M - 1).map(|_| s0.clone()).collect();
@@ -490,13 +559,17 @@ async fn bench_d_kit_recv_async<const M: usize, const RING_CAP: usize>(label: &s
         let stop = stop.clone();
         let go = go.clone();
         handles.push(tokio::spawn(async move {
-            while !go.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            while !go.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
             let mut sent = 0u64;
             while sent < per_prod {
                 if s.try_send(sent).is_ok() {
                     sent += 1;
                 } else {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     tokio::task::yield_now().await;
                 }
             }
@@ -515,7 +588,9 @@ async fn bench_d_kit_recv_async<const M: usize, const RING_CAP: usize>(label: &s
     let dt = t0.elapsed();
 
     stop.store(true, Ordering::Release);
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
     sd.signal();
 
     let mean = dt.as_nanos() as f64 / D_TOTAL as f64;
@@ -538,13 +613,17 @@ async fn bench_d_tokio_recv_async<const M: usize>(label: &str) {
         let stop = stop.clone();
         let go = go.clone();
         handles.push(tokio::spawn(async move {
-            while !go.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            while !go.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
             let mut sent = 0u64;
             while sent < per_prod {
                 if tx.try_send(sent).is_ok() {
                     sent += 1;
                 } else {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     tokio::task::yield_now().await;
                 }
             }
@@ -558,12 +637,18 @@ async fn bench_d_tokio_recv_async<const M: usize>(label: &str) {
     let mut received: usize = 0;
     let t0 = Instant::now();
     while received < D_TOTAL {
-        if rx.recv().await.is_some() { received += 1; } else { break; }
+        if rx.recv().await.is_some() {
+            received += 1;
+        } else {
+            break;
+        }
     }
     let dt = t0.elapsed();
 
     stop.store(true, Ordering::Release);
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
 
     let mean = dt.as_nanos() as f64 / D_TOTAL as f64;
     let ops = D_TOTAL as f64 / dt.as_secs_f64();
@@ -583,8 +668,7 @@ fn bench_c_clone_throughput_async() {
 
     let mut total_ns: u64 = 0;
     for _ in 0..ROUNDS {
-        let (sender, _c, _sd) =
-            Mpsc::<u64, 64, NotifyWaiter>::new_cloneable(N);
+        let (sender, _c, _sd) = Mpsc::<u64, 64, NotifyWaiter>::new_cloneable(N);
         let t0 = Instant::now();
         let _clones: Vec<MpscProducer<u64, 64, NotifyWaiter>> =
             (0..N - 1).map(|_| sender.clone()).collect();
@@ -596,11 +680,7 @@ fn bench_c_clone_throughput_async() {
     let ops = (total_clones as f64) / (total_ns as f64 / 1e9);
     println!(
         "{:<48} {:>12.2} {:>12} {:>12} {:>14}",
-        "MpscProducer<NotifyWaiter>::clone()",
-        mean_ns,
-        "—",
-        "—",
-        ops as u64
+        "MpscProducer<NotifyWaiter>::clone()", mean_ns, "—", "—", ops as u64
     );
 }
 
@@ -628,41 +708,84 @@ fn main() {
 
         header("B. MP/1C async fan-in (total cap = M × RING_CAP = 1024)");
         bench_b_old_async::<2, 512>("Mpsc::new(2)                 2P/1C async cap=2×512").await;
-        bench_b_cloneable_async::<2, 512>("Mpsc::new_cloneable(2)       2P/1C async cap=2×512").await;
+        bench_b_cloneable_async::<2, 512>("Mpsc::new_cloneable(2)       2P/1C async cap=2×512")
+            .await;
         bench_b_tokio_mpsc::<2>("tokio::mpsc::channel(1024)   2P/1C async").await;
         bench_b_old_async::<4, 256>("Mpsc::new(4)                 4P/1C async cap=4×256").await;
-        bench_b_cloneable_async::<4, 256>("Mpsc::new_cloneable(4)       4P/1C async cap=4×256").await;
+        bench_b_cloneable_async::<4, 256>("Mpsc::new_cloneable(4)       4P/1C async cap=4×256")
+            .await;
         bench_b_tokio_mpsc::<4>("tokio::mpsc::channel(1024)   4P/1C async").await;
         bench_b_old_async::<8, 128>("Mpsc::new(8)                 8P/1C async cap=8×128").await;
-        bench_b_cloneable_async::<8, 128>("Mpsc::new_cloneable(8)       8P/1C async cap=8×128").await;
+        bench_b_cloneable_async::<8, 128>("Mpsc::new_cloneable(8)       8P/1C async cap=8×128")
+            .await;
         bench_b_tokio_mpsc::<8>("tokio::mpsc::channel(1024)   8P/1C async").await;
 
         header("D1. Consumer recv-single async (recv_async_send / rx.recv) — TOTAL=200k");
-        bench_d_kit_recv_async::<1, 1024>("Mpsc::new(1)                 1P/1C recv-1 async", false).await;
-        bench_d_kit_recv_async::<1, 1024>("Mpsc::new_cloneable(1)       1P/1C recv-1 async", true).await;
+        bench_d_kit_recv_async::<1, 1024>("Mpsc::new(1)                 1P/1C recv-1 async", false)
+            .await;
+        bench_d_kit_recv_async::<1, 1024>("Mpsc::new_cloneable(1)       1P/1C recv-1 async", true)
+            .await;
         bench_d_tokio_recv_async::<1>("tokio::mpsc::channel(1024)   1P/1C recv-1 async").await;
-        bench_d_kit_recv_async::<2, 512>("Mpsc::new(2)                 2P/1C recv-1 async", false).await;
-        bench_d_kit_recv_async::<2, 512>("Mpsc::new_cloneable(2)       2P/1C recv-1 async", true).await;
+        bench_d_kit_recv_async::<2, 512>("Mpsc::new(2)                 2P/1C recv-1 async", false)
+            .await;
+        bench_d_kit_recv_async::<2, 512>("Mpsc::new_cloneable(2)       2P/1C recv-1 async", true)
+            .await;
         bench_d_tokio_recv_async::<2>("tokio::mpsc::channel(1024)   2P/1C recv-1 async").await;
-        bench_d_kit_recv_async::<4, 256>("Mpsc::new(4)                 4P/1C recv-1 async", false).await;
-        bench_d_kit_recv_async::<4, 256>("Mpsc::new_cloneable(4)       4P/1C recv-1 async", true).await;
+        bench_d_kit_recv_async::<4, 256>("Mpsc::new(4)                 4P/1C recv-1 async", false)
+            .await;
+        bench_d_kit_recv_async::<4, 256>("Mpsc::new_cloneable(4)       4P/1C recv-1 async", true)
+            .await;
         bench_d_tokio_recv_async::<4>("tokio::mpsc::channel(1024)   4P/1C recv-1 async").await;
-        bench_d_kit_recv_async::<8, 128>("Mpsc::new(8)                 8P/1C recv-1 async", false).await;
-        bench_d_kit_recv_async::<8, 128>("Mpsc::new_cloneable(8)       8P/1C recv-1 async", true).await;
+        bench_d_kit_recv_async::<8, 128>("Mpsc::new(8)                 8P/1C recv-1 async", false)
+            .await;
+        bench_d_kit_recv_async::<8, 128>("Mpsc::new_cloneable(8)       8P/1C recv-1 async", true)
+            .await;
         bench_d_tokio_recv_async::<8>("tokio::mpsc::channel(1024)   8P/1C recv-1 async").await;
 
         header("D2. Consumer recv-batch async (recv_batch_async_send / recv_many) — TOTAL=200k");
-        bench_d_kit_recv_batch_async::<1, 1024>("Mpsc::new(1)                 1P/1C recv-batch async", false).await;
-        bench_d_kit_recv_batch_async::<1, 1024>("Mpsc::new_cloneable(1)       1P/1C recv-batch async", true).await;
+        bench_d_kit_recv_batch_async::<1, 1024>(
+            "Mpsc::new(1)                 1P/1C recv-batch async",
+            false,
+        )
+        .await;
+        bench_d_kit_recv_batch_async::<1, 1024>(
+            "Mpsc::new_cloneable(1)       1P/1C recv-batch async",
+            true,
+        )
+        .await;
         bench_d_tokio_recv_many::<1>("tokio::mpsc::recv_many(1024) 1P/1C recv-batch async").await;
-        bench_d_kit_recv_batch_async::<2, 512>("Mpsc::new(2)                 2P/1C recv-batch async", false).await;
-        bench_d_kit_recv_batch_async::<2, 512>("Mpsc::new_cloneable(2)       2P/1C recv-batch async", true).await;
+        bench_d_kit_recv_batch_async::<2, 512>(
+            "Mpsc::new(2)                 2P/1C recv-batch async",
+            false,
+        )
+        .await;
+        bench_d_kit_recv_batch_async::<2, 512>(
+            "Mpsc::new_cloneable(2)       2P/1C recv-batch async",
+            true,
+        )
+        .await;
         bench_d_tokio_recv_many::<2>("tokio::mpsc::recv_many(1024) 2P/1C recv-batch async").await;
-        bench_d_kit_recv_batch_async::<4, 256>("Mpsc::new(4)                 4P/1C recv-batch async", false).await;
-        bench_d_kit_recv_batch_async::<4, 256>("Mpsc::new_cloneable(4)       4P/1C recv-batch async", true).await;
+        bench_d_kit_recv_batch_async::<4, 256>(
+            "Mpsc::new(4)                 4P/1C recv-batch async",
+            false,
+        )
+        .await;
+        bench_d_kit_recv_batch_async::<4, 256>(
+            "Mpsc::new_cloneable(4)       4P/1C recv-batch async",
+            true,
+        )
+        .await;
         bench_d_tokio_recv_many::<4>("tokio::mpsc::recv_many(1024) 4P/1C recv-batch async").await;
-        bench_d_kit_recv_batch_async::<8, 128>("Mpsc::new(8)                 8P/1C recv-batch async", false).await;
-        bench_d_kit_recv_batch_async::<8, 128>("Mpsc::new_cloneable(8)       8P/1C recv-batch async", true).await;
+        bench_d_kit_recv_batch_async::<8, 128>(
+            "Mpsc::new(8)                 8P/1C recv-batch async",
+            false,
+        )
+        .await;
+        bench_d_kit_recv_batch_async::<8, 128>(
+            "Mpsc::new_cloneable(8)       8P/1C recv-batch async",
+            true,
+        )
+        .await;
         bench_d_tokio_recv_many::<8>("tokio::mpsc::recv_many(1024) 8P/1C recv-batch async").await;
     });
 

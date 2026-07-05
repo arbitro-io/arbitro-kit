@@ -42,10 +42,10 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::waiter::{ParkWaiter, Waiter};
 #[cfg(feature = "tokio")]
 use crate::waiter::AsyncWaiter;
 use crate::waiter::BlockingWaiter;
+use crate::waiter::{ParkWaiter, Waiter};
 
 /// Maximum number of gates a `SignalSet` can host with the legacy
 /// (mask: u64) API. Sets with more than 64 bits must be created via
@@ -67,10 +67,14 @@ impl SignalId {
     /// `mask()` API only makes sense for `idx < 64` (chunk 0); higher
     /// indices are valid for chunk-aware methods (`release`, `lock`,
     /// `is_open`) on a `SignalSet` built with [`SignalSet::with_capacity`].
-    pub const fn new(idx: u8) -> Self { Self(idx) }
+    pub const fn new(idx: u8) -> Self {
+        Self(idx)
+    }
 
     #[inline]
-    pub const fn index(self) -> u8 { self.0 }
+    pub const fn index(self) -> u8 {
+        self.0
+    }
 
     /// Bit mask with only this gate's bit set.
     ///
@@ -79,7 +83,10 @@ impl SignalId {
     /// indices use the chunk-aware methods directly.
     #[inline]
     pub const fn mask(self) -> u64 {
-        assert!((self.0 as usize) < 64, "SignalId::mask: only valid for idx < 64");
+        assert!(
+            (self.0 as usize) < 64,
+            "SignalId::mask: only valid for idx < 64"
+        );
         1u64 << self.0
     }
 }
@@ -108,7 +115,9 @@ unsafe impl<W: Waiter> Sync for SignalSet<W> {}
 unsafe impl<W: Waiter> Send for SignalSet<W> {}
 
 impl<W: Waiter> Default for SignalSet<W> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<W: Waiter> SignalSet<W> {
@@ -126,12 +135,14 @@ impl<W: Waiter> SignalSet<W> {
         let n_chunks = (n_bits.max(1) + 63) / 64;
         let cap_bits = n_chunks * 64;
         let mut chunks: Vec<AtomicU64> = Vec::with_capacity(n_chunks);
-        for _ in 0..n_chunks { chunks.push(AtomicU64::new(0)); }
+        for _ in 0..n_chunks {
+            chunks.push(AtomicU64::new(0));
+        }
         let names: Vec<Option<&'static str>> = vec![None; cap_bits];
         Self {
-            chunks:  chunks.into_boxed_slice(),
-            waiter:  W::default(),
-            names:   UnsafeCell::new(names),
+            chunks: chunks.into_boxed_slice(),
+            waiter: W::default(),
+            names: UnsafeCell::new(names),
             next_id: UnsafeCell::new(0),
         }
     }
@@ -139,16 +150,22 @@ impl<W: Waiter> SignalSet<W> {
     /// Borrow the underlying waiter. Useful for composing this set into
     /// a larger topology.
     #[inline]
-    pub fn waiter(&self) -> &W { &self.waiter }
+    pub fn waiter(&self) -> &W {
+        &self.waiter
+    }
 
     /// Number of `AtomicU64` chunks. `n_chunks() == 1` for the legacy
     /// (≤64-bit) API.
     #[inline]
-    pub fn n_chunks(&self) -> usize { self.chunks.len() }
+    pub fn n_chunks(&self) -> usize {
+        self.chunks.len()
+    }
 
     /// Total bit capacity (= `n_chunks() * 64`).
     #[inline]
-    pub fn capacity_bits(&self) -> usize { self.chunks.len() * 64 }
+    pub fn capacity_bits(&self) -> usize {
+        self.chunks.len() * 64
+    }
 
     /// Register a new gate. Returns its typed handle. Callable only while
     /// the set is unshared (`&mut self` enforces this at compile time).
@@ -295,7 +312,9 @@ impl<W: Waiter> SignalSet<W> {
     #[inline]
     pub fn any_chunk_open(&self) -> bool {
         for c in self.chunks.iter() {
-            if c.load(Ordering::Acquire) != 0 { return true; }
+            if c.load(Ordering::Acquire) != 0 {
+                return true;
+            }
         }
         false
     }
@@ -308,25 +327,22 @@ impl<W: BlockingWaiter> SignalSet<W> {
     /// thread registered via `set_worker`.
     #[inline]
     pub fn acquire_any(&self, mask: u64) {
-        self.waiter.wait_until(|| {
-            (self.chunks[0].load(Ordering::Acquire) & mask) != 0
-        });
+        self.waiter
+            .wait_until(|| (self.chunks[0].load(Ordering::Acquire) & mask) != 0);
     }
 
     /// Block until **every** gate in `mask` is open.
     #[inline]
     pub fn acquire_all(&self, mask: u64) {
-        self.waiter.wait_until(|| {
-            (self.chunks[0].load(Ordering::Acquire) & mask) == mask
-        });
+        self.waiter
+            .wait_until(|| (self.chunks[0].load(Ordering::Acquire) & mask) == mask);
     }
 
     /// Block until any gate is open (equivalent to `acquire_any(!0)`).
     #[inline]
     pub fn acquire(&self) {
-        self.waiter.wait_until(|| {
-            self.chunks[0].load(Ordering::Acquire) != 0
-        });
+        self.waiter
+            .wait_until(|| self.chunks[0].load(Ordering::Acquire) != 0);
     }
 
     /// Block until any bit across ALL chunks is set (multi-chunk variant
@@ -365,9 +381,7 @@ impl<W: AsyncWaiter> SignalSet<W> {
 
     /// Async sibling of [`acquire_any_chunk`](Self::acquire_any_chunk).
     pub async fn acquire_any_chunk_async(&self) {
-        self.waiter
-            .wait_until(|| self.any_chunk_open())
-            .await;
+        self.waiter.wait_until(|| self.any_chunk_open()).await;
     }
 }
 
@@ -471,9 +485,9 @@ mod tests {
     fn many_producers_one_consumer() {
         use std::sync::atomic::AtomicBool;
         let mut set: SignalSet = SignalSet::new();
-        let ids: Vec<_> = (0..8).map(|i| {
-            set.create(Box::leak(format!("g{i}").into_boxed_str()))
-        }).collect();
+        let ids: Vec<_> = (0..8)
+            .map(|i| set.create(Box::leak(format!("g{i}").into_boxed_str())))
+            .collect();
         let set = Arc::new(set);
         let mask_all: u64 = ids.iter().map(|id| id.mask()).fold(0, |a, b| a | b);
         let stop = Arc::new(AtomicBool::new(false));
@@ -489,19 +503,25 @@ mod tests {
             }
         });
 
-        let producers: Vec<_> = ids.iter().copied().map(|id| {
-            let s = set.clone();
-            std::thread::spawn(move || {
-                for _ in 0..25 {
-                    s.release(id);
-                    std::thread::yield_now();
-                }
+        let producers: Vec<_> = ids
+            .iter()
+            .copied()
+            .map(|id| {
+                let s = set.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        s.release(id);
+                        std::thread::yield_now();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
-        for p in producers { p.join().unwrap(); }
+        for p in producers {
+            p.join().unwrap();
+        }
         stop.store(true, Ordering::Relaxed);
-        set.release(ids[0]);  // Kick the consumer if parked.
+        set.release(ids[0]); // Kick the consumer if parked.
         consumer.join().unwrap();
     }
 

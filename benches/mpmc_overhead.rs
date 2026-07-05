@@ -38,7 +38,9 @@ fn rounds() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(500)
 }
-fn warmup_batches() -> usize { 10 }
+fn warmup_batches() -> usize {
+    10
+}
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
@@ -67,8 +69,11 @@ fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
 // No cross-core traffic, no park. Isolates the adaptive-routing scan +
 // `fetch_or` + `try_recv` bitmap pop.
 fn bench_single_thread() {
-    let (ps, cs, sd): (Vec<MpmcProducer<u64>>, Vec<MpmcConsumer<u64>>, MpmcShutdown<u64>) =
-        Mpmc::<u64>::new(1, 1);
+    let (ps, cs, sd): (
+        Vec<MpmcProducer<u64>>,
+        Vec<MpmcConsumer<u64>>,
+        MpmcShutdown<u64>,
+    ) = Mpmc::<u64>::new(1, 1);
     let p = &ps[0];
     let c = &cs[0];
 
@@ -78,7 +83,9 @@ fn bench_single_thread() {
             std::hint::black_box(c.try_recv().unwrap());
         }
     };
-    for _ in 0..warmup_batches() { do_batch(); }
+    for _ in 0..warmup_batches() {
+        do_batch();
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -88,7 +95,11 @@ fn bench_single_thread() {
         do_batch();
         lats.push(t0.elapsed().as_nanos() as u64);
     }
-    row("mpmc 1P/1C single-thread", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "mpmc 1P/1C single-thread",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     drop(sd);
     let _ = SHARD_CAP_UNUSED;
@@ -105,7 +116,10 @@ fn bench_spsc_cross_thread() {
         let mut count: u64 = 0;
         loop {
             match c.recv() {
-                Ok(v) => { std::hint::black_box(v); count = count.wrapping_add(1); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                    count = count.wrapping_add(1);
+                }
                 Err(_) => break,
             }
         }
@@ -114,7 +128,9 @@ fn bench_spsc_cross_thread() {
 
     p.bind();
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
     }
 
     let n = rounds();
@@ -122,10 +138,16 @@ fn bench_spsc_cross_thread() {
     let wall = Instant::now();
     for _ in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
-    row("mpmc 1P/1C cross-thread", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "mpmc 1P/1C cross-thread",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.join().unwrap();
@@ -144,7 +166,10 @@ fn bench_mpsc<const M: usize>(label: &str) {
         c.bind();
         let mut total: u64 = 0;
         loop {
-            match c.recv_batch(|v| { std::hint::black_box(v); total += 1; }) {
+            match c.recv_batch(|v| {
+                std::hint::black_box(v);
+                total += 1;
+            }) {
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -169,12 +194,19 @@ fn bench_mpsc<const M: usize>(label: &str) {
             loop {
                 // Wait for next round signal.
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { p.send(k); }
+                for k in 0..per_prod as u64 {
+                    p.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -184,7 +216,9 @@ fn bench_mpsc<const M: usize>(label: &str) {
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -194,14 +228,18 @@ fn bench_mpsc<const M: usize>(label: &str) {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel); // unblock producers
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
     let _ = consumer.join().unwrap();
 }
@@ -213,22 +251,29 @@ fn bench_spmc<const N: usize>(label: &str) {
 
     let handles: Vec<_> = cs
         .into_iter()
-        .map(|c| thread::spawn(move || {
-            c.bind();
-            let mut count: u64 = 0;
-            loop {
-                match c.recv_batch(|v| { std::hint::black_box(v); count += 1; }) {
-                    Ok(_) => {}
-                    Err(_) => break,
+        .map(|c| {
+            thread::spawn(move || {
+                c.bind();
+                let mut count: u64 = 0;
+                loop {
+                    match c.recv_batch(|v| {
+                        std::hint::black_box(v);
+                        count += 1;
+                    }) {
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
                 }
-            }
-            count
-        }))
+                count
+            })
+        })
         .collect();
 
     p.bind();
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
     }
 
     let n = rounds();
@@ -236,13 +281,17 @@ fn bench_spmc<const N: usize>(label: &str) {
     let wall = Instant::now();
     for _ in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     sd.signal();
-    for h in handles { let _ = h.join().unwrap(); }
+    for h in handles {
+        let _ = h.join().unwrap();
+    }
 }
 
 // ── E. MP/NC symmetric ────────────────────────────────────────────────
@@ -251,17 +300,22 @@ fn bench_mpmc_symmetric<const M: usize, const N: usize>(label: &str) {
 
     let consumer_handles: Vec<_> = cs
         .into_iter()
-        .map(|c| thread::spawn(move || {
-            c.bind();
-            let mut count: u64 = 0;
-            loop {
-                match c.recv_batch(|v| { std::hint::black_box(v); count += 1; }) {
-                    Ok(_) => {}
-                    Err(_) => break,
+        .map(|c| {
+            thread::spawn(move || {
+                c.bind();
+                let mut count: u64 = 0;
+                loop {
+                    match c.recv_batch(|v| {
+                        std::hint::black_box(v);
+                        count += 1;
+                    }) {
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
                 }
-            }
-            count
-        }))
+                count
+            })
+        })
         .collect();
 
     let per_prod = BATCH / M;
@@ -278,12 +332,19 @@ fn bench_mpmc_symmetric<const M: usize, const N: usize>(label: &str) {
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { p.send(k); }
+                for k in 0..per_prod as u64 {
+                    p.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -292,7 +353,9 @@ fn bench_mpmc_symmetric<const M: usize, const N: usize>(label: &str) {
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -302,16 +365,22 @@ fn bench_mpmc_symmetric<const M: usize, const N: usize>(label: &str) {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in prod_handles { let _ = h.join(); }
+    for h in prod_handles {
+        let _ = h.join();
+    }
     sd.signal();
-    for h in consumer_handles { let _ = h.join().unwrap(); }
+    for h in consumer_handles {
+        let _ = h.join().unwrap();
+    }
 }
 
 // ── F. Crossbeam baselines ────────────────────────────────────────────
@@ -321,7 +390,8 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
     let consumer = thread::spawn(move || {
         let mut count: u64 = 0;
         while let Ok(v) = rx.recv() {
-            std::hint::black_box(v); count += 1;
+            std::hint::black_box(v);
+            count += 1;
         }
         count
     });
@@ -340,12 +410,19 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { let _ = tx.send(k); }
+                for k in 0..per_prod as u64 {
+                    let _ = tx.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -355,7 +432,9 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -365,34 +444,43 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     let _ = consumer.join().unwrap();
 }
 
 fn bench_crossbeam_spmc<const N: usize>(label: &str) {
     let (tx, rx) = bounded::<u64>(1024);
 
-    let handles: Vec<_> = (0..N).map(|_| {
-        let rx = rx.clone();
-        thread::spawn(move || {
-            let mut count: u64 = 0;
-            while let Ok(v) = rx.recv() {
-                std::hint::black_box(v); count += 1;
-            }
-            count
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let rx = rx.clone();
+            thread::spawn(move || {
+                let mut count: u64 = 0;
+                while let Ok(v) = rx.recv() {
+                    std::hint::black_box(v);
+                    count += 1;
+                }
+                count
+            })
         })
-    }).collect();
+        .collect();
     drop(rx);
 
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { let _ = tx.send(k); }
+        for k in 0..BATCH as u64 {
+            let _ = tx.send(k);
+        }
     }
 
     let n = rounds();
@@ -400,28 +488,35 @@ fn bench_crossbeam_spmc<const N: usize>(label: &str) {
     let wall = Instant::now();
     for _ in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { let _ = tx.send(k); }
+        for k in 0..BATCH as u64 {
+            let _ = tx.send(k);
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     drop(tx);
-    for h in handles { let _ = h.join().unwrap(); }
+    for h in handles {
+        let _ = h.join().unwrap();
+    }
 }
 
 fn bench_crossbeam_mpmc<const M: usize, const N: usize>(label: &str) {
     let (tx, rx) = bounded::<u64>(1024);
 
-    let cons_handles: Vec<_> = (0..N).map(|_| {
-        let rx = rx.clone();
-        thread::spawn(move || {
-            let mut count: u64 = 0;
-            while let Ok(v) = rx.recv() {
-                std::hint::black_box(v); count += 1;
-            }
-            count
+    let cons_handles: Vec<_> = (0..N)
+        .map(|_| {
+            let rx = rx.clone();
+            thread::spawn(move || {
+                let mut count: u64 = 0;
+                while let Ok(v) = rx.recv() {
+                    std::hint::black_box(v);
+                    count += 1;
+                }
+                count
+            })
         })
-    }).collect();
+        .collect();
     drop(rx);
 
     let per_prod = BATCH / M;
@@ -438,12 +533,19 @@ fn bench_crossbeam_mpmc<const M: usize, const N: usize>(label: &str) {
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { let _ = tx.send(k); }
+                for k in 0..per_prod as u64 {
+                    let _ = tx.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -453,7 +555,9 @@ fn bench_crossbeam_mpmc<const M: usize, const N: usize>(label: &str) {
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -463,15 +567,21 @@ fn bench_crossbeam_mpmc<const M: usize, const N: usize>(label: &str) {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in prod_handles { let _ = h.join(); }
-    for h in cons_handles { let _ = h.join().unwrap(); }
+    for h in prod_handles {
+        let _ = h.join();
+    }
+    for h in cons_handles {
+        let _ = h.join().unwrap();
+    }
 }
 
 // ── G. MP/NC with `try_send_batch` on the producer side ───────────────
@@ -485,17 +595,22 @@ fn bench_mpmc_batched<const M: usize, const N: usize>(label: &str, chunk: usize)
 
     let consumer_handles: Vec<_> = cs
         .into_iter()
-        .map(|c| thread::spawn(move || {
-            c.bind();
-            let mut count: u64 = 0;
-            loop {
-                match c.recv_batch(|v| { std::hint::black_box(v); count += 1; }) {
-                    Ok(_) => {}
-                    Err(_) => break,
+        .map(|c| {
+            thread::spawn(move || {
+                c.bind();
+                let mut count: u64 = 0;
+                loop {
+                    match c.recv_batch(|v| {
+                        std::hint::black_box(v);
+                        count += 1;
+                    }) {
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
                 }
-            }
-            count
-        }))
+                count
+            })
+        })
         .collect();
 
     let per_prod = BATCH / M;
@@ -513,16 +628,23 @@ fn bench_mpmc_batched<const M: usize, const N: usize>(label: &str, chunk: usize)
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
                 let mut sent: usize = 0;
                 while sent < per_prod {
                     let want = (per_prod - sent).min(chunk);
                     buf.clear();
-                    for k in 0..want as u64 { buf.push(sent as u64 + k); }
+                    for k in 0..want as u64 {
+                        buf.push(sent as u64 + k);
+                    }
                     while !buf.is_empty() {
                         let n = p.try_send_batch(&mut buf);
                         if n == 0 {
@@ -541,7 +663,9 @@ fn bench_mpmc_batched<const M: usize, const N: usize>(label: &str, chunk: usize)
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -551,16 +675,22 @@ fn bench_mpmc_batched<const M: usize, const N: usize>(label: &str, chunk: usize)
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         lats.push(t0.elapsed().as_nanos() as u64);
     }
     row(label, lats, wall.elapsed().as_nanos() as u64);
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in prod_handles { let _ = h.join(); }
+    for h in prod_handles {
+        let _ = h.join();
+    }
     sd.signal();
-    for h in consumer_handles { let _ = h.join().unwrap(); }
+    for h in consumer_handles {
+        let _ = h.join().unwrap();
+    }
 }
 
 fn main() {

@@ -54,7 +54,9 @@ impl Waiter for NotifyWaiter {
 
     /// Always `true`: the runtime is the worker.
     #[inline]
-    fn has_worker(&self) -> bool { true }
+    fn has_worker(&self) -> bool {
+        true
+    }
 
     #[inline]
     fn wake(&self) {
@@ -73,7 +75,9 @@ impl AsyncWaiter for NotifyWaiter {
                 // Without this, a producer firing `notify_one` between the
                 // check and the await would be lost.
                 let notified = self.inner.notified();
-                if ready() { return; }
+                if ready() {
+                    return;
+                }
                 notified.await;
             }
         }

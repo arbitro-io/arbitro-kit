@@ -26,7 +26,9 @@ pub struct Receipt(u64);
 impl Receipt {
     /// Internal: build from a raw seq. `Stream` is the only producer.
     #[inline]
-    pub(crate) fn new(seq: u64) -> Self { Receipt(seq) }
+    pub(crate) fn new(seq: u64) -> Self {
+        Receipt(seq)
+    }
 
     /// Sequence number of the message this receipt confirms.
     ///
@@ -34,7 +36,9 @@ impl Receipt {
     /// **last** item in the batch. The first item's seq is therefore
     /// `seq() - (batch_len - 1)`.
     #[inline]
-    pub fn seq(&self) -> u64 { self.0 }
+    pub fn seq(&self) -> u64 {
+        self.0
+    }
 
     /// Returns `true` if the consumer has drained past this receipt's
     /// message. Cost: one Acquire atomic load on the stream's cursor.

@@ -117,10 +117,14 @@ impl<In: Send, Out: Send, W: Waiter> Hub<In, Out, W> {
     }
 
     #[inline]
-    pub fn len(&self) -> usize { self.ids.len() }
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
 
     #[inline]
-    pub fn full_mask(&self) -> u64 { self.full_mask }
+    pub fn full_mask(&self) -> u64 {
+        self.full_mask
+    }
 }
 
 impl<In, Out, W: Waiter> Drop for Hub<In, Out, W> {
@@ -129,7 +133,9 @@ impl<In, Out, W: Waiter> Drop for Hub<In, Out, W> {
         for (i, _) in self.inbound.iter().enumerate() {
             let bit = 1u64 << i;
             if state & bit != 0 {
-                unsafe { (*self.inbound[i].0.get()).assume_init_drop(); }
+                unsafe {
+                    (*self.inbound[i].0.get()).assume_init_drop();
+                }
             }
         }
     }
@@ -140,13 +146,15 @@ impl<In, Out, W: Waiter> Drop for Hub<In, Out, W> {
 pub struct HubPort<In: Send, Out: Send, W: Waiter = ParkWaiter> {
     hub: Arc<Hub<In, Out, W>>,
     idx: usize,
-    id:  SignalId,
+    id: SignalId,
     _not_sync: PhantomData<Cell<()>>,
 }
 
 impl<In: Send, Out: Send, W: Waiter> HubPort<In, Out, W> {
     #[inline]
-    pub fn index(&self) -> usize { self.idx }
+    pub fn index(&self) -> usize {
+        self.idx
+    }
 
     /// Register this thread as the port's reply consumer. No-op for async
     /// waiter backends.
@@ -156,7 +164,9 @@ impl<In: Send, Out: Send, W: Waiter> HubPort<In, Out, W> {
     }
 
     #[inline]
-    pub fn is_idle(&self) -> bool { !self.hub.coordinator.is_open(self.id) }
+    pub fn is_idle(&self) -> bool {
+        !self.hub.coordinator.is_open(self.id)
+    }
 
     /// Send `v` to the drain.
     #[inline]
@@ -166,15 +176,21 @@ impl<In: Send, Out: Send, W: Waiter> HubPort<In, Out, W> {
             "HubPort::send called on busy port {}: caller must drain reply first",
             self.idx
         );
-        unsafe { (*self.hub.inbound[self.idx].0.get()).write(v); }
+        unsafe {
+            (*self.hub.inbound[self.idx].0.get()).write(v);
+        }
         self.hub.coordinator.release(self.id);
     }
 
     /// Non-blocking send. Returns `Err(v)` if the port is still busy.
     #[inline]
     pub fn try_send(&self, v: In) -> Result<(), In> {
-        if !self.is_idle() { return Err(v); }
-        unsafe { (*self.hub.inbound[self.idx].0.get()).write(v); }
+        if !self.is_idle() {
+            return Err(v);
+        }
+        unsafe {
+            (*self.hub.inbound[self.idx].0.get()).write(v);
+        }
         self.hub.coordinator.release(self.id);
         Ok(())
     }
@@ -217,25 +233,33 @@ impl<In: Send, Out: Send, W: Waiter> HubDrain<In, Out, W> {
     }
 
     #[inline]
-    pub fn len(&self) -> usize { self.hub.len() }
+    pub fn len(&self) -> usize {
+        self.hub.len()
+    }
 
     #[inline]
     pub fn shutdown_handle(&self) -> HubShutdown<In, Out, W> {
-        HubShutdown { hub: self.hub.clone() }
+        HubShutdown {
+            hub: self.hub.clone(),
+        }
     }
 
     /// Internal: drain whatever's currently pending without blocking.
     fn drain_available<F: FnMut(usize, In, HubReply<'_, Out, W>)>(&self, f: &mut F) {
         let state = self.hub.coordinator.state();
         let mut active = state & self.hub.full_mask;
-        if active == 0 { return; }
+        if active == 0 {
+            return;
+        }
         while active != 0 {
             let i = active.trailing_zeros() as usize;
             let bit = 1u64 << i;
             active &= active.wrapping_sub(1);
             let v = unsafe { (*self.hub.inbound[i].0.get()).assume_init_read() };
             self.hub.coordinator.lock_mask(bit);
-            let reply = HubReply { pipe: &self.hub.outbound[i] };
+            let reply = HubReply {
+                pipe: &self.hub.outbound[i],
+            };
             f(i, v, reply);
         }
     }
@@ -244,12 +268,18 @@ impl<In: Send, Out: Send, W: Waiter> HubDrain<In, Out, W> {
     pub fn try_recv_batch<F: FnMut(usize, In, HubReply<'_, Out, W>)>(&self, mut f: F) -> bool {
         let state = self.hub.coordinator.state();
         let active = state & self.hub.full_mask;
-        if active == 0 { return false; }
+        if active == 0 {
+            return false;
+        }
         let n = self.hub.ids.len();
         let start = self.cursor.get() as usize % n;
-        let split = if start == 0 { 0u64 } else { (1u64 << start) - 1 };
+        let split = if start == 0 {
+            0u64
+        } else {
+            (1u64 << start) - 1
+        };
         let high = active & !split;
-        let low  = active & split;
+        let low = active & split;
         for mut m in [high, low] {
             while m != 0 {
                 let i = m.trailing_zeros() as usize;
@@ -257,7 +287,9 @@ impl<In: Send, Out: Send, W: Waiter> HubDrain<In, Out, W> {
                 m &= m.wrapping_sub(1);
                 let v = unsafe { (*self.hub.inbound[i].0.get()).assume_init_read() };
                 self.hub.coordinator.lock_mask(bit);
-                let reply = HubReply { pipe: &self.hub.outbound[i] };
+                let reply = HubReply {
+                    pipe: &self.hub.outbound[i],
+                };
                 f(i, v, reply);
             }
         }
@@ -285,9 +317,13 @@ impl<In: Send, Out: Send, W: BlockingWaiter> HubDrain<In, Out, W> {
 
         let start = self.cursor.get() as usize % n;
         let active = state & self.hub.full_mask;
-        let split = if start == 0 { 0u64 } else { (1u64 << start) - 1 };
+        let split = if start == 0 {
+            0u64
+        } else {
+            (1u64 << start) - 1
+        };
         let high = active & !split;
-        let low  = active & split;
+        let low = active & split;
         for mut m in [high, low] {
             while m != 0 {
                 let i = m.trailing_zeros() as usize;
@@ -295,7 +331,9 @@ impl<In: Send, Out: Send, W: BlockingWaiter> HubDrain<In, Out, W> {
                 m &= m.wrapping_sub(1);
                 let v = unsafe { (*self.hub.inbound[i].0.get()).assume_init_read() };
                 self.hub.coordinator.lock_mask(bit);
-                let reply = HubReply { pipe: &self.hub.outbound[i] };
+                let reply = HubReply {
+                    pipe: &self.hub.outbound[i],
+                };
                 f(i, v, reply);
             }
         }
@@ -311,7 +349,11 @@ pub struct HubShutdown<In: Send, Out: Send, W: Waiter = ParkWaiter> {
 }
 
 impl<In: Send, Out: Send, W: Waiter> Clone for HubShutdown<In, Out, W> {
-    fn clone(&self) -> Self { Self { hub: self.hub.clone() } }
+    fn clone(&self) -> Self {
+        Self {
+            hub: self.hub.clone(),
+        }
+    }
 }
 
 impl<In: Send, Out: Send, W: Waiter> HubShutdown<In, Out, W> {
@@ -336,11 +378,15 @@ pub struct HubReply<'a, Out: Send, W: Waiter = ParkWaiter> {
 impl<'a, Out: Send, W: Waiter> HubReply<'a, Out, W> {
     /// Send the reply back to the originating port.
     #[inline]
-    pub fn send(self, v: Out) { self.pipe.send(v); }
+    pub fn send(self, v: Out) {
+        self.pipe.send(v);
+    }
 
     /// Access the underlying outbound pipe for advanced composition.
     #[inline]
-    pub fn pipe(&self) -> &Pipe<Out, NoHook, W> { self.pipe }
+    pub fn pipe(&self) -> &Pipe<Out, NoHook, W> {
+        self.pipe
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -359,10 +405,12 @@ mod tests {
 
         let d = thread::spawn(move || {
             drain.bind();
-            drain.recv_batch(|idx, msg, reply| {
-                assert_eq!(idx, 0);
-                reply.send(msg * 2);
-            }).unwrap();
+            drain
+                .recv_batch(|idx, msg, reply| {
+                    assert_eq!(idx, 0);
+                    reply.send(msg * 2);
+                })
+                .unwrap();
         });
 
         thread::sleep(Duration::from_millis(10));
@@ -390,16 +438,22 @@ mod tests {
 
         thread::sleep(Duration::from_millis(10));
 
-        let handles: Vec<_> = ports.into_iter().enumerate().map(|(i, p)| {
-            thread::spawn(move || {
-                p.bind();
-                for k in 0..50u64 {
-                    let r = p.call(k);
-                    assert_eq!(r, k + i as u64 * 1000);
-                }
+        let handles: Vec<_> = ports
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                thread::spawn(move || {
+                    p.bind();
+                    for k in 0..50u64 {
+                        let r = p.call(k);
+                        assert_eq!(r, k + i as u64 * 1000);
+                    }
+                })
             })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
         shutdown.signal();
         d.join().unwrap();
     }
@@ -431,11 +485,15 @@ mod tests {
 
         let h0 = thread::spawn(move || {
             p0.bind();
-            for k in 0..500u64 { p0.call(k); }
+            for k in 0..500u64 {
+                p0.call(k);
+            }
         });
         let h1 = thread::spawn(move || {
             p1.bind();
-            for k in 0..500u64 { p1.call(k); }
+            for k in 0..500u64 {
+                p1.call(k);
+            }
         });
         h0.join().unwrap();
         h1.join().unwrap();
@@ -499,7 +557,9 @@ mod tests {
     fn drop_drains_inflight_inbound() {
         struct Tracked(Arc<AtomicUsize>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let drops = Arc::new(AtomicUsize::new(0));
         {
@@ -529,10 +589,14 @@ mod tests {
 
         let d = thread::spawn(move || {
             drain.bind();
-            drain.recv_batch(|_, mut msg, reply| {
-                for b in msg.iter_mut() { *b = b.wrapping_add(1); }
-                reply.send(msg);
-            }).unwrap();
+            drain
+                .recv_batch(|_, mut msg, reply| {
+                    for b in msg.iter_mut() {
+                        *b = b.wrapping_add(1);
+                    }
+                    reply.send(msg);
+                })
+                .unwrap();
         });
         thread::sleep(Duration::from_millis(10));
         p.bind();

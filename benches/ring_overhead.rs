@@ -18,22 +18,24 @@
 //! Run:
 //!   cargo bench --bench ring_overhead 2>&1 | tee ring_overhead.log
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use arbitro_kit::stream::Ring;
 
 // Keep totals small per bench_safety: max ~1000 msgs per measurement.
-const MSGS:   usize = 1000;
-const BATCH:  usize = 1000;  // inner loop for single-thread timing precision
-const ROUNDS: usize = 300;   // samples per variant (best of)
+const MSGS: usize = 1000;
+const BATCH: usize = 1000; // inner loop for single-thread timing precision
+const ROUNDS: usize = 300; // samples per variant (best of)
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
-    println!("{:<28} {:>12} {:>12} {:>14}",
-             "variant", "p50_ns/op", "min_ns/op", "ops/sec");
+    println!(
+        "{:<28} {:>12} {:>12} {:>14}",
+        "variant", "p50_ns/op", "min_ns/op", "ops/sec"
+    );
     println!("{}", "─".repeat(72));
 }
 
@@ -53,7 +55,8 @@ fn st_ring<const CAP: usize>() -> Vec<u64> {
     r.set_consumer(std::thread::current());
     r.set_producer(std::thread::current());
     let mut samples = Vec::with_capacity(ROUNDS);
-    for _ in 0..10 { // warmup
+    for _ in 0..10 {
+        // warmup
         for i in 0..BATCH as u64 {
             r.try_send(i).unwrap();
             let _ = r.try_recv().unwrap();
@@ -78,12 +81,16 @@ fn ct_ring<const CAP: usize>() -> f64 {
     let consumer = thread::spawn(move || {
         r2.set_consumer(thread::current());
         let mut sum = 0u64;
-        for _ in 0..MSGS { sum = sum.wrapping_add(r2.recv()); }
+        for _ in 0..MSGS {
+            sum = sum.wrapping_add(r2.recv());
+        }
         sum
     });
     r.set_producer(thread::current());
     let t0 = Instant::now();
-    for i in 0..MSGS as u64 { r.send(i); }
+    for i in 0..MSGS as u64 {
+        r.send(i);
+    }
     let _ = consumer.join().unwrap();
     let ns = t0.elapsed().as_nanos() as f64;
     ns / MSGS as f64
@@ -107,7 +114,9 @@ fn burst_ring<const CAP: usize>() -> f64 {
     thread::sleep(std::time::Duration::from_millis(5));
     r.set_producer(thread::current());
     let t0 = Instant::now();
-    for i in 0..MSGS as u64 { r.send(i); }
+    for i in 0..MSGS as u64 {
+        r.send(i);
+    }
     let ns = t0.elapsed().as_nanos() as f64;
     stop.store(true, Ordering::Relaxed);
     r.send(0);
@@ -120,12 +129,18 @@ fn burst_ring<const CAP: usize>() -> f64 {
 fn drain_loop_vs_batch<const CAP: usize>(n: usize) -> (f64, f64) {
     let r: Ring<u64, CAP> = Ring::new();
 
-    for i in 0..n as u64 { r.try_send(i).unwrap(); }
+    for i in 0..n as u64 {
+        r.try_send(i).unwrap();
+    }
     let t0 = Instant::now();
-    for _ in 0..n { let _ = r.try_recv().unwrap(); }
+    for _ in 0..n {
+        let _ = r.try_recv().unwrap();
+    }
     let loop_ns = t0.elapsed().as_nanos() as f64 / n as f64;
 
-    for i in 0..n as u64 { r.try_send(i).unwrap(); }
+    for i in 0..n as u64 {
+        r.try_send(i).unwrap();
+    }
     let mut out = Vec::with_capacity(n);
     let t0 = Instant::now();
     let _ = r.drain_into(&mut out, n);
@@ -145,7 +160,9 @@ fn send_loop_vs_batch<const CAP: usize>(n: usize) -> (f64, f64) {
 
     // A) per-item try_send
     let t0 = Instant::now();
-    for i in 0..n as u64 { r.try_send(i).unwrap(); }
+    for i in 0..n as u64 {
+        r.try_send(i).unwrap();
+    }
     let loop_ns = t0.elapsed().as_nanos() as f64 / n as f64;
     drain.clear();
     let _ = r.drain_into(&mut drain, n);
@@ -239,18 +256,22 @@ fn batched_ring<const CAP: usize, const BSZ: usize>() -> f64 {
     let consumer = thread::spawn(move || {
         r2.set_consumer(thread::current());
         let mut count: u64 = 0;
-        let mut sum:   u64 = 0; // prevent loop elimination
+        let mut sum: u64 = 0; // prevent loop elimination
         let mut buf: Vec<u64> = Vec::with_capacity(BSZ);
         'outer: loop {
-            let v = r2.recv();              // block on not_empty
-            if v == u64::MAX { break; }     // sentinel from producer
+            let v = r2.recv(); // block on not_empty
+            if v == u64::MAX {
+                break;
+            } // sentinel from producer
             count += 1;
             sum = sum.wrapping_add(v);
             // One batched ack covers up to BSZ additional items.
             buf.clear();
             let _ = r2.drain_into(&mut buf, BSZ);
             for &x in &buf {
-                if x == u64::MAX { break 'outer; }
+                if x == u64::MAX {
+                    break 'outer;
+                }
                 count += 1;
                 sum = sum.wrapping_add(x);
             }
@@ -306,7 +327,10 @@ fn rt_single_thread_batched<const CAP: usize, const BSZ: usize>() -> f64 {
         let _ = req.try_send_from(&mut src);
         recv_buf.clear();
         let _ = req.drain_into(&mut recv_buf, BSZ);
-        let mut reply: Vec<u64> = recv_buf.iter().map(|v| v.wrapping_mul(2).wrapping_add(1)).collect();
+        let mut reply: Vec<u64> = recv_buf
+            .iter()
+            .map(|v| v.wrapping_mul(2).wrapping_add(1))
+            .collect();
         let _ = rsp.try_send_from(&mut reply);
         recv_buf.clear();
         let _ = rsp.drain_into(&mut recv_buf, BSZ);
@@ -320,7 +344,10 @@ fn rt_single_thread_batched<const CAP: usize, const BSZ: usize>() -> f64 {
         let _ = req.try_send_from(&mut src);
         recv_buf.clear();
         let _ = req.drain_into(&mut recv_buf, BSZ);
-        let mut reply: Vec<u64> = recv_buf.iter().map(|v| v.wrapping_mul(2).wrapping_add(1)).collect();
+        let mut reply: Vec<u64> = recv_buf
+            .iter()
+            .map(|v| v.wrapping_mul(2).wrapping_add(1))
+            .collect();
         let _ = rsp.try_send_from(&mut reply);
         recv_buf.clear();
         let _ = rsp.drain_into(&mut recv_buf, BSZ);
@@ -349,19 +376,26 @@ fn rt_cross_thread_batched<const CAP: usize, const BSZ: usize>() -> f64 {
         while processed < MSGS {
             // Block until at least one item arrives, then batch-drain.
             let first = req2.recv();
-            if first == u64::MAX { break; }
+            if first == u64::MAX {
+                break;
+            }
             buf.clear();
             buf.push(first.wrapping_mul(2).wrapping_add(1));
             let mut batch: Vec<u64> = Vec::with_capacity(BSZ);
             let _ = req2.drain_into(&mut batch, BSZ - 1);
             for v in batch {
-                if v == u64::MAX { break; }
+                if v == u64::MAX {
+                    break;
+                }
                 buf.push(v.wrapping_mul(2).wrapping_add(1));
             }
             processed += buf.len();
             while !buf.is_empty() {
                 let n = rsp2.try_send_from(&mut buf);
-                if n == 0 { let v = buf.remove(0); rsp2.send(v); }
+                if n == 0 {
+                    let v = buf.remove(0);
+                    rsp2.send(v);
+                }
             }
         }
     });
@@ -383,7 +417,10 @@ fn rt_cross_thread_batched<const CAP: usize, const BSZ: usize>() -> f64 {
             pending.extend(sent..sent + take as u64);
             while !pending.is_empty() {
                 let n = req.try_send_from(&mut pending);
-                if n == 0 { let v = pending.remove(0); req.send(v); }
+                if n == 0 {
+                    let v = pending.remove(0);
+                    req.send(v);
+                }
             }
             sent += take as u64;
         }
@@ -431,13 +468,18 @@ fn ct_ring_inline<const N: usize, const CAP: usize>() -> f64 {
     let consumer = thread::spawn(move || {
         r2.set_consumer(thread::current());
         let mut sum: u64 = 0;
-        for _ in 0..total { sum = sum.wrapping_add(r2.recv()[0] as u64); }
+        for _ in 0..total {
+            sum = sum.wrapping_add(r2.recv()[0] as u64);
+        }
         sum
     });
     r.set_producer(thread::current());
     let mut buf = [0u8; N];
     // Warmup (not timed).
-    for i in 0..WARMUP as u64 { buf[0] = i as u8; r.send(buf); }
+    for i in 0..WARMUP as u64 {
+        buf[0] = i as u8;
+        r.send(buf);
+    }
     // Timed region.
     let t0 = Instant::now();
     for i in 0..PMSGS as u64 {
@@ -459,7 +501,9 @@ fn ct_ring_boxed<const N: usize, const CAP: usize>() -> f64 {
     let consumer = thread::spawn(move || {
         r2.set_consumer(thread::current());
         let mut sum: u64 = 0;
-        for _ in 0..total { sum = sum.wrapping_add(r2.recv()[0] as u64); }
+        for _ in 0..total {
+            sum = sum.wrapping_add(r2.recv()[0] as u64);
+        }
         sum
     });
     r.set_producer(thread::current());
@@ -537,7 +581,10 @@ fn ct_ring_pooled<const N: usize, const CAP: usize>() -> f64 {
 // ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("Ring overhead bench  ({} ops × {} rounds + warmup)", BATCH, ROUNDS);
+    println!(
+        "Ring overhead bench  ({} ops × {} rounds + warmup)",
+        BATCH, ROUNDS
+    );
     println!("Cross-thread scenarios use N = {} messages.", MSGS);
 
     // ══════════════════════════════════════════════════════════════════
@@ -549,8 +596,8 @@ fn main() {
 
     // ── A1. single-thread, per-item ─────────────────────────────────
     header("A1. single-thread, per-item (try_send / try_recv)");
-    row("Ring<u64, 16>",   st_ring::<16>());
-    row("Ring<u64, 256>",  st_ring::<256>());
+    row("Ring<u64, 16>", st_ring::<16>());
+    row("Ring<u64, 256>", st_ring::<256>());
     row("Ring<u64, 1024>", st_ring::<1024>());
 
     // ── A2. single-thread, batch ────────────────────────────────────
@@ -558,44 +605,101 @@ fn main() {
     println!("{:<28} {:>14}", "variant", "ns/item");
     println!("{}", "─".repeat(48));
     let (lps, bts) = send_loop_vs_batch::<2048>(MSGS);
-    let (lp,  bt ) = drain_loop_vs_batch::<2048>(MSGS);
-    println!("{:<28} {:>12.2}", "send loop: try_send × N",     lps);
-    println!("{:<28} {:>12.2}", "send batch: try_send_from",   bts);
+    let (lp, bt) = drain_loop_vs_batch::<2048>(MSGS);
+    println!("{:<28} {:>12.2}", "send loop: try_send × N", lps);
+    println!("{:<28} {:>12.2}", "send batch: try_send_from", bts);
     println!("  speedup (send):  {:.2}×", lps / bts);
-    println!("{:<28} {:>12.2}", "recv loop: try_recv × N",     lp);
-    println!("{:<28} {:>12.2}", "recv batch: drain_into",      bt);
+    println!("{:<28} {:>12.2}", "recv loop: try_recv × N", lp);
+    println!("{:<28} {:>12.2}", "recv batch: drain_into", bt);
     println!("  speedup (recv):  {:.2}×", lp / bt);
 
     // ── A3. cross-thread, per-item ──────────────────────────────────
     println!("\n── A3. cross-thread, per-item ({} msgs) ──", MSGS);
     println!("{:<28} {:>14} {:>14}", "variant", "ns/op (min)", "ops/sec");
     println!("{}", "─".repeat(60));
-    let ct_r16   = (0..3).map(|_| ct_ring::<16>()).fold(f64::INFINITY, f64::min);
-    let ct_r256  = (0..3).map(|_| ct_ring::<256>()).fold(f64::INFINITY, f64::min);
-    let ct_r1024 = (0..3).map(|_| ct_ring::<1024>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 16>",   ct_r16,   1e9 / ct_r16);
-    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>",  ct_r256,  1e9 / ct_r256);
-    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 1024>", ct_r1024, 1e9 / ct_r1024);
+    let ct_r16 = (0..3)
+        .map(|_| ct_ring::<16>())
+        .fold(f64::INFINITY, f64::min);
+    let ct_r256 = (0..3)
+        .map(|_| ct_ring::<256>())
+        .fold(f64::INFINITY, f64::min);
+    let ct_r1024 = (0..3)
+        .map(|_| ct_ring::<1024>())
+        .fold(f64::INFINITY, f64::min);
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "Ring<u64, 16>",
+        ct_r16,
+        1e9 / ct_r16
+    );
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "Ring<u64, 256>",
+        ct_r256,
+        1e9 / ct_r256
+    );
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "Ring<u64, 1024>",
+        ct_r1024,
+        1e9 / ct_r1024
+    );
 
     // ── A4. cross-thread, batch ─────────────────────────────────────
-    println!("\n── A4. cross-thread, batch (send + ack amortized, {} msgs) ──", MSGS);
-    println!("{:<28} {:>14} {:>14}", "variant", "ns/item (min)", "ops/sec");
+    println!(
+        "\n── A4. cross-thread, batch (send + ack amortized, {} msgs) ──",
+        MSGS
+    );
+    println!(
+        "{:<28} {:>14} {:>14}",
+        "variant", "ns/item (min)", "ops/sec"
+    );
     println!("{}", "─".repeat(60));
-    let bt_b16  = (0..3).map(|_| batched_ring::<128, 16>()).fold(f64::INFINITY, f64::min);
-    let bt_b64  = (0..3).map(|_| batched_ring::<128, 64>()).fold(f64::INFINITY, f64::min);
-    let bt_b128 = (0..3).map(|_| batched_ring::<256, 128>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=16",  bt_b16,  1e9 / bt_b16);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=64",  bt_b64,  1e9 / bt_b64);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=256, B=128", bt_b128, 1e9 / bt_b128);
+    let bt_b16 = (0..3)
+        .map(|_| batched_ring::<128, 16>())
+        .fold(f64::INFINITY, f64::min);
+    let bt_b64 = (0..3)
+        .map(|_| batched_ring::<128, 64>())
+        .fold(f64::INFINITY, f64::min);
+    let bt_b128 = (0..3)
+        .map(|_| batched_ring::<256, 128>())
+        .fold(f64::INFINITY, f64::min);
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "CAP=128, B=16",
+        bt_b16,
+        1e9 / bt_b16
+    );
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "CAP=128, B=64",
+        bt_b64,
+        1e9 / bt_b64
+    );
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "CAP=256, B=128",
+        bt_b128,
+        1e9 / bt_b128
+    );
 
     // ── A5. cross-thread, burst ─────────────────────────────────────
-    println!("\n── A5. cross-thread, burst (producer-side, {} msgs) ──", MSGS);
+    println!(
+        "\n── A5. cross-thread, burst (producer-side, {} msgs) ──",
+        MSGS
+    );
     println!("{:<28} {:>14}", "variant", "producer ns/op");
     println!("{}", "─".repeat(48));
-    let b_r16   = (0..3).map(|_| burst_ring::<16>()).fold(f64::INFINITY, f64::min);
-    let b_r1024 = (0..3).map(|_| burst_ring::<1024>()).fold(f64::INFINITY, f64::min);
-    let b_r2048 = (0..3).map(|_| burst_ring::<2048>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.1}", "Ring<u64, 16>",   b_r16);
+    let b_r16 = (0..3)
+        .map(|_| burst_ring::<16>())
+        .fold(f64::INFINITY, f64::min);
+    let b_r1024 = (0..3)
+        .map(|_| burst_ring::<1024>())
+        .fold(f64::INFINITY, f64::min);
+    let b_r2048 = (0..3)
+        .map(|_| burst_ring::<2048>())
+        .fold(f64::INFINITY, f64::min);
+    println!("{:<28} {:>12.1}", "Ring<u64, 16>", b_r16);
     println!("{:<28} {:>12.1}", "Ring<u64, 1024>", b_r1024);
     println!("{:<28} {:>12.1} (CAP > MSGS)", "Ring<u64, 2048>", b_r2048);
 
@@ -607,55 +711,142 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════╝");
 
     // ── B1. single-thread, per-item ─────────────────────────────────
-    println!("\n── B1. single-thread round-trip, per-item ({} cycles) ──", MSGS);
-    println!("{:<28} {:>14} {:>14}", "variant", "ns/cycle (min)", "cycles/sec");
+    println!(
+        "\n── B1. single-thread round-trip, per-item ({} cycles) ──",
+        MSGS
+    );
+    println!(
+        "{:<28} {:>14} {:>14}",
+        "variant", "ns/cycle (min)", "cycles/sec"
+    );
     println!("{}", "─".repeat(60));
-    let st_rt_r32  = (0..3).map(|_| rt_single_thread::<32>()).fold(f64::INFINITY, f64::min);
-    let st_rt_r256 = (0..3).map(|_| rt_single_thread::<256>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 32>",  st_rt_r32,  1e9 / st_rt_r32);
-    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>", st_rt_r256, 1e9 / st_rt_r256);
+    let st_rt_r32 = (0..3)
+        .map(|_| rt_single_thread::<32>())
+        .fold(f64::INFINITY, f64::min);
+    let st_rt_r256 = (0..3)
+        .map(|_| rt_single_thread::<256>())
+        .fold(f64::INFINITY, f64::min);
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "Ring<u64, 32>",
+        st_rt_r32,
+        1e9 / st_rt_r32
+    );
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "Ring<u64, 256>",
+        st_rt_r256,
+        1e9 / st_rt_r256
+    );
 
     // ── B2. single-thread, batch ────────────────────────────────────
-    println!("\n── B2. single-thread round-trip, batch ({} items) ──", MSGS);
-    println!("{:<28} {:>14} {:>14}", "variant", "ns/item (min)", "ops/sec");
+    println!(
+        "\n── B2. single-thread round-trip, batch ({} items) ──",
+        MSGS
+    );
+    println!(
+        "{:<28} {:>14} {:>14}",
+        "variant", "ns/item (min)", "ops/sec"
+    );
     println!("{}", "─".repeat(60));
-    let stb_r256_b64  = (0..3).map(|_| rt_single_thread_batched::<256, 64>()).fold(f64::INFINITY, f64::min);
-    let stb_r512_b128 = (0..3).map(|_| rt_single_thread_batched::<512, 128>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.2} {:>14.0}", "CAP=256, B=64",  stb_r256_b64,  1e9 / stb_r256_b64);
-    println!("{:<28} {:>12.2} {:>14.0}", "CAP=512, B=128", stb_r512_b128, 1e9 / stb_r512_b128);
+    let stb_r256_b64 = (0..3)
+        .map(|_| rt_single_thread_batched::<256, 64>())
+        .fold(f64::INFINITY, f64::min);
+    let stb_r512_b128 = (0..3)
+        .map(|_| rt_single_thread_batched::<512, 128>())
+        .fold(f64::INFINITY, f64::min);
+    println!(
+        "{:<28} {:>12.2} {:>14.0}",
+        "CAP=256, B=64",
+        stb_r256_b64,
+        1e9 / stb_r256_b64
+    );
+    println!(
+        "{:<28} {:>12.2} {:>14.0}",
+        "CAP=512, B=128",
+        stb_r512_b128,
+        1e9 / stb_r512_b128
+    );
 
     // ── B3. cross-thread, per-item ──────────────────────────────────
-    println!("\n── B3. cross-thread round-trip, per-item ({} cycles) ──", MSGS);
-    println!("{:<28} {:>14} {:>14}", "variant", "ns/cycle (min)", "cycles/sec");
+    println!(
+        "\n── B3. cross-thread round-trip, per-item ({} cycles) ──",
+        MSGS
+    );
+    println!(
+        "{:<28} {:>14} {:>14}",
+        "variant", "ns/cycle (min)", "cycles/sec"
+    );
     println!("{}", "─".repeat(60));
-    let rt_r32   = (0..3).map(|_| rt_ring::<32>()).fold(f64::INFINITY, f64::min);
-    let rt_r256  = (0..3).map(|_| rt_ring::<256>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 32>",  rt_r32,  1e9 / rt_r32);
-    println!("{:<28} {:>12.1} {:>14.0}", "Ring<u64, 256>", rt_r256, 1e9 / rt_r256);
+    let rt_r32 = (0..3)
+        .map(|_| rt_ring::<32>())
+        .fold(f64::INFINITY, f64::min);
+    let rt_r256 = (0..3)
+        .map(|_| rt_ring::<256>())
+        .fold(f64::INFINITY, f64::min);
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "Ring<u64, 32>",
+        rt_r32,
+        1e9 / rt_r32
+    );
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "Ring<u64, 256>",
+        rt_r256,
+        1e9 / rt_r256
+    );
 
     // ── B4. cross-thread, batch ─────────────────────────────────────
-    println!("\n── B4. cross-thread round-trip, batch ({} items) ──", MSGS);
-    println!("{:<28} {:>14} {:>14}", "variant", "ns/item (min)", "ops/sec");
+    println!(
+        "\n── B4. cross-thread round-trip, batch ({} items) ──",
+        MSGS
+    );
+    println!(
+        "{:<28} {:>14} {:>14}",
+        "variant", "ns/item (min)", "ops/sec"
+    );
     println!("{}", "─".repeat(60));
-    let xtb_r128_b32  = (0..3).map(|_| rt_cross_thread_batched::<128, 32>()).fold(f64::INFINITY, f64::min);
-    let xtb_r256_b128 = (0..3).map(|_| rt_cross_thread_batched::<256, 128>()).fold(f64::INFINITY, f64::min);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=128, B=32",  xtb_r128_b32,  1e9 / xtb_r128_b32);
-    println!("{:<28} {:>12.1} {:>14.0}", "CAP=256, B=128", xtb_r256_b128, 1e9 / xtb_r256_b128);
+    let xtb_r128_b32 = (0..3)
+        .map(|_| rt_cross_thread_batched::<128, 32>())
+        .fold(f64::INFINITY, f64::min);
+    let xtb_r256_b128 = (0..3)
+        .map(|_| rt_cross_thread_batched::<256, 128>())
+        .fold(f64::INFINITY, f64::min);
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "CAP=128, B=32",
+        xtb_r128_b32,
+        1e9 / xtb_r128_b32
+    );
+    println!(
+        "{:<28} {:>12.1} {:>14.0}",
+        "CAP=256, B=128",
+        xtb_r256_b128,
+        1e9 / xtb_r256_b128
+    );
 
     // ══════════════════════════════════════════════════════════════════
     //            C. PAYLOAD SIZE SWEEP (XT per-item, inline vs Box)
     // ══════════════════════════════════════════════════════════════════
     println!("\n╔══════════════════════════════════════════════════════════╗");
-    println!("║ C. PAYLOAD SIZE SWEEP (XT per-item, {} msgs)          ║", PMSGS);
+    println!(
+        "║ C. PAYLOAD SIZE SWEEP (XT per-item, {} msgs)          ║",
+        PMSGS
+    );
     println!("╚══════════════════════════════════════════════════════════╝");
     println!("Inline: Ring<[u8; N], CAP>       — memcpy per send + per recv.");
     println!("Boxed:  Ring<Box<[u8; N]>, CAP>  — fresh Box::new per send (incl. alloc+memset).");
     println!("Pooled: Ring<Box<[u8; N]>, CAP>  — pre-allocated pool, no alloc/free timed.");
-    println!("Stats over {} runs (after {} warmup iters per run). min / p50.",
-             PAYLOAD_RUNS, WARMUP);
+    println!(
+        "Stats over {} runs (after {} warmup iters per run). min / p50.",
+        PAYLOAD_RUNS, WARMUP
+    );
     println!();
-    println!("{:<9} {:>14} {:>14} {:>14} {:>10}",
-             "payload", "inline min/p50", "boxed min/p50", "pool min/p50", "winner");
+    println!(
+        "{:<9} {:>14} {:>14} {:>14} {:>10}",
+        "payload", "inline min/p50", "boxed min/p50", "pool min/p50", "winner"
+    );
     println!("{}", "─".repeat(74));
 
     // Take `runs` samples; return (min, p50).
@@ -666,24 +857,76 @@ fn main() {
         let p50 = xs[xs.len() / 2];
         (min, p50)
     }
-    fn fmt(x: (f64, f64)) -> String { format!("{:>5.1} / {:>5.1}", x.0, x.1) }
+    fn fmt(x: (f64, f64)) -> String {
+        format!("{:>5.1} / {:>5.1}", x.0, x.1)
+    }
 
-    let sizes: [(&str, (f64,f64), (f64,f64), (f64,f64)); 8] = [
-        ("64 B",    stats(|| ct_ring_inline::<64,    256>()), stats(|| ct_ring_boxed::<64,    256>()), stats(|| ct_ring_pooled::<64,    256>())),
-        ("256 B",   stats(|| ct_ring_inline::<256,   256>()), stats(|| ct_ring_boxed::<256,   256>()), stats(|| ct_ring_pooled::<256,   256>())),
-        ("512 B",   stats(|| ct_ring_inline::<512,   256>()), stats(|| ct_ring_boxed::<512,   256>()), stats(|| ct_ring_pooled::<512,   256>())),
-        ("1 KB",    stats(|| ct_ring_inline::<1024,  256>()), stats(|| ct_ring_boxed::<1024,  256>()), stats(|| ct_ring_pooled::<1024,  256>())),
-        ("4 KB",    stats(|| ct_ring_inline::<4096,  64 >()), stats(|| ct_ring_boxed::<4096,  64 >()), stats(|| ct_ring_pooled::<4096,  64 >())),
-        ("16 KB",   stats(|| ct_ring_inline::<16384, 16 >()), stats(|| ct_ring_boxed::<16384, 16 >()), stats(|| ct_ring_pooled::<16384, 16 >())),
-        ("32 KB",   stats(|| ct_ring_inline::<32768, 16 >()), stats(|| ct_ring_boxed::<32768, 16 >()), stats(|| ct_ring_pooled::<32768, 16 >())),
-        ("64 KB",   stats(|| ct_ring_inline::<65536, 8  >()), stats(|| ct_ring_boxed::<65536, 8  >()), stats(|| ct_ring_pooled::<65536, 8  >())),
+    let sizes: [(&str, (f64, f64), (f64, f64), (f64, f64)); 8] = [
+        (
+            "64 B",
+            stats(|| ct_ring_inline::<64, 256>()),
+            stats(|| ct_ring_boxed::<64, 256>()),
+            stats(|| ct_ring_pooled::<64, 256>()),
+        ),
+        (
+            "256 B",
+            stats(|| ct_ring_inline::<256, 256>()),
+            stats(|| ct_ring_boxed::<256, 256>()),
+            stats(|| ct_ring_pooled::<256, 256>()),
+        ),
+        (
+            "512 B",
+            stats(|| ct_ring_inline::<512, 256>()),
+            stats(|| ct_ring_boxed::<512, 256>()),
+            stats(|| ct_ring_pooled::<512, 256>()),
+        ),
+        (
+            "1 KB",
+            stats(|| ct_ring_inline::<1024, 256>()),
+            stats(|| ct_ring_boxed::<1024, 256>()),
+            stats(|| ct_ring_pooled::<1024, 256>()),
+        ),
+        (
+            "4 KB",
+            stats(|| ct_ring_inline::<4096, 64>()),
+            stats(|| ct_ring_boxed::<4096, 64>()),
+            stats(|| ct_ring_pooled::<4096, 64>()),
+        ),
+        (
+            "16 KB",
+            stats(|| ct_ring_inline::<16384, 16>()),
+            stats(|| ct_ring_boxed::<16384, 16>()),
+            stats(|| ct_ring_pooled::<16384, 16>()),
+        ),
+        (
+            "32 KB",
+            stats(|| ct_ring_inline::<32768, 16>()),
+            stats(|| ct_ring_boxed::<32768, 16>()),
+            stats(|| ct_ring_pooled::<32768, 16>()),
+        ),
+        (
+            "64 KB",
+            stats(|| ct_ring_inline::<65536, 8>()),
+            stats(|| ct_ring_boxed::<65536, 8>()),
+            stats(|| ct_ring_pooled::<65536, 8>()),
+        ),
     ];
     for (name, inl, bx, pl) in sizes {
-        let winner = if pl.0 <= inl.0 && pl.0 <= bx.0 { "pool"   }
-                     else if inl.0 <= bx.0           { "inline" }
-                     else                            { "box"    };
-        println!("{:<9} {:>14} {:>14} {:>14} {:>10}",
-                 name, fmt(inl), fmt(bx), fmt(pl), winner);
+        let winner = if pl.0 <= inl.0 && pl.0 <= bx.0 {
+            "pool"
+        } else if inl.0 <= bx.0 {
+            "inline"
+        } else {
+            "box"
+        };
+        println!(
+            "{:<9} {:>14} {:>14} {:>14} {:>10}",
+            name,
+            fmt(inl),
+            fmt(bx),
+            fmt(pl),
+            winner
+        );
     }
 
     println!();

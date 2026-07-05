@@ -54,7 +54,7 @@ use super::stream::Stream;
 /// incoming. The peer holds the same two `Arc`s but with the
 /// direction labels swapped.
 pub struct DuplexEnd<S, R, W: Waiter = ParkWaiter> {
-    out:   Arc<Stream<S, W>>,
+    out: Arc<Stream<S, W>>,
     inbox: Arc<Stream<R, W>>,
 }
 
@@ -76,11 +76,15 @@ impl<S, R, W: Waiter> DuplexEnd<S, R, W> {
 
     /// Borrow the outbound stream — for cursor checks, custom flows.
     #[inline]
-    pub fn out_stream(&self) -> &Stream<S, W> { &self.out }
+    pub fn out_stream(&self) -> &Stream<S, W> {
+        &self.out
+    }
 
     /// Total items WE have produced toward the peer.
     #[inline]
-    pub fn out_tail(&self) -> u64 { self.out.tail() }
+    pub fn out_tail(&self) -> u64 {
+        self.out.tail()
+    }
 
     /// Returns `true` if the peer has drained past this receipt's
     /// message in our outbound stream. Cost: one Acquire load.
@@ -130,15 +134,21 @@ impl<S, R, W: Waiter> DuplexEnd<S, R, W> {
 
     /// Borrow the inbound stream — for cursor checks, custom flows.
     #[inline]
-    pub fn in_stream(&self) -> &Stream<R, W> { &self.inbox }
+    pub fn in_stream(&self) -> &Stream<R, W> {
+        &self.inbox
+    }
 
     /// Total items WE have drained from the peer's outbound.
     #[inline]
-    pub fn in_cursor(&self) -> u64 { self.inbox.cursor() }
+    pub fn in_cursor(&self) -> u64 {
+        self.inbox.cursor()
+    }
 
     /// Total items the PEER has produced toward us.
     #[inline]
-    pub fn peer_tail(&self) -> u64 { self.inbox.tail() }
+    pub fn peer_tail(&self) -> u64 {
+        self.inbox.tail()
+    }
 }
 
 impl<S, R, W: BlockingWaiter> DuplexEnd<S, R, W> {
@@ -192,11 +202,11 @@ impl<A: Send + 'static, B: Send + 'static, W: Waiter + 'static> Duplex<A, B, W> 
         let b_to_a: Arc<Stream<B, W>> = Arc::new(Stream::new_strict());
 
         let left = DuplexEnd {
-            out:   a_to_b.clone(),
+            out: a_to_b.clone(),
             inbox: b_to_a.clone(),
         };
         let right = DuplexEnd {
-            out:   b_to_a,
+            out: b_to_a,
             inbox: a_to_b,
         };
         (left, right)
@@ -222,8 +232,12 @@ mod tests {
     fn each_direction_is_independent() {
         let (a, b) = Duplex::<u64, u64>::pair();
         // a sends 0,1,2 to b; b independently sends 100,101,102 to a.
-        a.send(0); a.send(1); a.send(2);
-        b.send(100); b.send(101); b.send(102);
+        a.send(0);
+        a.send(1);
+        a.send(2);
+        b.send(100);
+        b.send(101);
+        b.send(102);
 
         assert_eq!(b.try_recv(), Some(0));
         assert_eq!(a.try_recv(), Some(100));
@@ -243,7 +257,7 @@ mod tests {
             server.set_consumer(thread::current());
             for _ in 0..100 {
                 let req = server.recv();
-                server.send(req.wrapping_mul(2) | 1);   // reply
+                server.send(req.wrapping_mul(2) | 1); // reply
             }
         });
 
@@ -265,24 +279,26 @@ mod tests {
         assert_eq!(a.out_tail(), 0);
         assert_eq!(b.out_tail(), 0);
 
-        a.send(1); a.send(2); a.send(3);
+        a.send(1);
+        a.send(2);
+        a.send(3);
         assert_eq!(a.out_tail(), 3);
-        assert_eq!(b.peer_tail(), 3);  // b sees a's tail through its inbox
+        assert_eq!(b.peer_tail(), 3); // b sees a's tail through its inbox
 
         b.send(10);
         assert_eq!(b.out_tail(), 1);
         assert_eq!(a.peer_tail(), 1);
 
         b.try_recv();
-        assert_eq!(b.in_cursor(), 1);  // b drained 1 item from a's stream
+        assert_eq!(b.in_cursor(), 1); // b drained 1 item from a's stream
     }
 
     #[test]
     fn type_level_direction() {
         // This test exists primarily as a compile-time sanity check.
         let (req_side, resp_side) = Duplex::<&'static str, u32>::pair();
-        req_side.send("hello");                // OK — req_side sends &str
-        // req_side.send(42u32);              // would NOT compile — wrong type
+        req_side.send("hello"); // OK — req_side sends &str
+                                // req_side.send(42u32);              // would NOT compile — wrong type
         assert_eq!(resp_side.try_recv(), Some("hello"));
 
         resp_side.send(42);
@@ -309,11 +325,11 @@ mod tests {
         assert_eq!(b.try_recv(), Some(200));
 
         // Now r0 and r1 are delivered; r2 still pending.
-        assert!( a.is_delivered(r0));
-        assert!( a.is_delivered(r1));
+        assert!(a.is_delivered(r0));
+        assert!(a.is_delivered(r1));
         assert!(!a.is_delivered(r2));
 
-        b.try_recv();   // drain the last one
+        b.try_recv(); // drain the last one
         assert!(a.is_delivered(r2));
     }
 
@@ -328,7 +344,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
             assert_eq!(bb.try_recv(), Some(42));
         });
-        a.wait_delivered(r);   // busy-spins until peer drains
+        a.wait_delivered(r); // busy-spins until peer drains
         handle.join().unwrap();
     }
 
@@ -340,7 +356,9 @@ mod tests {
         assert!(!a.is_delivered(r));
 
         // Drain everything; receipt for last item is delivered.
-        for _ in 0..100 { b.try_recv(); }
+        for _ in 0..100 {
+            b.try_recv();
+        }
         assert!(a.is_delivered(r));
     }
 
@@ -350,14 +368,20 @@ mod tests {
 
         struct Tracked(Arc<AtomicUsize>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let drops = Arc::new(AtomicUsize::new(0));
         {
             let (a, b) = Duplex::<Tracked, Tracked>::pair();
-            for _ in 0..5 { a.send(Tracked(drops.clone())); }
-            for _ in 0..3 { b.send(Tracked(drops.clone())); }
+            for _ in 0..5 {
+                a.send(Tracked(drops.clone()));
+            }
+            for _ in 0..3 {
+                b.send(Tracked(drops.clone()));
+            }
             // a sent 5 to b's inbox, b sent 3 to a's inbox; nothing drained.
         } // drop both ends → drops both streams → drains 5 + 3 = 8.
         assert_eq!(drops.load(Ordering::Relaxed), 8);

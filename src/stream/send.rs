@@ -29,7 +29,9 @@ impl<T, W: Waiter> Stream<T, W> {
         // and the segment freed).
         let seg_ref = unsafe { &*seg };
         let idx = seg_ref.idx(seq);
-        unsafe { (*seg_ref.slots[idx].get()).write(value); }
+        unsafe {
+            (*seg_ref.slots[idx].get()).write(value);
+        }
 
         // Publish: Release pairs with consumer's Acquire on tail_pos
         // to make the slot write visible cross-thread.
@@ -73,7 +75,9 @@ impl<T, W: Waiter> Stream<T, W> {
             }
             let seg_ref = unsafe { &*seg };
             let idx = seg_ref.idx(current_seq);
-            unsafe { (*seg_ref.slots[idx].get()).write(value); }
+            unsafe {
+                (*seg_ref.slots[idx].get()).write(value);
+            }
             current_seq += 1;
         }
 

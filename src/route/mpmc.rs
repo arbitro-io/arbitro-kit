@@ -83,8 +83,9 @@ impl<T: Send, const RING_CAP: usize> PRing<T, RING_CAP> {
     const MASK: usize = RING_CAP - 1;
 
     fn new() -> Self {
-        let slots: Vec<UnsafeCell<MaybeUninit<T>>> =
-            (0..RING_CAP).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect();
+        let slots: Vec<UnsafeCell<MaybeUninit<T>>> = (0..RING_CAP)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect();
         Self {
             head: AtomicUsize::new(0),
             _pad_head: [0u8; CACHE_LINE - core::mem::size_of::<AtomicUsize>()],
@@ -139,7 +140,9 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> Shard<T, RING_CAP, W> {
             let ring = &self.rings[p];
             let h = ring.head.load(Ordering::Acquire);
             let t = ring.tail.load(Ordering::Relaxed);
-            if h != t { return true; }
+            if h != t {
+                return true;
+            }
         }
         false
     }
@@ -169,8 +172,7 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcInner<T, RING_CAP, W> {
 
         let mut shards_vec = Vec::with_capacity(n);
         for _ in 0..n {
-            let rings: Vec<PRing<T, RING_CAP>> =
-                (0..m).map(|_| PRing::new()).collect();
+            let rings: Vec<PRing<T, RING_CAP>> = (0..m).map(|_| PRing::new()).collect();
             shards_vec.push(Shard {
                 rings: rings.into_boxed_slice(),
                 consumer_waiter: W::default(),
@@ -199,8 +201,7 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> Drop for MpmcInner<T, RING_CAP, 
                 let mut t = ring.tail.load(Ordering::Acquire);
                 while t != h {
                     unsafe {
-                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                            .assume_init_drop();
+                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get()).assume_init_drop();
                     }
                     t = t.wrapping_add(1);
                 }
@@ -214,9 +215,7 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> Drop for MpmcInner<T, RING_CAP, 
 /// M:N bounded channel, sharded across `N` consumers. Each `(producer,
 /// shard)` pair is an SPSC ring of `RING_CAP` slots. Generic over the
 /// [`Waiter`] backend; defaults to `ParkWaiter` for OS-thread `park`/`unpark`.
-pub struct Mpmc<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter>(
-    PhantomData<(T, W)>,
-);
+pub struct Mpmc<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWaiter>(PhantomData<(T, W)>);
 
 impl<T: Send + 'static, const RING_CAP: usize, W: Waiter + 'static> Mpmc<T, RING_CAP, W> {
     /// Build an `Mpmc` with `m` producers and `n` consumer shards.
@@ -277,7 +276,9 @@ pub struct MpmcProducer<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWai
 impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
     /// Numeric index of this producer (`0..m`).
     #[inline]
-    pub fn index(&self) -> usize { self.my_idx }
+    pub fn index(&self) -> usize {
+        self.my_idx
+    }
 
     /// Register this thread as the producer's backpressure waiter. Must
     /// be called from the thread that will invoke [`send`](Self::send)
@@ -285,8 +286,7 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
     /// waiter backends.
     #[inline]
     pub fn bind(&self) {
-        self.inner.producer_waiters[self.my_idx]
-            .set_worker(std::thread::current());
+        self.inner.producer_waiters[self.my_idx].set_worker(std::thread::current());
     }
 
     /// `true` if at least one shard's ring for this producer has room.
@@ -306,10 +306,14 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
     // ── Capacity introspection (snapshot, non-consistent) ────────────────
 
     #[inline]
-    pub const fn capacity_per_shard(&self) -> usize { RING_CAP }
+    pub const fn capacity_per_shard(&self) -> usize {
+        RING_CAP
+    }
 
     #[inline]
-    pub fn total_capacity(&self) -> usize { self.inner.n * RING_CAP }
+    pub fn total_capacity(&self) -> usize {
+        self.inner.n * RING_CAP
+    }
 
     #[inline]
     pub fn available_in_shard(&self, s: usize) -> usize {
@@ -370,7 +374,9 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
             let ring = &shard.rings[self.my_idx];
             let h = ring.head.load(Ordering::Relaxed);
             let t = ring.tail.load(Ordering::Acquire);
-            if PRing::<T, RING_CAP>::is_full(h, t) { continue; }
+            if PRing::<T, RING_CAP>::is_full(h, t) {
+                continue;
+            }
             unsafe {
                 (*ring.slots[h & PRing::<T, RING_CAP>::MASK].get()).write(value);
             }
@@ -384,7 +390,9 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
 
     /// Batch send. Drains as many items as fit into a single ring.
     pub fn try_send_batch(&self, items: &mut Vec<T>) -> usize {
-        if items.is_empty() { return 0; }
+        if items.is_empty() {
+            return 0;
+        }
         let n = self.inner.n;
         let start = (self.cursor.get() as usize) % n;
         for k in 0..n {
@@ -394,7 +402,9 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
             let h0 = ring.head.load(Ordering::Relaxed);
             let t = ring.tail.load(Ordering::Acquire);
             let used = h0.wrapping_sub(t);
-            if used >= RING_CAP { continue; }
+            if used >= RING_CAP {
+                continue;
+            }
             let avail = RING_CAP - used;
             let take = items.len().min(avail);
             let mut h = h0;
@@ -423,8 +433,7 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcProducer<T, RING_CAP
                 Ok(()) => return,
                 Err(v) => value = v,
             }
-            self.inner.producer_waiters[self.my_idx]
-                .wait_until(|| self.has_idle_shard());
+            self.inner.producer_waiters[self.my_idx].wait_until(|| self.has_idle_shard());
         }
     }
 }
@@ -472,7 +481,9 @@ pub struct MpmcConsumer<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWai
 impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
     /// Numeric index of this consumer's shard (`0..n`).
     #[inline]
-    pub fn shard(&self) -> usize { self.shard_idx }
+    pub fn shard(&self) -> usize {
+        self.shard_idx
+    }
 
     /// Register this thread as the shard's drain worker. Must be called
     /// before the first blocking `recv` / `recv_batch`. No-op for async
@@ -487,10 +498,14 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
     // ── Capacity introspection (snapshot, non-consistent) ────────────────
 
     #[inline]
-    pub const fn capacity_per_producer(&self) -> usize { RING_CAP }
+    pub const fn capacity_per_producer(&self) -> usize {
+        RING_CAP
+    }
 
     #[inline]
-    pub fn total_capacity(&self) -> usize { self.inner.m * RING_CAP }
+    pub fn total_capacity(&self) -> usize {
+        self.inner.m * RING_CAP
+    }
 
     #[inline]
     pub fn pending(&self) -> usize {
@@ -543,11 +558,11 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
             let ring = &shard.rings[p];
             let t = ring.tail.load(Ordering::Relaxed);
             let h = ring.head.load(Ordering::Acquire);
-            if t == h { continue; }
-            let v = unsafe {
-                (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                    .assume_init_read()
-            };
+            if t == h {
+                continue;
+            }
+            let v =
+                unsafe { (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get()).assume_init_read() };
             ring.tail.store(t.wrapping_add(1), Ordering::Release);
             self.inner.producer_waiters[p].wake();
             return Some(v);
@@ -573,11 +588,12 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
                 let ring = &shard.rings[p];
                 let mut t = ring.tail.load(Ordering::Relaxed);
                 let h = ring.head.load(Ordering::Acquire);
-                if t == h { continue; }
+                if t == h {
+                    continue;
+                }
                 while t != h {
                     let v = unsafe {
-                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get())
-                            .assume_init_read()
+                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get()).assume_init_read()
                     };
                     t = t.wrapping_add(1);
                     f(v);
@@ -587,7 +603,9 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
                 ring.tail.store(t, Ordering::Release);
                 self.inner.producer_waiters[p].wake();
             }
-            if !progress { return count; }
+            if !progress {
+                return count;
+            }
         }
     }
 }
@@ -597,14 +615,15 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcConsumer<T, RING_CAP
     /// one of this shard's rings or shutdown fires.
     pub fn recv(&self) -> Result<T, Shutdown> {
         loop {
-            if let Some(v) = self.try_recv() { return Ok(v); }
+            if let Some(v) = self.try_recv() {
+                return Ok(v);
+            }
             if self.inner.shutdown.load(Ordering::Acquire) {
                 return Err(Shutdown);
             }
             let shard = &self.inner.shards[self.shard_idx];
             shard.consumer_waiter.wait_until(|| {
-                shard.any_ring_has_work()
-                    || self.inner.shutdown.load(Ordering::Acquire)
+                shard.any_ring_has_work() || self.inner.shutdown.load(Ordering::Acquire)
             });
         }
     }
@@ -614,14 +633,15 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcConsumer<T, RING_CAP
     pub fn recv_batch<F: FnMut(T)>(&self, mut f: F) -> Result<usize, Shutdown> {
         loop {
             let count = self.drain_all(&mut f);
-            if count > 0 { return Ok(count); }
+            if count > 0 {
+                return Ok(count);
+            }
             if self.inner.shutdown.load(Ordering::Acquire) {
                 return Err(Shutdown);
             }
             let shard = &self.inner.shards[self.shard_idx];
             shard.consumer_waiter.wait_until(|| {
-                shard.any_ring_has_work()
-                    || self.inner.shutdown.load(Ordering::Acquire)
+                shard.any_ring_has_work() || self.inner.shutdown.load(Ordering::Acquire)
             });
         }
     }
@@ -631,7 +651,9 @@ impl<T: Send, const RING_CAP: usize, W: AsyncWaiter> MpmcConsumer<T, RING_CAP, W
     /// Async single-item take.
     pub async fn recv_async(&self) -> Result<T, Shutdown> {
         loop {
-            if let Some(v) = self.try_recv() { return Ok(v); }
+            if let Some(v) = self.try_recv() {
+                return Ok(v);
+            }
             if self.inner.shutdown.load(Ordering::Acquire) {
                 return Err(Shutdown);
             }
@@ -639,9 +661,10 @@ impl<T: Send, const RING_CAP: usize, W: AsyncWaiter> MpmcConsumer<T, RING_CAP, W
             // Borrow only the shard + shutdown atomic (both Sync) — not
             // `self`, because `MpmcConsumer` is intentionally `!Sync`.
             let shutdown = &self.inner.shutdown;
-            shard.consumer_waiter.wait_until(|| {
-                shard.any_ring_has_work() || shutdown.load(Ordering::Acquire)
-            }).await;
+            shard
+                .consumer_waiter
+                .wait_until(|| shard.any_ring_has_work() || shutdown.load(Ordering::Acquire))
+                .await;
         }
     }
 }
@@ -653,7 +676,11 @@ pub struct MpmcShutdown<T: Send, const RING_CAP: usize = 64, W: Waiter = ParkWai
 }
 
 impl<T: Send, const RING_CAP: usize, W: Waiter> Clone for MpmcShutdown<T, RING_CAP, W> {
-    fn clone(&self) -> Self { Self { inner: self.inner.clone() } }
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcShutdown<T, RING_CAP, W> {
@@ -732,8 +759,12 @@ mod tests {
         }
 
         // ── Send 5 from p0, 3 from p1, 0 from p2 ──────────────────────────
-        for v in 0..5u64 { ps[0].try_send(v).unwrap(); }
-        for v in 100..103u64 { ps[1].try_send(v).unwrap(); }
+        for v in 0..5u64 {
+            ps[0].try_send(v).unwrap();
+        }
+        for v in 100..103u64 {
+            ps[1].try_send(v).unwrap();
+        }
 
         // Producer p0: pending == sum of per-shard pending == 5
         let p0_per_shard: usize = (0..N).map(|s| ps[0].pending_in_shard(s)).sum();
@@ -769,7 +800,8 @@ mod tests {
 
         // ── Drain consumer 0 and verify the deltas reconcile ──────────────
         let drained_at_c0 = cs[0].try_recv_batch(|_| {});
-        let pending_at_c0_before_drain = 5 + 3 - cs.iter().skip(1).map(|c| c.pending()).sum::<usize>();
+        let pending_at_c0_before_drain =
+            5 + 3 - cs.iter().skip(1).map(|c| c.pending()).sum::<usize>();
         assert_eq!(drained_at_c0, pending_at_c0_before_drain);
 
         // After draining c0: c0.pending == 0, the other consumers unchanged.
@@ -844,38 +876,51 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(M + N));
 
-        let consumers: Vec<_> = cs.into_iter().map(|c| {
-            let got_sum = got_sum.clone();
-            let got_count = got_count.clone();
-            let b = barrier.clone();
-            thread::spawn(move || {
-                c.bind();
-                b.wait();
-                loop {
-                    match c.recv_batch(|v| {
-                        got_sum.fetch_add(v as usize, Ordering::Relaxed);
-                        got_count.fetch_add(1, Ordering::Relaxed);
-                    }) {
-                        Ok(_) => continue,
-                        Err(Shutdown) => break,
+        let consumers: Vec<_> = cs
+            .into_iter()
+            .map(|c| {
+                let got_sum = got_sum.clone();
+                let got_count = got_count.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    c.bind();
+                    b.wait();
+                    loop {
+                        match c.recv_batch(|v| {
+                            got_sum.fetch_add(v as usize, Ordering::Relaxed);
+                            got_count.fetch_add(1, Ordering::Relaxed);
+                        }) {
+                            Ok(_) => continue,
+                            Err(Shutdown) => break,
+                        }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
-        let producers: Vec<_> = ps.into_iter().enumerate().map(|(i, p)| {
-            let b = barrier.clone();
-            thread::spawn(move || {
-                p.bind();
-                b.wait();
-                for k in 0..PER { p.send(i as u64 * 10_000 + k); }
+        let producers: Vec<_> = ps
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    p.bind();
+                    b.wait();
+                    for k in 0..PER {
+                        p.send(i as u64 * 10_000 + k);
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
-        for h in producers { h.join().unwrap(); }
+        for h in producers {
+            h.join().unwrap();
+        }
         thread::sleep(Duration::from_millis(20));
         sd2.signal();
-        for h in consumers { h.join().unwrap(); }
+        for h in consumers {
+            h.join().unwrap();
+        }
 
         assert_eq!(got_count.load(Ordering::Relaxed), (M as u64 * PER) as usize);
         assert_eq!(got_sum.load(Ordering::Relaxed) as u64, sum_expected);
@@ -893,36 +938,49 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(M + N));
 
-        let consumers: Vec<_> = cs.into_iter().enumerate().map(|(s, c)| {
-            let counts = counts.clone();
-            let b = barrier.clone();
-            thread::spawn(move || {
-                c.bind();
-                b.wait();
-                loop {
-                    match c.recv_batch(|_| {
-                        counts[s].fetch_add(1, Ordering::Relaxed);
-                    }) {
-                        Ok(_) => continue,
-                        Err(Shutdown) => break,
+        let consumers: Vec<_> = cs
+            .into_iter()
+            .enumerate()
+            .map(|(s, c)| {
+                let counts = counts.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    c.bind();
+                    b.wait();
+                    loop {
+                        match c.recv_batch(|_| {
+                            counts[s].fetch_add(1, Ordering::Relaxed);
+                        }) {
+                            Ok(_) => continue,
+                            Err(Shutdown) => break,
+                        }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
-        let producers: Vec<_> = ps.into_iter().map(|p| {
-            let b = barrier.clone();
-            thread::spawn(move || {
-                p.bind();
-                b.wait();
-                for k in 0..PER { p.send(k); }
+        let producers: Vec<_> = ps
+            .into_iter()
+            .map(|p| {
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    p.bind();
+                    b.wait();
+                    for k in 0..PER {
+                        p.send(k);
+                    }
+                })
             })
-        }).collect();
-        for h in producers { h.join().unwrap(); }
+            .collect();
+        for h in producers {
+            h.join().unwrap();
+        }
 
         thread::sleep(Duration::from_millis(20));
         sd2.signal();
-        for h in consumers { h.join().unwrap(); }
+        for h in consumers {
+            h.join().unwrap();
+        }
 
         let total: usize = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
         assert_eq!(total, M * PER as usize);
@@ -932,12 +990,15 @@ mod tests {
     fn shutdown_wakes_all_parked_consumers() {
         let (_ps, cs, sd) = Mpmc::<u64>::new(2, 4);
 
-        let consumers: Vec<_> = cs.into_iter().map(|c| {
-            thread::spawn(move || {
-                c.bind();
-                c.recv()
+        let consumers: Vec<_> = cs
+            .into_iter()
+            .map(|c| {
+                thread::spawn(move || {
+                    c.bind();
+                    c.recv()
+                })
             })
-        }).collect();
+            .collect();
 
         thread::sleep(Duration::from_millis(30));
         sd.signal();
@@ -975,7 +1036,9 @@ mod tests {
     fn drop_drains_inflight() {
         struct Tracked(Arc<AtomicUsize>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let drops = Arc::new(AtomicUsize::new(0));
         {
@@ -1014,25 +1077,38 @@ mod tests {
         consumer.bind();
 
         let producers: Vec<_> = ps.drain(..).collect();
-        let handles: Vec<_> = producers.into_iter().enumerate().map(|(i, p)| {
-            std::thread::spawn(move || {
-                for v in 0..50u32 {
-                    p.send((i as u32) * 1000 + v);
-                }
+        let handles: Vec<_> = producers
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                std::thread::spawn(move || {
+                    for v in 0..50u32 {
+                        p.send((i as u32) * 1000 + v);
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         let mut got = 0usize;
         let total = M * 50;
         let mut sum = 0u64;
         while got < total {
-            consumer.recv_batch(|v| { sum += v as u64; got += 1; }).unwrap();
+            consumer
+                .recv_batch(|v| {
+                    sum += v as u64;
+                    got += 1;
+                })
+                .unwrap();
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
 
         let mut expected = 0u64;
         for i in 0..M {
-            for v in 0..50u32 { expected += ((i as u32) * 1000 + v) as u64; }
+            for v in 0..50u32 {
+                expected += ((i as u32) * 1000 + v) as u64;
+            }
         }
         assert_eq!(sum, expected);
         assert_eq!(got, total);
@@ -1059,7 +1135,9 @@ mod tests {
         assert_eq!(c0.available(), 16);
         assert_eq!(c0.has_pending(), false);
 
-        for v in 0..5u32 { p0.try_send(v).unwrap(); }
+        for v in 0..5u32 {
+            p0.try_send(v).unwrap();
+        }
         assert_eq!(p0.available(), 24 - 5);
         let pending_from_p0 = c0.pending_from(0) + c1.pending_from(0) + c2.pending_from(0);
         assert_eq!(pending_from_p0, 5);
@@ -1123,36 +1201,48 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(M + N));
 
-        let consumers: Vec<_> = cs.into_iter().map(|c| {
-            let delivered = delivered.clone();
-            let b = barrier.clone();
-            thread::spawn(move || {
-                c.bind();
-                b.wait();
-                loop {
-                    match c.recv_batch(|_v| {
-                        delivered.fetch_add(1, Ordering::Relaxed);
-                    }) {
-                        Ok(_) => continue,
-                        Err(Shutdown) => break,
+        let consumers: Vec<_> = cs
+            .into_iter()
+            .map(|c| {
+                let delivered = delivered.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    c.bind();
+                    b.wait();
+                    loop {
+                        match c.recv_batch(|_v| {
+                            delivered.fetch_add(1, Ordering::Relaxed);
+                        }) {
+                            Ok(_) => continue,
+                            Err(Shutdown) => break,
+                        }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
-        let producers: Vec<_> = ps.into_iter().map(|p| {
-            let b = barrier.clone();
-            thread::spawn(move || {
-                p.bind();
-                b.wait();
-                for k in 0..PER { p.send(k); }
+        let producers: Vec<_> = ps
+            .into_iter()
+            .map(|p| {
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    p.bind();
+                    b.wait();
+                    for k in 0..PER {
+                        p.send(k);
+                    }
+                })
             })
-        }).collect();
-        for h in producers { h.join().unwrap(); }
+            .collect();
+        for h in producers {
+            h.join().unwrap();
+        }
 
         thread::sleep(Duration::from_millis(50));
         sd2.signal();
-        for h in consumers { h.join().unwrap(); }
+        for h in consumers {
+            h.join().unwrap();
+        }
 
         assert_eq!(delivered.load(Ordering::Relaxed), M * PER as usize);
     }
@@ -1186,7 +1276,9 @@ mod tests {
         let c = cs.remove(0);
 
         let producer = async move {
-            for k in 0..1000u64 { p.send_async(k).await; }
+            for k in 0..1000u64 {
+                p.send_async(k).await;
+            }
         };
         let consumer = async move {
             let mut sum = 0u64;

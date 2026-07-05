@@ -20,9 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arbitro_kit::gate::OneSignal;
-use arbitro_kit::waiter::ParkWaiter;
 use arbitro_kit::route::OneShot;
 use arbitro_kit::slot::Pipe;
+use arbitro_kit::waiter::ParkWaiter;
 
 const ROUNDS: usize = 500;
 const WARMUP: usize = 50;
@@ -165,7 +165,7 @@ fn b_oneshot_kit() {
         let barrier = Arc::new(Barrier::new(2));
         let b2 = barrier.clone();
         let handle = thread::spawn(move || {
-            rx.bind();                       // ← register thread for unpark
+            rx.bind(); // ← register thread for unpark
             b2.wait();
             let t0 = Instant::now();
             let _ = rx.recv();
@@ -283,7 +283,7 @@ fn c_oneshot_kit() {
         let barrier = Arc::new(Barrier::new(2));
         let b2 = barrier.clone();
         let handle = thread::spawn(move || {
-            rx.bind();                       // ← register thread for unpark
+            rx.bind(); // ← register thread for unpark
             b2.wait();
             let t0 = Instant::now();
             let _ = rx.recv();

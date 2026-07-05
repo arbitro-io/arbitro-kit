@@ -62,7 +62,9 @@ pub trait Waiter: Default + Send + Sync {
 
     /// `true` if a worker has been registered (or if registration is
     /// not required for this backend).
-    fn has_worker(&self) -> bool { true }
+    fn has_worker(&self) -> bool {
+        true
+    }
 
     /// Wake the waiting consumer (or arm a wake-on-arrival flag).
     /// Lock-free, idempotent, callable from any thread.

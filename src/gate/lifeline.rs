@@ -83,18 +83,23 @@ impl WaiterId {
         assert!(
             (index as usize) < MAX_WAITERS,
             "WaiterId index {} out of range (MAX_WAITERS = {})",
-            index, MAX_WAITERS
+            index,
+            MAX_WAITERS
         );
         Self(index)
     }
 
     /// The raw bit index (0..64) used in `cancel_mask`.
     #[inline]
-    pub fn index(self) -> u8 { self.0 }
+    pub fn index(self) -> u8 {
+        self.0
+    }
 
     /// The single-bit mask for this id.
     #[inline]
-    pub fn bit(self) -> u64 { 1u64 << self.0 }
+    pub fn bit(self) -> u64 {
+        1u64 << self.0
+    }
 }
 
 /// Returned by `recv_or_cancel` when the lifeline cancels the wait.
@@ -125,7 +130,9 @@ pub struct Lifeline {
 }
 
 impl Default for Lifeline {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Lifeline {
@@ -189,13 +196,17 @@ impl Lifeline {
             let w = self.waiters.lock().unwrap();
             w[id.0 as usize].clone()
         };
-        if let Some(t) = to_wake { t.unpark(); }
+        if let Some(t) = to_wake {
+            t.unpark();
+        }
     }
 
     /// Cancel every waiter whose bit is set in `mask`. Bits beyond
     /// the registered range are ignored.
     pub fn cancel_mask(&self, mask: u64) {
-        if mask == 0 { return; }
+        if mask == 0 {
+            return;
+        }
         self.cancelled_mask.fetch_or(mask, Ordering::SeqCst);
         let to_wake: Vec<Thread> = {
             let w = self.waiters.lock().unwrap();
@@ -204,7 +215,9 @@ impl Lifeline {
                 .filter_map(|i| w[i].clone())
                 .collect()
         };
-        for t in to_wake { t.unpark(); }
+        for t in to_wake {
+            t.unpark();
+        }
     }
 
     /// Cancel every waiter ever registered on this Lifeline. Sets the
@@ -216,15 +229,17 @@ impl Lifeline {
             let w = self.waiters.lock().unwrap();
             w.iter().filter_map(|o| o.clone()).collect()
         };
-        for t in to_wake { t.unpark(); }
+        for t in to_wake {
+            t.unpark();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -312,19 +327,25 @@ mod tests {
         let (id_tx_b, id_rx_b) = mpsc::channel::<WaiterId>();
 
         // Two workers, only worker A gets cancelled individually.
-        let l_a = l.clone(); let p_a = progress.clone();
+        let l_a = l.clone();
+        let p_a = progress.clone();
         let h_a = thread::spawn(move || {
             let id = l_a.register(thread::current());
             id_tx_a.send(id).unwrap();
-            while !l_a.is_cancelled(id) { thread::park(); }
+            while !l_a.is_cancelled(id) {
+                thread::park();
+            }
             p_a.fetch_add(1, Ordering::SeqCst);
         });
 
-        let l_b = l.clone(); let p_b = progress.clone();
+        let l_b = l.clone();
+        let p_b = progress.clone();
         let h_b = thread::spawn(move || {
             let id = l_b.register(thread::current());
             id_tx_b.send(id).unwrap();
-            while !l_b.is_cancelled(id) { thread::park(); }
+            while !l_b.is_cancelled(id) {
+                thread::park();
+            }
             p_b.fetch_add(1, Ordering::SeqCst);
         });
 

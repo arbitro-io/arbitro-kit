@@ -129,7 +129,9 @@ unsafe impl<T: Send, const CAP: usize, W: Waiter> Send for Ring<T, CAP, W> {}
 unsafe impl<T: Send, const CAP: usize, W: Waiter> Sync for Ring<T, CAP, W> {}
 
 impl<T, const CAP: usize, W: Waiter> Default for Ring<T, CAP, W> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
@@ -138,13 +140,13 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
     /// # Panics
     /// Panics if `CAP` is 0 or not a power of two.
     pub fn new() -> Self {
-        assert!(CAP > 0,                "Ring CAP must be > 0");
-        assert!(CAP.is_power_of_two(),  "Ring CAP must be a power of two");
+        assert!(CAP > 0, "Ring CAP must be > 0");
+        assert!(CAP.is_power_of_two(), "Ring CAP must be a power of two");
 
         // Waiters have no payload state — "is it ready to proceed?" is
         // answered by the predicate that `wait_until` evaluates over head/tail.
         let not_empty = W::default();
-        let not_full  = W::default();
+        let not_full = W::default();
 
         // Safety: creating an array of `UnsafeCell<MaybeUninit<T>>` is sound;
         // MaybeUninit::uninit() is always valid, UnsafeCell is a transparent
@@ -183,7 +185,10 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
     }
 
     /// Maximum number of buffered items.
-    #[inline] pub const fn capacity(&self) -> usize { CAP }
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        CAP
+    }
 
     /// Current number of items in the ring. Approximate under concurrent
     /// access — both cursors may advance between the two loads.
@@ -195,10 +200,16 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
     }
 
     /// `true` iff the ring holds no items.
-    #[inline] pub fn is_empty(&self) -> bool { self.len() == 0 }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// `true` iff the ring is at capacity.
-    #[inline] pub fn is_full(&self) -> bool { self.len() >= CAP }
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.len() >= CAP
+    }
 
     // ── Producer API ─────────────────────────────────────────────────
 
@@ -216,7 +227,9 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
             return Err(value);
         }
         // Safety: slot is empty (head - tail < CAP). We own the write.
-        unsafe { (*self.slots[head & Self::MASK].get()).write(value); }
+        unsafe {
+            (*self.slots[head & Self::MASK].get()).write(value);
+        }
         // Release on head publishes the slot write to the consumer AND is
         // what opens the `not_empty` predicate (it reads head/tail).
         // No separate `locked` store — eliminating it halves the cache-line
@@ -243,7 +256,9 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
         let tail = self.tail.load(Ordering::Acquire);
         let free = CAP - head.wrapping_sub(tail);
         let n = src.len().min(free);
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
 
         // Drop-guard: if any `write` panics (or `src.drain`'s iterator
         // panics), advance `head` by the number of slots we already
@@ -256,9 +271,10 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
         impl<T, const CAP: usize, W: Waiter> Drop for Guard<'_, T, CAP, W> {
             fn drop(&mut self) {
                 // Only runs on panic unwind (we `forget` on success).
-                self.ring
-                    .head
-                    .store(self.head_start.wrapping_add(self.written), Ordering::Release);
+                self.ring.head.store(
+                    self.head_start.wrapping_add(self.written),
+                    Ordering::Release,
+                );
                 self.ring.not_empty.wake();
             }
         }
@@ -323,7 +339,9 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
         let head = self.head.load(Ordering::Acquire);
         let available = head.wrapping_sub(tail);
         let n = available.min(max);
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         // Reserve up-front so the subsequent `push` calls cannot reallocate
         // and therefore cannot panic mid-drain. If `reserve` itself panics
         // (OOM), it does so BEFORE any slot has been moved out — the ring
@@ -335,8 +353,7 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
         // moved out without `tail` being advanced below.
         for i in 0..n {
             let v = unsafe {
-                (*self.slots[tail.wrapping_add(i) & Self::MASK].get())
-                    .assume_init_read()
+                (*self.slots[tail.wrapping_add(i) & Self::MASK].get()).assume_init_read()
             };
             out.push(v);
         }
@@ -375,7 +392,9 @@ impl<T, const CAP: usize, W: BlockingWaiter> Ring<T, CAP, W> {
     #[inline]
     pub fn recv(&self) -> T {
         loop {
-            if let Some(v) = self.try_recv() { return v; }
+            if let Some(v) = self.try_recv() {
+                return v;
+            }
             self.not_empty.wait_until(|| !self.is_empty());
         }
     }
@@ -393,9 +412,14 @@ impl<T, const CAP: usize, W: BlockingWaiter> Ring<T, CAP, W> {
         id: crate::gate::WaiterId,
     ) -> Result<T, crate::gate::Cancelled> {
         loop {
-            if let Some(v) = self.try_recv() { return Ok(v); }
-            if life.is_cancelled(id)        { return Err(crate::gate::Cancelled); }
-            self.not_empty.wait_until(|| !self.is_empty() || life.is_cancelled(id));
+            if let Some(v) = self.try_recv() {
+                return Ok(v);
+            }
+            if life.is_cancelled(id) {
+                return Err(crate::gate::Cancelled);
+            }
+            self.not_empty
+                .wait_until(|| !self.is_empty() || life.is_cancelled(id));
         }
     }
 }
@@ -421,7 +445,9 @@ impl<T: Send, const CAP: usize, W: AsyncWaiter> Ring<T, CAP, W> {
     /// Must only be called from the single consumer task.
     pub async fn recv_async(&self) -> T {
         loop {
-            if let Some(v) = self.try_recv() { return v; }
+            if let Some(v) = self.try_recv() {
+                return v;
+            }
             self.not_empty.wait_until(|| !self.is_empty()).await;
         }
     }
@@ -444,13 +470,19 @@ impl<T: Send, const CAP: usize> Ring<T, CAP, crate::waiter::NotifyWaiter> {
     /// `Send` bound. The single heap allocation per call is negligible
     /// relative to the Notify wake cycle (~300 ns).
     #[inline]
-    pub fn recv_async_send(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> {
+    pub fn recv_async_send(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> {
         Box::pin(async move {
             loop {
-                if let Some(v) = self.try_recv() { return v; }
+                if let Some(v) = self.try_recv() {
+                    return v;
+                }
                 // Bypass trait RPITIT: use concrete Notify::notified() directly.
                 let notified = self.not_empty.inner.notified();
-                if !self.is_empty() { continue; }
+                if !self.is_empty() {
+                    continue;
+                }
                 notified.await;
             }
         })
@@ -465,7 +497,9 @@ impl<T, const CAP: usize, W: Waiter> Drop for Ring<T, CAP, W> {
         let mut i = tail;
         while i != head {
             // Safety: slot[i & MASK] is initialized (i ∈ [tail, head)).
-            unsafe { (*self.slots[i & Self::MASK].get()).assume_init_drop(); }
+            unsafe {
+                (*self.slots[i & Self::MASK].get()).assume_init_drop();
+            }
             i = i.wrapping_add(1);
         }
     }
@@ -478,8 +512,8 @@ impl<T, const CAP: usize, W: Waiter> Drop for Ring<T, CAP, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn single_thread_basic() {
@@ -487,11 +521,15 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(r.capacity(), 8);
 
-        for i in 0..8 { assert!(r.try_send(i).is_ok()); }
+        for i in 0..8 {
+            assert!(r.try_send(i).is_ok());
+        }
         assert!(r.is_full());
         assert!(r.try_send(999).is_err());
 
-        for i in 0..8 { assert_eq!(r.try_recv(), Some(i)); }
+        for i in 0..8 {
+            assert_eq!(r.try_recv(), Some(i));
+        }
         assert!(r.is_empty());
         assert_eq!(r.try_recv(), None);
     }
@@ -512,11 +550,15 @@ mod tests {
         let h = std::thread::spawn(move || {
             r2.set_consumer(std::thread::current());
             let mut sum = 0u64;
-            for _ in 0..1000 { sum += r2.recv(); }
+            for _ in 0..1000 {
+                sum += r2.recv();
+            }
             sum
         });
         r.set_producer(std::thread::current());
-        for i in 0..1000u64 { r.send(i); }
+        for i in 0..1000u64 {
+            r.send(i);
+        }
         let got = h.join().unwrap();
         assert_eq!(got, (0..1000u64).sum());
     }
@@ -524,7 +566,9 @@ mod tests {
     #[test]
     fn drain_batch() {
         let r: Ring<u32, 32> = Ring::new();
-        for i in 0..10 { r.try_send(i).unwrap(); }
+        for i in 0..10 {
+            r.try_send(i).unwrap();
+        }
         let mut out = Vec::new();
         let n = r.drain_into(&mut out, 100);
         assert_eq!(n, 10);
@@ -535,7 +579,9 @@ mod tests {
     fn drop_drains_inflight() {
         struct Tracked(Arc<AtomicU64>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let drops = Arc::new(AtomicU64::new(0));
         {
@@ -585,11 +631,16 @@ mod tests {
         });
 
         r.set_producer(std::thread::current());
-        for i in 0..N { r.send(i); }
+        for i in 0..N {
+            r.send(i);
+        }
 
         let got = consumer.join().unwrap();
-        assert_eq!(got, (0..N).collect::<Vec<_>>(),
-                   "FIFO order must hold across wraparounds");
+        assert_eq!(
+            got,
+            (0..N).collect::<Vec<_>>(),
+            "FIFO order must hold across wraparounds"
+        );
         assert!(r.is_empty(), "ring should be drained");
     }
 
@@ -608,20 +659,30 @@ mod tests {
         let consumer = std::thread::spawn(move || {
             r2.set_consumer(std::thread::current());
             let mut sum: u64 = 0;
-            for _ in 0..N { sum = sum.wrapping_add(r2.recv()); }
+            for _ in 0..N {
+                sum = sum.wrapping_add(r2.recv());
+            }
             sum
         });
 
         r.set_producer(std::thread::current());
         let t0 = std::time::Instant::now();
-        for i in 0..N { r.send(i); }
+        for i in 0..N {
+            r.send(i);
+        }
         let got = consumer.join().unwrap();
         let ns = t0.elapsed().as_nanos() as f64;
         let expected: u64 = (0..N).fold(0u64, |a, b| a.wrapping_add(b));
         assert_eq!(got, expected, "checksum mismatch under high volume");
         assert!(r.is_empty());
-        eprintln!("high_volume: N={} CAP={} total={:.2}ms per_msg={:.1}ns ops/sec={:.0}",
-                  N, CAP, ns / 1e6, ns / N as f64, 1e9 / (ns / N as f64));
+        eprintln!(
+            "high_volume: N={} CAP={} total={:.2}ms per_msg={:.1}ns ops/sec={:.0}",
+            N,
+            CAP,
+            ns / 1e6,
+            ns / N as f64,
+            1e9 / (ns / N as f64)
+        );
     }
 
     /// Validates each correctness factor independently under high volume:
@@ -641,12 +702,16 @@ mod tests {
         let consumer = std::thread::spawn(move || {
             r2.set_consumer(std::thread::current());
             let mut got: Vec<u64> = Vec::with_capacity(N as usize);
-            for _ in 0..N { got.push(r2.recv()); }
+            for _ in 0..N {
+                got.push(r2.recv());
+            }
             got
         });
 
         r.set_producer(std::thread::current());
-        for i in 0..N { r.send(i); }
+        for i in 0..N {
+            r.send(i);
+        }
         let got = consumer.join().unwrap();
 
         // ① No loss — count
@@ -691,17 +756,30 @@ mod tests {
         for i in 0..N {
             req.send(i);
             let r = rsp.recv();
-            assert_eq!(r, i.wrapping_mul(2).wrapping_add(1),
-                       "response {} does not correlate to request {}", r, i);
+            assert_eq!(
+                r,
+                i.wrapping_mul(2).wrapping_add(1),
+                "response {} does not correlate to request {}",
+                r,
+                i
+            );
         }
         let ns = t0.elapsed().as_nanos() as f64;
 
         worker.join().unwrap();
-        assert!(req.is_empty() && rsp.is_empty(),
-                "both rings must be drained at end");
+        assert!(
+            req.is_empty() && rsp.is_empty(),
+            "both rings must be drained at end"
+        );
 
-        eprintln!("round_trip: N={} CAP={} total={:.2}ms per_cycle={:.1}ns cycles/sec={:.0}",
-                  N, CAP, ns / 1e6, ns / N as f64, 1e9 / (ns / N as f64));
+        eprintln!(
+            "round_trip: N={} CAP={} total={:.2}ms per_cycle={:.1}ns cycles/sec={:.0}",
+            N,
+            CAP,
+            ns / 1e6,
+            ns / N as f64,
+            1e9 / (ns / N as f64)
+        );
     }
 
     #[test]
@@ -716,8 +794,8 @@ mod tests {
         assert_eq!(r.len(), 10);
 
         // Partial batch when ring has less space than src.
-        let mut src2: Vec<u64> = (100..130).collect();  // 30 items
-        let n2 = r.try_send_from(&mut src2);            // only 22 fit (32-10)
+        let mut src2: Vec<u64> = (100..130).collect(); // 30 items
+        let n2 = r.try_send_from(&mut src2); // only 22 fit (32-10)
         assert_eq!(n2, 22);
         assert_eq!(src2.len(), 30 - 22, "unsent suffix must remain");
         assert_eq!(src2[0], 100 + 22, "remainder starts at first unsent");
@@ -784,11 +862,21 @@ mod tests {
         let ns = t0.elapsed().as_nanos() as f64;
 
         assert_eq!(got.len() as u64, N);
-        assert_eq!(got, (0..N).collect::<Vec<_>>(),
-                   "batched path must preserve FIFO");
+        assert_eq!(
+            got,
+            (0..N).collect::<Vec<_>>(),
+            "batched path must preserve FIFO"
+        );
         assert!(r.is_empty());
-        eprintln!("batched: N={} CAP={} BATCH={} total={:.2}ms per_item={:.1}ns ops/sec={:.0}",
-                  N, CAP, BATCH, ns / 1e6, ns / N as f64, 1e9 / (ns / N as f64));
+        eprintln!(
+            "batched: N={} CAP={} BATCH={} total={:.2}ms per_item={:.1}ns ops/sec={:.0}",
+            N,
+            CAP,
+            BATCH,
+            ns / 1e6,
+            ns / N as f64,
+            1e9 / (ns / N as f64)
+        );
     }
 
     #[test]
@@ -796,7 +884,9 @@ mod tests {
         // Producer fires a burst of 100 items into a 128-slot ring without
         // the consumer yet running. Must not block.
         let r: Ring<u32, 128> = Ring::new();
-        for i in 0..100 { assert!(r.try_send(i).is_ok()); }
+        for i in 0..100 {
+            assert!(r.try_send(i).is_ok());
+        }
         assert_eq!(r.len(), 100);
     }
 
@@ -811,11 +901,15 @@ mod tests {
         // borrows `&Ring<..., NotifyWaiter>` across an await.
         let r: Ring<u64, 16, NotifyWaiter> = Ring::new();
         let producer = async {
-            for i in 0..1000u64 { r.send_async(i).await; }
+            for i in 0..1000u64 {
+                r.send_async(i).await;
+            }
         };
         let consumer = async {
             let mut sum = 0u64;
-            for _ in 0..1000 { sum += r.recv_async().await; }
+            for _ in 0..1000 {
+                sum += r.recv_async().await;
+            }
             sum
         };
         let (_, got) = tokio::join!(producer, consumer);

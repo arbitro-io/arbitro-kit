@@ -47,7 +47,9 @@ fn rounds() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(500)
 }
-fn warmup_batches() -> usize { 10 }
+fn warmup_batches() -> usize {
+    10
+}
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
@@ -71,9 +73,7 @@ fn progress_start(label: &str, n: usize) -> (impl FnMut(usize, u64), Instant) {
         if i > 0 && i % step == 0 {
             let pct = (i * 100) / n;
             let ns_per_op = (last_batch_ns as f64) / (BATCH as f64);
-            eprintln!(
-                "      [{label_for_tick}] {pct}% ({i}/{n})  last={ns_per_op:.2} ns/op"
-            );
+            eprintln!("      [{label_for_tick}] {pct}% ({i}/{n})  last={ns_per_op:.2} ns/op");
         }
     };
     (tick, Instant::now())
@@ -99,8 +99,11 @@ fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
 
 // ── A. Single-thread 1P/1C (RING_CAP=1024 → total cap 1024) ──────────
 fn bench_single_thread() {
-    let (ps, c, sd): (Vec<MpscProducer<u64, 1024>>, MpscConsumer<u64, 1024>, MpscShutdown<u64, 1024>) =
-        Mpsc::<u64, 1024>::new(1);
+    let (ps, c, sd): (
+        Vec<MpscProducer<u64, 1024>>,
+        MpscConsumer<u64, 1024>,
+        MpscShutdown<u64, 1024>,
+    ) = Mpsc::<u64, 1024>::new(1);
     let p = &ps[0];
 
     let do_batch = || {
@@ -109,7 +112,9 @@ fn bench_single_thread() {
             std::hint::black_box(c.try_recv().unwrap());
         }
     };
-    for _ in 0..warmup_batches() { do_batch(); }
+    for _ in 0..warmup_batches() {
+        do_batch();
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -123,7 +128,11 @@ fn bench_single_thread() {
         tick(i, dt);
     }
     progress_end("A 1P/1C st", prog_t0);
-    row("mpsc 1P/1C single-thread", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "mpsc 1P/1C single-thread",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     drop(sd);
 }
@@ -138,7 +147,10 @@ fn bench_spsc_cross_thread() {
         let mut count: u64 = 0;
         loop {
             match c.recv() {
-                Ok(v) => { std::hint::black_box(v); count = count.wrapping_add(1); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                    count = count.wrapping_add(1);
+                }
                 Err(_) => break,
             }
         }
@@ -147,7 +159,9 @@ fn bench_spsc_cross_thread() {
 
     p.bind();
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
     }
 
     let n = rounds();
@@ -156,13 +170,19 @@ fn bench_spsc_cross_thread() {
     let wall = Instant::now();
     for i in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
     }
     progress_end("B 1P/1C xt", prog_t0);
-    row("mpsc 1P/1C cross-thread", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "mpsc 1P/1C cross-thread",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.join().unwrap();
@@ -178,7 +198,10 @@ fn bench_mpsc_fanin<const M: usize, const RING_CAP: usize>(label: &str) {
         c.bind();
         let mut total: u64 = 0;
         loop {
-            match c.recv_batch(|v| { std::hint::black_box(v); total += 1; }) {
+            match c.recv_batch(|v| {
+                std::hint::black_box(v);
+                total += 1;
+            }) {
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -200,12 +223,19 @@ fn bench_mpsc_fanin<const M: usize, const RING_CAP: usize>(label: &str) {
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { p.send(k); }
+                for k in 0..per_prod as u64 {
+                    p.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -214,7 +244,9 @@ fn bench_mpsc_fanin<const M: usize, const RING_CAP: usize>(label: &str) {
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -225,7 +257,9 @@ fn bench_mpsc_fanin<const M: usize, const RING_CAP: usize>(label: &str) {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
@@ -235,7 +269,9 @@ fn bench_mpsc_fanin<const M: usize, const RING_CAP: usize>(label: &str) {
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
     let _ = consumer.join().unwrap();
 }
@@ -247,7 +283,8 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
     let consumer = thread::spawn(move || {
         let mut count: u64 = 0;
         while let Ok(v) = rx.recv() {
-            std::hint::black_box(v); count += 1;
+            std::hint::black_box(v);
+            count += 1;
         }
         count
     });
@@ -266,12 +303,19 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { let _ = tx.send(k); }
+                for k in 0..per_prod as u64 {
+                    let _ = tx.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -281,7 +325,9 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -292,7 +338,9 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
@@ -302,7 +350,9 @@ fn bench_crossbeam_mpsc<const M: usize>(label: &str) {
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     let _ = consumer.join().unwrap();
 }
 
@@ -314,7 +364,10 @@ fn bench_mpsc_batched<const M: usize, const RING_CAP: usize>(label: &str, chunk:
         c.bind();
         let mut total: u64 = 0;
         loop {
-            match c.recv_batch(|v| { std::hint::black_box(v); total += 1; }) {
+            match c.recv_batch(|v| {
+                std::hint::black_box(v);
+                total += 1;
+            }) {
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -337,16 +390,23 @@ fn bench_mpsc_batched<const M: usize, const RING_CAP: usize>(label: &str, chunk:
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
                 let mut sent: usize = 0;
                 while sent < per_prod {
                     let want = (per_prod - sent).min(chunk);
                     buf.clear();
-                    for k in 0..want as u64 { buf.push(sent as u64 + k); }
+                    for k in 0..want as u64 {
+                        buf.push(sent as u64 + k);
+                    }
                     while !buf.is_empty() {
                         let n = p.try_send_batch(&mut buf);
                         if n == 0 {
@@ -365,7 +425,9 @@ fn bench_mpsc_batched<const M: usize, const RING_CAP: usize>(label: &str, chunk:
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -376,7 +438,9 @@ fn bench_mpsc_batched<const M: usize, const RING_CAP: usize>(label: &str, chunk:
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
@@ -386,7 +450,9 @@ fn bench_mpsc_batched<const M: usize, const RING_CAP: usize>(label: &str, chunk:
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
     let _ = consumer.join().unwrap();
 }
@@ -415,7 +481,9 @@ fn bench_client_alloc_per_msg() {
         c.bind();
         loop {
             match c.recv() {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
@@ -450,7 +518,11 @@ fn bench_client_alloc_per_msg() {
         tick(i, dt);
     }
     progress_end("7 alloc-per-msg", prog_t0);
-    row("client: alloc+fill+send (Vec per msg, 92B)", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "client: alloc+fill+send (Vec per msg, 92B)",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.join();
@@ -464,7 +536,9 @@ fn bench_client_ptr_reuse() {
         c.bind();
         loop {
             match c.recv() {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
@@ -496,7 +570,11 @@ fn bench_client_ptr_reuse() {
         tick(i, dt);
     }
     progress_end("7 ptr-reuse", prog_t0);
-    row("ideal:  fill+send (ptr reuse, no alloc, 92B)", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "ideal:  fill+send (ptr reuse, no alloc, 92B)",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.join();

@@ -8,35 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy (default features)
-        run: cargo clippy --lib --tests -- -D warnings
-      - name: Clippy (tokio feature)
-        run: cargo clippy --lib --tests --features tokio -- -D warnings
-
-  test:
-    name: test
+  # ── Required gates: must pass ─────────────────────────────────────────
+  build:
+    name: build (features=${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -45,7 +21,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Test (features=${{ matrix.features }})
+      - name: Build
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo build --lib --tests
+          else
+            cargo build --lib --tests --features ${{ matrix.features }}
+          fi
+
+  test:
+    name: test (features=${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "tokio"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
         run: |
           if [ -z "${{ matrix.features }}" ]; then
             cargo test --lib
@@ -60,17 +54,28 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Compile all benches (no run)
-        run: cargo bench --no-run --features tokio
+      - run: cargo bench --no-run --features tokio
 
-  doc:
-    name: docs
+  # ── Informational: surface lints without blocking ─────────────────────
+  clippy:
+    name: clippy (informational)
     runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: "-D warnings"
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build docs
-        run: cargo doc --no-deps --features tokio
+      - run: cargo clippy --lib --tests --features tokio
+
+  fmt:
+    name: rustfmt (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check

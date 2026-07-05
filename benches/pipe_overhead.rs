@@ -18,8 +18,8 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use std::sync::atomic::AtomicBool;
@@ -37,15 +37,20 @@ use arbitro_kit::waiter::{BlockingWaiter, ParkWaiter, Waiter};
 // `Pipe`'s internals reduce to after the `Waiter` migration.
 struct Signal {
     waiter: ParkWaiter,
-    open:   AtomicBool,
+    open: AtomicBool,
 }
 
 impl Signal {
     fn new() -> Self {
-        Self { waiter: ParkWaiter::default(), open: AtomicBool::new(false) }
+        Self {
+            waiter: ParkWaiter::default(),
+            open: AtomicBool::new(false),
+        }
     }
     #[inline]
-    fn set_worker(&self, t: std::thread::Thread) { self.waiter.set_worker(t); }
+    fn set_worker(&self, t: std::thread::Thread) {
+        self.waiter.set_worker(t);
+    }
     #[inline]
     fn release(&self) {
         self.open.store(true, Ordering::Release);
@@ -56,7 +61,9 @@ impl Signal {
         self.waiter.wait_until(|| self.open.load(Ordering::Acquire));
     }
     #[inline]
-    fn lock(&self) { self.open.store(false, Ordering::Relaxed); }
+    fn lock(&self) {
+        self.open.store(false, Ordering::Relaxed);
+    }
 }
 
 // We batch K operations per timing sample because Instant::now() on Windows
@@ -66,15 +73,21 @@ const BATCH: usize = 1000;
 
 fn rounds() -> usize {
     // Total ops = rounds * BATCH. Default 500 => 500_000 ops per variant.
-    std::env::var("BENCH_ROUNDS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(500)
+    std::env::var("BENCH_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500)
 }
-fn warmup() -> usize { 10 } // batches
+fn warmup() -> usize {
+    10
+} // batches
 
 // Print helpers -----------------------------------------------------------
 fn header() {
-    println!("\n{:<26} {:>12} {:>12} {:>12} {:>14}",
-             "variant", "mean_ns/op", "p50_ns/op", "p99_ns/op", "ops/sec");
+    println!(
+        "\n{:<26} {:>12} {:>12} {:>12} {:>14}",
+        "variant", "mean_ns/op", "p50_ns/op", "p99_ns/op", "ops/sec"
+    );
     println!("{}", "─".repeat(80));
 }
 fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
@@ -85,8 +98,10 @@ fn row(name: &str, mut batch_ns: Vec<u64>, total_elapsed_ns: u64) {
     let mean_per_op = total_elapsed_ns as f64 / total_ops as f64;
     let p50_per_op = batch_ns[samples / 2] as f64 / BATCH as f64;
     let p99_per_op = batch_ns[samples * 99 / 100] as f64 / BATCH as f64;
-    println!("{:<26} {:>12.2} {:>12.2} {:>12.2} {:>14}",
-             name, mean_per_op, p50_per_op, p99_per_op, ops as u64);
+    println!(
+        "{:<26} {:>12.2} {:>12.2} {:>12.2} {:>14}",
+        name, mean_per_op, p50_per_op, p99_per_op, ops as u64
+    );
 }
 
 // ── 1. raw baseline: Signal + slot assembled inline ──────────────────────
@@ -102,7 +117,9 @@ fn bench_raw_signal_slot() {
 
     let do_batch = |i_base: u64| {
         for k in 0..BATCH as u64 {
-            unsafe { (*slot.get()).write(i_base + k); }
+            unsafe {
+                (*slot.get()).write(i_base + k);
+            }
             sig.release();
             sig.acquire();
             let v = unsafe { (*slot.get()).assume_init_read() };
@@ -110,7 +127,9 @@ fn bench_raw_signal_slot() {
             std::hint::black_box(v);
         }
     };
-    for b in 0..warmup() { do_batch((b * BATCH) as u64); }
+    for b in 0..warmup() {
+        do_batch((b * BATCH) as u64);
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -135,7 +154,9 @@ fn bench_pipe_nohook() {
             std::hint::black_box(p.recv());
         }
     };
-    for b in 0..warmup() { do_batch((b * BATCH) as u64); }
+    for b in 0..warmup() {
+        do_batch((b * BATCH) as u64);
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -151,10 +172,19 @@ fn bench_pipe_nohook() {
 // ── 3. Pipe with counting hook (real work) ────────────────────────────────
 
 #[derive(Default)]
-struct Counting { s: AtomicU64, r: AtomicU64 }
+struct Counting {
+    s: AtomicU64,
+    r: AtomicU64,
+}
 impl PipeHook<u64> for Counting {
-    #[inline] fn on_send(&self, _v: &u64) { self.s.fetch_add(1, Ordering::Relaxed); }
-    #[inline] fn on_recv(&self, _v: &u64) { self.r.fetch_add(1, Ordering::Relaxed); }
+    #[inline]
+    fn on_send(&self, _v: &u64) {
+        self.s.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    fn on_recv(&self, _v: &u64) {
+        self.r.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn bench_pipe_counting() {
@@ -167,7 +197,9 @@ fn bench_pipe_counting() {
             std::hint::black_box(p.recv());
         }
     };
-    for b in 0..warmup() { do_batch((b * BATCH) as u64); }
+    for b in 0..warmup() {
+        do_batch((b * BATCH) as u64);
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -177,7 +209,11 @@ fn bench_pipe_counting() {
         do_batch((b * BATCH) as u64);
         lats.push(t0.elapsed().as_nanos() as u64);
     }
-    row("pipe_counting_hook", lats, t_wall.elapsed().as_nanos() as u64);
+    row(
+        "pipe_counting_hook",
+        lats,
+        t_wall.elapsed().as_nanos() as u64,
+    );
     // sanity: hook really ran
     let expected = ((rounds() + warmup()) * BATCH) as u64;
     assert_eq!(p.hook().s.load(Ordering::Relaxed), expected);
@@ -191,7 +227,7 @@ fn bench_pipe_counting() {
 
 struct BoxedHookPipe {
     signal: Signal,
-    slot:   UnsafeCell<MaybeUninit<u64>>,
+    slot: UnsafeCell<MaybeUninit<u64>>,
     on_send: Box<dyn Fn(&u64) + Send + Sync>,
     on_recv: Box<dyn Fn(&u64) + Send + Sync>,
 }
@@ -207,12 +243,16 @@ impl BoxedHookPipe {
             on_recv: Box::new(|_| {}),
         }
     }
-    #[inline] fn send(&self, v: u64) {
+    #[inline]
+    fn send(&self, v: u64) {
         (self.on_send)(&v);
-        unsafe { (*self.slot.get()).write(v); }
+        unsafe {
+            (*self.slot.get()).write(v);
+        }
         self.signal.release();
     }
-    #[inline] fn recv(&self) -> u64 {
+    #[inline]
+    fn recv(&self) -> u64 {
         self.signal.acquire();
         let v = unsafe { (*self.slot.get()).assume_init_read() };
         self.signal.lock();
@@ -231,7 +271,9 @@ fn bench_pipe_boxed() {
             std::hint::black_box(p.recv());
         }
     };
-    for b in 0..warmup() { do_batch((b * BATCH) as u64); }
+    for b in 0..warmup() {
+        do_batch((b * BATCH) as u64);
+    }
 
     let n = rounds();
     let mut lats = Vec::with_capacity(n);
@@ -241,7 +283,11 @@ fn bench_pipe_boxed() {
         do_batch((b * BATCH) as u64);
         lats.push(t0.elapsed().as_nanos() as u64);
     }
-    row("pipe_boxed_dyn_hook", lats, t_wall.elapsed().as_nanos() as u64);
+    row(
+        "pipe_boxed_dyn_hook",
+        lats,
+        t_wall.elapsed().as_nanos() as u64,
+    );
 }
 
 // ── 5. Cross-thread round-trip ───────────────────────────────────────────
@@ -287,9 +333,14 @@ fn bench_pipe_xt_round_trip() {
     let expected: u64 = (0..N).sum();
     assert_eq!(sum, expected);
     let per_cycle = elapsed as f64 / N as f64;
-    println!("{:<26} {:>12.2} {:>12} {:>12} {:>14}",
-             "pipe_xt_round_trip", per_cycle, "-", "-",
-             ((N as f64) / (elapsed as f64 / 1e9)) as u64);
+    println!(
+        "{:<26} {:>12.2} {:>12} {:>12} {:>14}",
+        "pipe_xt_round_trip",
+        per_cycle,
+        "-",
+        "-",
+        ((N as f64) / (elapsed as f64 / 1e9)) as u64
+    );
 }
 
 // ── 6. Cross-thread burst: the single-slot stall ─────────────────────────
@@ -323,9 +374,14 @@ fn bench_pipe_xt_handshake_only() {
     let elapsed = t0.elapsed().as_nanos() as u64;
     let _ = consumer.join().unwrap();
     let per_cycle = elapsed as f64 / N as f64;
-    println!("{:<26} {:>12.2} {:>12} {:>12} {:>14}",
-             "pipe_xt_handshake (unit)", per_cycle, "-", "-",
-             ((N as f64) / (elapsed as f64 / 1e9)) as u64);
+    println!(
+        "{:<26} {:>12.2} {:>12} {:>12} {:>14}",
+        "pipe_xt_handshake (unit)",
+        per_cycle,
+        "-",
+        "-",
+        ((N as f64) / (elapsed as f64 / 1e9)) as u64
+    );
 }
 
 // ── 7. Cross-thread with batched payload: Pipe<Vec<u64>> ─────────────────
@@ -361,9 +417,7 @@ fn bench_pipe_xt_batched_payload() {
 
         let t0 = Instant::now();
         for b in 0..batches {
-            let v: Vec<u64> = (0..batch as u64)
-                .map(|k| (b * batch) as u64 + k)
-                .collect();
+            let v: Vec<u64> = (0..batch as u64).map(|k| (b * batch) as u64 + k).collect();
             fwd.send(v);
             ack.recv();
         }
@@ -372,9 +426,14 @@ fn bench_pipe_xt_batched_payload() {
         assert_eq!(items as usize, batches * batch);
         let per_item = elapsed as f64 / (batches * batch) as f64;
         let name = format!("pipe_xt_vec B={}", batch);
-        println!("{:<26} {:>12.2} {:>12} {:>12} {:>14}",
-                 name, per_item, "-", "-",
-                 ((batches * batch) as f64 / (elapsed as f64 / 1e9)) as u64);
+        println!(
+            "{:<26} {:>12.2} {:>12} {:>12} {:>14}",
+            name,
+            per_item,
+            "-",
+            "-",
+            ((batches * batch) as f64 / (elapsed as f64 / 1e9)) as u64
+        );
     }
 }
 
@@ -394,8 +453,10 @@ fn main() {
     println!("── B. Cross-thread round-trip (fwd + ack = 2 Pipes) ──");
     println!("Pipe has no backpressure primitive; a second Pipe<()> ack closes");
     println!("the loop so the producer respects the single-slot contract.");
-    println!("{:<26} {:>12} {:>12} {:>12} {:>14}",
-             "variant", "ns/cycle", "", "", "cycles/sec");
+    println!(
+        "{:<26} {:>12} {:>12} {:>12} {:>14}",
+        "variant", "ns/cycle", "", "", "cycles/sec"
+    );
     println!("{}", "─".repeat(80));
     bench_pipe_xt_round_trip();
     bench_pipe_xt_handshake_only();
@@ -404,8 +465,10 @@ fn main() {
     println!("── C. Batched payload: Pipe<Vec<u64>> (user-level batching) ──");
     println!("One send/recv per batch. Shows 'the right way' to batch over Pipe");
     println!("without turning it into Ring.");
-    println!("{:<26} {:>12} {:>12} {:>12} {:>14}",
-             "variant", "ns/item", "", "", "items/sec");
+    println!(
+        "{:<26} {:>12} {:>12} {:>12} {:>14}",
+        "variant", "ns/item", "", "", "items/sec"
+    );
     println!("{}", "─".repeat(80));
     bench_pipe_xt_batched_payload();
     println!();

@@ -124,11 +124,7 @@ impl ParkWaiter {
     /// deadline-aware variant. Used by `OneSignal::acquire_timeout` and
     /// any other primitive that needs a timed wait specifically against
     /// the park backend.
-    pub fn wait_until_deadline<F: FnMut() -> bool>(
-        &self,
-        deadline: Instant,
-        mut ready: F,
-    ) -> bool {
+    pub fn wait_until_deadline<F: FnMut() -> bool>(&self, deadline: Instant, mut ready: F) -> bool {
         if ready() {
             return false;
         }

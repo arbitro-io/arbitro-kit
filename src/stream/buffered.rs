@@ -94,28 +94,38 @@ impl<T, W: Waiter> BufferedSender<T, W> {
     /// Number of items currently buffered locally, not yet sent
     /// through the underlying stream.
     #[inline]
-    pub fn pending(&self) -> usize { self.buf.len() }
+    pub fn pending(&self) -> usize {
+        self.buf.len()
+    }
 
     /// Threshold at which auto-flush triggers.
     #[inline]
-    pub fn threshold(&self) -> usize { self.threshold }
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
 
     /// Last receipt returned by a flush. Useful for verifying
     /// delivery of the most recent batch via `Receipt::is_delivered`
     /// or `Receipt::wait_delivered`.
     #[inline]
-    pub fn last_receipt(&self) -> Option<Receipt> { self.last_receipt }
+    pub fn last_receipt(&self) -> Option<Receipt> {
+        self.last_receipt
+    }
 
     /// Borrow the underlying stream — for cursor inspection,
     /// `wait_for(seq)`, etc.
     #[inline]
-    pub fn stream(&self) -> &Stream<T, W> { &self.stream }
+    pub fn stream(&self) -> &Stream<T, W> {
+        &self.stream
+    }
 }
 
 impl<T, W: Waiter> Drop for BufferedSender<T, W> {
     /// RAII safety: flush any residual items so they aren't silently
     /// dropped when the sender goes out of scope.
-    fn drop(&mut self) { self.flush(); }
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 // ─── Stream::buffered() helper ────────────────────────────────────────────

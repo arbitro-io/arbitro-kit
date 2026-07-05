@@ -32,7 +32,9 @@ fn rounds() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(500)
 }
-fn warmup_batches() -> usize { 10 }
+fn warmup_batches() -> usize {
+    10
+}
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
@@ -52,9 +54,7 @@ fn progress_start(label: &str, n: usize) -> (impl FnMut(usize, u64), Instant) {
         if i > 0 && i % step == 0 {
             let pct = (i * 100) / n;
             let ns_per_op = (last_batch_ns as f64) / (BATCH as f64);
-            eprintln!(
-                "      [{label_for_tick}] {pct}% ({i}/{n})  last={ns_per_op:.2} ns/op"
-            );
+            eprintln!("      [{label_for_tick}] {pct}% ({i}/{n})  last={ns_per_op:.2} ns/op");
         }
     };
     (tick, Instant::now())
@@ -90,7 +90,9 @@ fn bench_a_old_1p() {
         c.bind();
         loop {
             match c.recv() {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
@@ -98,7 +100,9 @@ fn bench_a_old_1p() {
 
     p.bind();
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
     }
 
     let n = rounds();
@@ -107,13 +111,19 @@ fn bench_a_old_1p() {
     let wall = Instant::now();
     for i in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { p.send(k); }
+        for k in 0..BATCH as u64 {
+            p.send(k);
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
     }
     progress_end("A old 1P/1C xt", prog_t0);
-    row("Mpsc::new(1)               1P/1C cross-thread", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "Mpsc::new(1)               1P/1C cross-thread",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.join();
@@ -126,7 +136,9 @@ fn bench_a_cloneable_1p() {
         c.bind();
         loop {
             match c.recv() {
-                Ok(v) => { std::hint::black_box(v); }
+                Ok(v) => {
+                    std::hint::black_box(v);
+                }
                 Err(_) => break,
             }
         }
@@ -134,7 +146,9 @@ fn bench_a_cloneable_1p() {
 
     sender.bind();
     for _ in 0..warmup_batches() {
-        for k in 0..BATCH as u64 { sender.send(k); }
+        for k in 0..BATCH as u64 {
+            sender.send(k);
+        }
     }
 
     let n = rounds();
@@ -143,13 +157,19 @@ fn bench_a_cloneable_1p() {
     let wall = Instant::now();
     for i in 0..n {
         let t0 = Instant::now();
-        for k in 0..BATCH as u64 { sender.send(k); }
+        for k in 0..BATCH as u64 {
+            sender.send(k);
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
     }
     progress_end("A cloneable 1P/1C xt", prog_t0);
-    row("Mpsc::new_cloneable(1)     1P/1C cross-thread", lats, wall.elapsed().as_nanos() as u64);
+    row(
+        "Mpsc::new_cloneable(1)     1P/1C cross-thread",
+        lats,
+        wall.elapsed().as_nanos() as u64,
+    );
 
     sd.signal();
     let _ = consumer.join();
@@ -179,12 +199,19 @@ fn run_fanin<const M: usize, const RING_CAP: usize>(
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod as u64 { s.send(k); }
+                for k in 0..per_prod as u64 {
+                    s.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -193,7 +220,9 @@ fn run_fanin<const M: usize, const RING_CAP: usize>(
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -204,7 +233,9 @@ fn run_fanin<const M: usize, const RING_CAP: usize>(
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
@@ -214,7 +245,9 @@ fn run_fanin<const M: usize, const RING_CAP: usize>(
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
     let _ = consumer_handle.join();
 }
@@ -224,7 +257,9 @@ fn bench_b_old<const M: usize, const RING_CAP: usize>(label: &str) {
     let consumer = thread::spawn(move || {
         c.bind();
         loop {
-            match c.recv_batch(|v| { std::hint::black_box(v); }) {
+            match c.recv_batch(|v| {
+                std::hint::black_box(v);
+            }) {
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -238,7 +273,9 @@ fn bench_b_cloneable<const M: usize, const RING_CAP: usize>(label: &str) {
     let consumer = thread::spawn(move || {
         c.bind();
         loop {
-            match c.recv_batch(|v| { std::hint::black_box(v); }) {
+            match c.recv_batch(|v| {
+                std::hint::black_box(v);
+            }) {
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -259,7 +296,9 @@ fn bench_b_crossbeam<const M: usize>(label: &str) {
     let (tx, rx) = bounded::<u64>(1024);
 
     let consumer = thread::spawn(move || {
-        while let Ok(v) = rx.recv() { std::hint::black_box(v); }
+        while let Ok(v) = rx.recv() {
+            std::hint::black_box(v);
+        }
     });
 
     let per_prod = (BATCH / M) as u64;
@@ -276,12 +315,19 @@ fn bench_b_crossbeam<const M: usize>(label: &str) {
             let mut last_round: u64 = 0;
             loop {
                 loop {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     let r = work_round.load(Ordering::Acquire);
-                    if r > last_round { last_round = r; break; }
+                    if r > last_round {
+                        last_round = r;
+                        break;
+                    }
                     std::hint::spin_loop();
                 }
-                for k in 0..per_prod { let _ = tx.send(k); }
+                for k in 0..per_prod {
+                    let _ = tx.send(k);
+                }
                 done_round.fetch_add(1, Ordering::AcqRel);
             }
         }));
@@ -291,7 +337,9 @@ fn bench_b_crossbeam<const M: usize>(label: &str) {
     for _ in 0..warmup_batches() {
         done_round.store(0, Ordering::Release);
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
     }
 
     let n = rounds();
@@ -302,7 +350,9 @@ fn bench_b_crossbeam<const M: usize>(label: &str) {
         done_round.store(0, Ordering::Release);
         let t0 = Instant::now();
         work_round.fetch_add(1, Ordering::AcqRel);
-        while done_round.load(Ordering::Acquire) < M { std::hint::spin_loop(); }
+        while done_round.load(Ordering::Acquire) < M {
+            std::hint::spin_loop();
+        }
         let dt = t0.elapsed().as_nanos() as u64;
         lats.push(dt);
         tick(i, dt);
@@ -312,7 +362,9 @@ fn bench_b_crossbeam<const M: usize>(label: &str) {
 
     stop.store(true, Ordering::Release);
     work_round.fetch_add(1, Ordering::AcqRel);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     // dropping all senders closes the channel; consumer exits
     let _ = consumer.join();
 }
@@ -353,13 +405,17 @@ fn bench_e_kit_recv_single<const M: usize, const RING_CAP: usize>(label: &str, c
         let go = go.clone();
         handles.push(thread::spawn(move || {
             p.bind();
-            while !go.load(Ordering::Acquire) { std::hint::spin_loop(); }
+            while !go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
             let mut sent = 0u64;
             while sent < per_prod {
                 if p.try_send(sent).is_ok() {
                     sent += 1;
                 } else {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     std::hint::spin_loop();
                 }
             }
@@ -373,13 +429,15 @@ fn bench_e_kit_recv_single<const M: usize, const RING_CAP: usize>(label: &str, c
     let mut received: usize = 0;
     let t0 = Instant::now();
     while received < E_TOTAL {
-        let _ = c.recv().unwrap();   // single-item, no drain_all
+        let _ = c.recv().unwrap(); // single-item, no drain_all
         received += 1;
     }
     let dt = t0.elapsed();
 
     stop.store(true, Ordering::Release);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
 
     let mean = dt.as_nanos() as f64 / E_TOTAL as f64;
@@ -411,13 +469,17 @@ fn bench_e_kit_recv<const M: usize, const RING_CAP: usize>(label: &str, cloneabl
         let go = go.clone();
         handles.push(thread::spawn(move || {
             p.bind();
-            while !go.load(Ordering::Acquire) { std::hint::spin_loop(); }
+            while !go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
             let mut sent = 0u64;
             while sent < per_prod {
                 if p.try_send(sent).is_ok() {
                     sent += 1;
                 } else {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     std::hint::spin_loop();
                 }
             }
@@ -432,12 +494,18 @@ fn bench_e_kit_recv<const M: usize, const RING_CAP: usize>(label: &str, cloneabl
     let mut received: usize = 0;
     let t0 = Instant::now();
     while received < E_TOTAL {
-        let _ = c.recv_batch(|_v| { received += 1; }).unwrap();
+        let _ = c
+            .recv_batch(|_v| {
+                received += 1;
+            })
+            .unwrap();
     }
     let dt = t0.elapsed();
 
     stop.store(true, Ordering::Release);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     sd.signal();
 
     let mean = dt.as_nanos() as f64 / E_TOTAL as f64;
@@ -460,13 +528,17 @@ fn bench_e_crossbeam_recv<const M: usize>(label: &str) {
         let stop = stop.clone();
         let go = go.clone();
         handles.push(thread::spawn(move || {
-            while !go.load(Ordering::Acquire) { std::hint::spin_loop(); }
+            while !go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
             let mut sent = 0u64;
             while sent < per_prod {
                 if tx.try_send(sent).is_ok() {
                     sent += 1;
                 } else {
-                    if stop.load(Ordering::Acquire) { return; }
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     std::hint::spin_loop();
                 }
             }
@@ -480,12 +552,18 @@ fn bench_e_crossbeam_recv<const M: usize>(label: &str) {
     let mut received: usize = 0;
     let t0 = Instant::now();
     while received < E_TOTAL {
-        if rx.recv().is_ok() { received += 1; } else { break; }
+        if rx.recv().is_ok() {
+            received += 1;
+        } else {
+            break;
+        }
     }
     let dt = t0.elapsed();
 
     stop.store(true, Ordering::Release);
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
 
     let mean = dt.as_nanos() as f64 / E_TOTAL as f64;
     let ops = E_TOTAL as f64 / dt.as_secs_f64();
@@ -513,8 +591,7 @@ fn bench_c_clone_throughput() {
         let (sender, _c, _sd) = Mpsc::<u64>::new_cloneable(N);
         let t0 = Instant::now();
         // Clone N-1 times; the original sender already holds idx 0.
-        let _clones: Vec<MpscProducer<u64>> =
-            (0..N - 1).map(|_| sender.clone()).collect();
+        let _clones: Vec<MpscProducer<u64>> = (0..N - 1).map(|_| sender.clone()).collect();
         total_ns += t0.elapsed().as_nanos() as u64;
         std::hint::black_box(_clones);
     }
@@ -523,11 +600,7 @@ fn bench_c_clone_throughput() {
     let ops = (total_clones as f64) / (total_ns as f64 / 1e9);
     println!(
         "{:<48} {:>12.2} {:>12} {:>12} {:>14}",
-        "MpscProducer::clone() (cold path)",
-        mean_ns,
-        "—",
-        "—",
-        ops as u64
+        "MpscProducer::clone() (cold path)", mean_ns, "—", "—", ops as u64
     );
 }
 
@@ -638,7 +711,10 @@ fn build_cloneable_1() -> (
 // ─────────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("Mpsc clone overhead bench — old API vs new_cloneable, BATCH={BATCH}, rounds={}", rounds());
+    println!(
+        "Mpsc clone overhead bench — old API vs new_cloneable, BATCH={BATCH}, rounds={}",
+        rounds()
+    );
 
     header("A. 1P/1C cross-thread send-side (consumer drains in parallel)");
     bench_a_old_1p();
@@ -660,7 +736,10 @@ fn main() {
 
     header("D. Ping-pong cross-thread RTT (full round-trip, two channels)");
     bench_d_pingpong::<1024>("Mpsc::new(1)               ping-pong RTT", build_old_1);
-    bench_d_pingpong::<1024>("Mpsc::new_cloneable(1)     ping-pong RTT", build_cloneable_1);
+    bench_d_pingpong::<1024>(
+        "Mpsc::new_cloneable(1)     ping-pong RTT",
+        build_cloneable_1,
+    );
 
     header("E1. Consumer recv (single-item, recv() per call) — TOTAL=1M");
     bench_e_kit_recv_single::<1, 1024>("Mpsc::new(1)                 1P/1C recv-1", false);

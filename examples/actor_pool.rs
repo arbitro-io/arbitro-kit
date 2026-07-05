@@ -38,8 +38,8 @@ use std::time::Instant;
 
 use arbitro_kit::gate::{Hub, Pipe, Shutdown};
 
-const WORKERS:  usize = 4;
-const JOBS:     u64   = 100_000;
+const WORKERS: usize = 4;
+const JOBS: u64 = 100_000;
 
 /// Unit of work. In a real system this would carry a payload buffer,
 /// a subject, credits, etc. Kept to a single u64 so a torn-read bug in
@@ -49,14 +49,17 @@ type Job = u64;
 /// Result emitted by a worker. `(job_id, worker_idx, computed)` — the
 /// sink uses `job_id` to verify and `worker_idx` to tally per-port load.
 #[derive(Debug)]
-struct Reply { job_id: u64, worker: usize, computed: u64 }
+struct Reply {
+    job_id: u64,
+    worker: usize,
+    computed: u64,
+}
 
 fn main() {
     // ── Wire the topology ───────────────────────────────────────────
     // One Pipe per worker for inbound jobs. The dispatcher (main) owns
     // all of them; each worker takes a `.clone()` of one.
-    let job_pipes: Vec<Arc<Pipe<Job>>> =
-        (0..WORKERS).map(|_| Arc::new(Pipe::new())).collect();
+    let job_pipes: Vec<Arc<Pipe<Job>>> = (0..WORKERS).map(|_| Arc::new(Pipe::new())).collect();
 
     // One Hub with WORKERS ports for outbound replies. Workers use
     // `port.call(reply)` (not `send`) so each worker blocks until the
@@ -74,10 +77,13 @@ fn main() {
         loop {
             match drain.recv_batch(|port_idx, reply, ack| {
                 // Verify: worker doubled the value.
-                assert_eq!(reply.computed, reply.job_id * 2,
-                           "worker {} returned wrong value", port_idx);
-                assert_eq!(reply.worker, port_idx,
-                           "port_idx / worker label mismatch");
+                assert_eq!(
+                    reply.computed,
+                    reply.job_id * 2,
+                    "worker {} returned wrong value",
+                    port_idx
+                );
+                assert_eq!(reply.worker, port_idx, "port_idx / worker label mismatch");
                 per_worker[port_idx] += 1;
                 received += 1;
                 sum_checked += reply.computed;
@@ -107,12 +113,14 @@ fn main() {
 
             loop {
                 let job: Job = inbox.recv();
-                if job == u64::MAX { break; } // shutdown sentinel
+                if job == u64::MAX {
+                    break;
+                } // shutdown sentinel
 
                 // Simulated work: double the value.
                 let reply = Reply {
-                    job_id:   job,
-                    worker:   idx,
+                    job_id: job,
+                    worker: idx,
                     computed: job.wrapping_mul(2),
                 };
                 // Blocking round-trip: drain's `ack.send(())` unblocks us.
@@ -128,20 +136,26 @@ fn main() {
     let t0 = Instant::now();
     for id in 0..JOBS {
         let target = &job_pipes[(id as usize) % WORKERS];
-        while target.has_data() { std::hint::spin_loop(); }
+        while target.has_data() {
+            std::hint::spin_loop();
+        }
         target.send(id as Job);
     }
 
     // Shutdown sentinels per worker.
     for p in &job_pipes {
-        while p.has_data() { std::hint::spin_loop(); }
+        while p.has_data() {
+            std::hint::spin_loop();
+        }
         p.send(u64::MAX);
     }
 
     // ── Teardown ────────────────────────────────────────────────────
     // Wait for workers so all replies have reached the Hub before we
     // signal the sink to exit.
-    for h in worker_handles { h.join().unwrap(); }
+    for h in worker_handles {
+        h.join().unwrap();
+    }
     // All replies are now in-flight or already drained. Give the sink
     // a chance to see them before we force-shut.
     shutdown.signal();
@@ -156,14 +170,21 @@ fn main() {
     println!("per-worker    : {:?}", per_worker);
     println!("sum(2*0..N)   : {} (expected {})", sum, JOBS * (JOBS - 1));
     println!("elapsed       : {:?}", elapsed);
-    println!("throughput    : {:.2} M jobs/s",
-             JOBS as f64 / elapsed.as_secs_f64() / 1e6);
+    println!(
+        "throughput    : {:.2} M jobs/s",
+        JOBS as f64 / elapsed.as_secs_f64() / 1e6
+    );
 
     assert_eq!(received, JOBS, "sink missed replies");
     assert_eq!(sum, JOBS * (JOBS - 1), "sum mismatch");
     for (i, &count) in per_worker.iter().enumerate() {
-        assert_eq!(count, JOBS / WORKERS as u64,
-                   "worker {} processed {} (expected uniform)", i, count);
+        assert_eq!(
+            count,
+            JOBS / WORKERS as u64,
+            "worker {} processed {} (expected uniform)",
+            i,
+            count
+        );
     }
     println!("OK");
 }

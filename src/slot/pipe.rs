@@ -40,10 +40,10 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::waiter::{ParkWaiter, Waiter};
 #[cfg(feature = "tokio")]
 use crate::waiter::AsyncWaiter;
 use crate::waiter::BlockingWaiter;
+use crate::waiter::{ParkWaiter, Waiter};
 
 /// Observer hook for a [`Pipe`].
 ///
@@ -85,11 +85,11 @@ impl<T> PipeHook<T> for NoHook {}
 /// `assume_init_drop` on the slot — safe for `T` holding RAII resources.
 #[repr(C)]
 pub struct Pipe<T, H: PipeHook<T> = NoHook, W: Waiter = ParkWaiter> {
-    waiter:   W,
-    slot:     UnsafeCell<MaybeUninit<T>>,
+    waiter: W,
+    slot: UnsafeCell<MaybeUninit<T>>,
     has_data: AtomicBool,
-    hook:     H,
-    _marker:  PhantomData<fn() -> T>,
+    hook: H,
+    _marker: PhantomData<fn() -> T>,
 }
 
 // Safety: slot access is serialized by the `has_data` flag — the producer
@@ -108,29 +108,35 @@ impl<T: Send, W: Waiter> Pipe<T, NoHook, W> {
 }
 
 impl<T: Send, W: Waiter> Default for Pipe<T, NoHook, W> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Send, H: PipeHook<T>, W: Waiter> Pipe<T, H, W> {
     /// Create a pipe with a custom observer hook.
     pub fn with_hook(hook: H) -> Self {
         Self {
-            waiter:   W::default(),
-            slot:     UnsafeCell::new(MaybeUninit::uninit()),
+            waiter: W::default(),
+            slot: UnsafeCell::new(MaybeUninit::uninit()),
             has_data: AtomicBool::new(false),
             hook,
-            _marker:  PhantomData,
+            _marker: PhantomData,
         }
     }
 
     /// Borrow the underlying waiter. Useful for composing a pipe into
     /// larger topologies (e.g. registering its worker via the waiter).
     #[inline]
-    pub fn waiter(&self) -> &W { &self.waiter }
+    pub fn waiter(&self) -> &W {
+        &self.waiter
+    }
 
     /// Borrow the observer hook.
     #[inline]
-    pub fn hook(&self) -> &H { &self.hook }
+    pub fn hook(&self) -> &H {
+        &self.hook
+    }
 
     /// Register the consumer thread. Must be called from the consumer
     /// thread before the first blocking [`recv`](Self::recv) (sync waiters
@@ -149,7 +155,9 @@ impl<T: Send, H: PipeHook<T>, W: Waiter> Pipe<T, H, W> {
     pub fn send(&self, v: T) {
         self.hook.on_send(&v);
         // Safety: SPSC contract — sole producer, slot is empty.
-        unsafe { (*self.slot.get()).write(v); }
+        unsafe {
+            (*self.slot.get()).write(v);
+        }
         self.has_data.store(true, Ordering::Release);
         self.waiter.wake();
     }
@@ -158,7 +166,9 @@ impl<T: Send, H: PipeHook<T>, W: Waiter> Pipe<T, H, W> {
     /// otherwise.
     #[inline]
     pub fn try_recv(&self) -> Option<T> {
-        if !self.has_data.load(Ordering::Acquire) { return None; }
+        if !self.has_data.load(Ordering::Acquire) {
+            return None;
+        }
         // Safety: producer wrote the slot before storing `has_data = true`
         // with Release; our Acquire load synchronises-with that store.
         let v = unsafe { (*self.slot.get()).assume_init_read() };
@@ -186,7 +196,8 @@ impl<T: Send, H: PipeHook<T>, W: BlockingWaiter> Pipe<T, H, W> {
     /// `wait_until` panics rather than deadlock silently.
     #[inline]
     pub fn recv(&self) -> T {
-        self.waiter.wait_until(|| self.has_data.load(Ordering::Acquire));
+        self.waiter
+            .wait_until(|| self.has_data.load(Ordering::Acquire));
         // Safety: predicate returned true; same as `try_recv`.
         let v = unsafe { (*self.slot.get()).assume_init_read() };
         self.has_data.store(false, Ordering::Release);
@@ -220,9 +231,10 @@ impl<T: Send, H: PipeHook<T> + Sync, W: AsyncWaiter> Pipe<T, H, W> {
             // Box the wait_until future to detach its `'a` borrow before
             // the outer async block's auto-trait inference runs.
             let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> =
-                Box::pin(self.waiter.wait_until(|| {
-                    self.has_data.load(Ordering::Acquire)
-                }));
+                Box::pin(
+                    self.waiter
+                        .wait_until(|| self.has_data.load(Ordering::Acquire)),
+                );
             fut.await;
             // Safety: predicate returned true; same as `try_recv`.
             let v = unsafe { (*self.slot.get()).assume_init_read() };
@@ -238,7 +250,9 @@ impl<T, H: PipeHook<T>, W: Waiter> Drop for Pipe<T, H, W> {
         // Safety: `&mut self` ⇒ no other references. If a value is in
         // flight, drop it to avoid leaking RAII resources.
         if self.has_data.load(Ordering::Acquire) {
-            unsafe { (*self.slot.get()).assume_init_drop(); }
+            unsafe {
+                (*self.slot.get()).assume_init_drop();
+            }
         }
     }
 }
@@ -246,8 +260,8 @@ impl<T, H: PipeHook<T>, W: Waiter> Drop for Pipe<T, H, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
+    use std::sync::Arc;
 
     #[test]
     fn basic_send_recv() {
@@ -281,10 +295,17 @@ mod tests {
     #[test]
     fn hook_fires_on_both_sides() {
         #[derive(Default)]
-        struct Counters { sends: AtomicU64, recvs: AtomicU64 }
+        struct Counters {
+            sends: AtomicU64,
+            recvs: AtomicU64,
+        }
         impl PipeHook<u64> for Counters {
-            fn on_send(&self, _: &u64) { self.sends.fetch_add(1, AtomOrd::Relaxed); }
-            fn on_recv(&self, _: &u64) { self.recvs.fetch_add(1, AtomOrd::Relaxed); }
+            fn on_send(&self, _: &u64) {
+                self.sends.fetch_add(1, AtomOrd::Relaxed);
+            }
+            fn on_recv(&self, _: &u64) {
+                self.recvs.fetch_add(1, AtomOrd::Relaxed);
+            }
         }
 
         let p: Pipe<u64, Counters> = Pipe::with_hook(Counters::default());
@@ -301,7 +322,9 @@ mod tests {
     fn drop_drains_inflight() {
         struct Tracked(Arc<AtomicU64>);
         impl Drop for Tracked {
-            fn drop(&mut self) { self.0.fetch_add(1, AtomOrd::Relaxed); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomOrd::Relaxed);
+            }
         }
         let drops = Arc::new(AtomicU64::new(0));
         {
@@ -326,7 +349,11 @@ mod tests {
         p.send(payload);
         let got = h.join().unwrap();
         assert_eq!(*got, vec![1, 2, 3, 4]);
-        assert_eq!(got.as_ptr() as usize, ptr_before, "heap buffer did not move");
+        assert_eq!(
+            got.as_ptr() as usize,
+            ptr_before,
+            "heap buffer did not move"
+        );
     }
 
     #[test]
@@ -354,7 +381,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
             p2.send(42);
         });
-        assert_eq!(p.recv_async().await,42);
+        assert_eq!(p.recv_async().await, 42);
         h.await.unwrap();
     }
 
@@ -370,6 +397,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             p2.send(99);
         });
-        assert_eq!(p.recv_async().await,99);
+        assert_eq!(p.recv_async().await, 99);
     }
 }

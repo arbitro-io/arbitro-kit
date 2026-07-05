@@ -16,14 +16,14 @@
 //! Conforms to bench_safety: BATCH = 1000, rounds capped via env, timeout
 //! expected from runner, no background work.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
-use arbitro_kit::slot::{PipeAsync, ChannelAsync};
+use arbitro_kit::route::{MpmcAsync, MpscAsync};
+use arbitro_kit::slot::{ChannelAsync, PipeAsync};
 use arbitro_kit::stream::Ring;
 use arbitro_kit::waiter::NotifyWaiter;
-use arbitro_kit::route::{MpscAsync, MpmcAsync};
 
 const BATCH: usize = 1000;
 
@@ -33,7 +33,9 @@ fn rounds() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(300)
 }
-fn warmup() -> usize { 30 }
+fn warmup() -> usize {
+    30
+}
 
 fn pct(samples: &mut [u64], q: f64) -> u64 {
     samples.sort_unstable();
@@ -51,7 +53,9 @@ fn header(title: &str) {
 }
 
 fn report(label: &str, samples: &mut Vec<u64>) {
-    if samples.is_empty() { return; }
+    if samples.is_empty() {
+        return;
+    }
     let total: u64 = samples.iter().sum();
     let n = samples.len() as u64;
     let mean = total / n;
@@ -172,19 +176,27 @@ async fn a_tokio_mpsc() {
     for _ in 0..warmup() {
         let t = tx2.clone();
         let h = tokio::spawn(async move {
-            for i in 0..BATCH as u64 { t.send(i).await.unwrap(); }
+            for i in 0..BATCH as u64 {
+                t.send(i).await.unwrap();
+            }
         });
-        for _ in 0..BATCH { rx2.recv().await.unwrap(); }
+        for _ in 0..BATCH {
+            rx2.recv().await.unwrap();
+        }
         h.await.unwrap();
     }
     let mut samples2 = Vec::with_capacity(rounds);
     for _ in 0..rounds {
         let t = tx2.clone();
         let h = tokio::spawn(async move {
-            for i in 0..BATCH as u64 { t.send(i).await.unwrap(); }
+            for i in 0..BATCH as u64 {
+                t.send(i).await.unwrap();
+            }
         });
         let t0 = Instant::now();
-        for _ in 0..BATCH { rx2.recv().await.unwrap(); }
+        for _ in 0..BATCH {
+            rx2.recv().await.unwrap();
+        }
         h.await.unwrap();
         samples2.push(t0.elapsed().as_nanos() as u64);
     }
@@ -209,8 +221,16 @@ async fn b_channel_kit() {
         let ch_s = ch.clone();
         let ch_c = ch.clone();
         tokio::join!(
-            async { for _ in 0..BATCH { ch_s.serve_one_async(|r| r.wrapping_mul(2)).await; } },
-            async { for i in 0..BATCH as u64 { ch_c.call_async(i).await; } }
+            async {
+                for _ in 0..BATCH {
+                    ch_s.serve_one_async(|r| r.wrapping_mul(2)).await;
+                }
+            },
+            async {
+                for i in 0..BATCH as u64 {
+                    ch_c.call_async(i).await;
+                }
+            }
         );
     }
 
@@ -220,7 +240,11 @@ async fn b_channel_kit() {
         let ch_c = ch.clone();
         let t0 = Instant::now();
         tokio::join!(
-            async { for _ in 0..BATCH { ch_s.serve_one_async(|r| r.wrapping_mul(2)).await; } },
+            async {
+                for _ in 0..BATCH {
+                    ch_s.serve_one_async(|r| r.wrapping_mul(2)).await;
+                }
+            },
             async {
                 for i in 0..BATCH as u64 {
                     let r = ch_c.call_async(i).await;
@@ -277,7 +301,9 @@ async fn b_tokio_mpsc_pair() {
     // Server task shared across warmup + bench
     let server = tokio::spawn(async move {
         while let Some(v) = rx_req.recv().await {
-            if tx_resp.send(v.wrapping_mul(2)).await.is_err() { break; }
+            if tx_resp.send(v.wrapping_mul(2)).await.is_err() {
+                break;
+            }
         }
     });
 
@@ -321,8 +347,16 @@ async fn c_ring_kit() {
         let r_tx = ring.clone();
         let r_rx = ring.clone();
         tokio::join!(
-            async { for i in 0..BATCH as u64 { r_tx.send_async(i).await; } },
-            async { for _ in 0..BATCH { r_rx.recv_async().await; } }
+            async {
+                for i in 0..BATCH as u64 {
+                    r_tx.send_async(i).await;
+                }
+            },
+            async {
+                for _ in 0..BATCH {
+                    r_rx.recv_async().await;
+                }
+            }
         );
     }
 
@@ -332,8 +366,16 @@ async fn c_ring_kit() {
         let r_rx = ring.clone();
         let t0 = Instant::now();
         tokio::join!(
-            async { for i in 0..BATCH as u64 { r_tx.send_async(i).await; } },
-            async { for _ in 0..BATCH { r_rx.recv_async().await; } }
+            async {
+                for i in 0..BATCH as u64 {
+                    r_tx.send_async(i).await;
+                }
+            },
+            async {
+                for _ in 0..BATCH {
+                    r_rx.recv_async().await;
+                }
+            }
         );
         samples.push(t0.elapsed().as_nanos() as u64);
     }
@@ -348,9 +390,13 @@ async fn c_tokio_mpsc_64() {
     for _ in 0..warmup() {
         let tx2 = tx.clone();
         let h = tokio::spawn(async move {
-            for i in 0..BATCH as u64 { tx2.send(i).await.unwrap(); }
+            for i in 0..BATCH as u64 {
+                tx2.send(i).await.unwrap();
+            }
         });
-        for _ in 0..BATCH { rx.recv().await.unwrap(); }
+        for _ in 0..BATCH {
+            rx.recv().await.unwrap();
+        }
         h.await.unwrap();
     }
 
@@ -358,10 +404,14 @@ async fn c_tokio_mpsc_64() {
     for _ in 0..rounds {
         let tx2 = tx.clone();
         let h = tokio::spawn(async move {
-            for i in 0..BATCH as u64 { tx2.send(i).await.unwrap(); }
+            for i in 0..BATCH as u64 {
+                tx2.send(i).await.unwrap();
+            }
         });
         let t0 = Instant::now();
-        for _ in 0..BATCH { rx.recv().await.unwrap(); }
+        for _ in 0..BATCH {
+            rx.recv().await.unwrap();
+        }
         h.await.unwrap();
         samples.push(t0.elapsed().as_nanos() as u64);
     }
@@ -386,28 +436,30 @@ async fn d_mpsc_kit() {
     let total_rounds = warmup() + rounds;
 
     for round in 0..total_rounds {
-        let (producers, mut consumer, shutdown) =
-            MpscAsync::<u64, 256>::new(M);
+        let (producers, mut consumer, shutdown) = MpscAsync::<u64, 256>::new(M);
 
         let t0 = Instant::now();
 
         // Move each producer into its own task.
-        let prod_handles: Vec<_> = producers.into_iter().map(|p| {
-            tokio::spawn(async move {
-                for k in 0..PER_PRODUCER as u64 {
-                    let mut v = k;
-                    loop {
-                        match p.try_send(v) {
-                            Ok(()) => break,
-                            Err(returned) => {
-                                v = returned;
-                                tokio::task::yield_now().await;
+        let prod_handles: Vec<_> = producers
+            .into_iter()
+            .map(|p| {
+                tokio::spawn(async move {
+                    for k in 0..PER_PRODUCER as u64 {
+                        let mut v = k;
+                        loop {
+                            match p.try_send(v) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    v = returned;
+                                    tokio::task::yield_now().await;
+                                }
                             }
                         }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
         // Consumer runs inline.
         let mut count = 0;
@@ -417,7 +469,9 @@ async fn d_mpsc_kit() {
                 Err(_) => break,
             }
         }
-        for h in prod_handles { h.await.unwrap(); }
+        for h in prod_handles {
+            h.await.unwrap();
+        }
 
         if round >= warmup() {
             samples.push(t0.elapsed().as_nanos() as u64);
@@ -439,19 +493,29 @@ async fn d_tokio_mpsc() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(256);
 
         let t0 = Instant::now();
-        let handles: Vec<_> = (0..M).map(|_| {
-            let tx2 = tx.clone();
-            tokio::spawn(async move {
-                for k in 0..PER_PRODUCER as u64 { tx2.send(k).await.unwrap(); }
+        let handles: Vec<_> = (0..M)
+            .map(|_| {
+                let tx2 = tx.clone();
+                tokio::spawn(async move {
+                    for k in 0..PER_PRODUCER as u64 {
+                        tx2.send(k).await.unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
         drop(tx); // drop the original sender so rx can detect end
 
         let mut count = 0;
         while count < BATCH {
-            if rx.recv().await.is_some() { count += 1; } else { break; }
+            if rx.recv().await.is_some() {
+                count += 1;
+            } else {
+                break;
+            }
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
 
         if round >= warmup() {
             samples.push(t0.elapsed().as_nanos() as u64);
@@ -481,8 +545,7 @@ async fn e_mpmc_kit() {
     let total_rounds = warmup() + rounds;
 
     for round in 0..total_rounds {
-        let (mut producers, mut consumers, shutdown) =
-            MpmcAsync::<u64, 64>::new(M, N);
+        let (mut producers, mut consumers, shutdown) = MpmcAsync::<u64, 64>::new(M, N);
 
         let total_recv = Arc::new(AtomicUsize::new(0));
 
@@ -503,24 +566,48 @@ async fn e_mpmc_kit() {
         let total_sd = total_recv.clone();
 
         tokio::join!(
-            async move { for k in 0..PER_PRODUCER as u64 { p0.send_async(k).await; } },
-            async move { for k in 0..PER_PRODUCER as u64 { p1.send_async(k).await; } },
-            async move { for k in 0..PER_PRODUCER as u64 { p2.send_async(k).await; } },
-            async move { for k in 0..PER_PRODUCER as u64 { p3.send_async(k).await; } },
+            async move {
+                for k in 0..PER_PRODUCER as u64 {
+                    p0.send_async(k).await;
+                }
+            },
+            async move {
+                for k in 0..PER_PRODUCER as u64 {
+                    p1.send_async(k).await;
+                }
+            },
+            async move {
+                for k in 0..PER_PRODUCER as u64 {
+                    p2.send_async(k).await;
+                }
+            },
+            async move {
+                for k in 0..PER_PRODUCER as u64 {
+                    p3.send_async(k).await;
+                }
+            },
             async move {
                 loop {
-                    if total0.load(Ordering::Relaxed) >= BATCH { break; }
+                    if total0.load(Ordering::Relaxed) >= BATCH {
+                        break;
+                    }
                     match c0.recv_async().await {
-                        Ok(_) => { total0.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            total0.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(_) => break,
                     }
                 }
             },
             async move {
                 loop {
-                    if total1.load(Ordering::Relaxed) >= BATCH { break; }
+                    if total1.load(Ordering::Relaxed) >= BATCH {
+                        break;
+                    }
                     match c1.recv_async().await {
-                        Ok(_) => { total1.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            total1.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(_) => break,
                     }
                 }
@@ -566,36 +653,49 @@ async fn e_tokio_mpsc_fanout() {
         let t0 = Instant::now();
 
         // Producers round-robin across N channels.
-        let prod_handles: Vec<_> = (0..M).map(|p_idx| {
-            let senders = senders.clone();
-            tokio::spawn(async move {
-                for k in 0..PER_PRODUCER as u64 {
-                    let target = (p_idx + k as usize) % N;
-                    senders[target].send(k).await.unwrap();
-                }
+        let prod_handles: Vec<_> = (0..M)
+            .map(|p_idx| {
+                let senders = senders.clone();
+                tokio::spawn(async move {
+                    for k in 0..PER_PRODUCER as u64 {
+                        let target = (p_idx + k as usize) % N;
+                        senders[target].send(k).await.unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         // N consumers.
-        let cons_handles: Vec<_> = receivers.into_iter().map(|mut rx| {
-            let total = total_recv.clone();
-            tokio::spawn(async move {
-                loop {
-                    if total.load(Ordering::Relaxed) >= BATCH { break; }
-                    match rx.recv().await {
-                        Some(_) => { total.fetch_add(1, Ordering::Relaxed); }
-                        None => break,
+        let cons_handles: Vec<_> = receivers
+            .into_iter()
+            .map(|mut rx| {
+                let total = total_recv.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if total.load(Ordering::Relaxed) >= BATCH {
+                            break;
+                        }
+                        match rx.recv().await {
+                            Some(_) => {
+                                total.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => break,
+                        }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
-        for h in prod_handles { h.await.unwrap(); }
+        for h in prod_handles {
+            h.await.unwrap();
+        }
         drop(senders); // signal EOF
         while total_recv.load(Ordering::Relaxed) < BATCH {
             tokio::task::yield_now().await;
         }
-        for h in cons_handles { h.await.unwrap(); }
+        for h in cons_handles {
+            h.await.unwrap();
+        }
 
         if round >= warmup() {
             samples.push(t0.elapsed().as_nanos() as u64);
@@ -616,7 +716,12 @@ fn main() {
         .unwrap();
 
     println!("=== arbitro-kit async head-to-head ===");
-    println!("rounds={} (+ {} warmup), batch={}", rounds(), warmup(), BATCH);
+    println!(
+        "rounds={} (+ {} warmup), batch={}",
+        rounds(),
+        warmup(),
+        BATCH
+    );
 
     rt.block_on(async {
         header("A. Pipe async — single-slot 1:1 (send + recv_async)");

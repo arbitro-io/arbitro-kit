@@ -7,8 +7,8 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-use crate::waiter::{ParkWaiter, Waiter};
 use super::segment::{Segment, SEG_SIZE};
+use crate::waiter::{ParkWaiter, Waiter};
 
 /// 64-byte cache-line padding to keep `tail_pos` (producer-written) and
 /// `head_pos` (consumer-written) on separate lines. Without this, every
@@ -102,7 +102,9 @@ unsafe impl<T: Send, W: Waiter> Send for Stream<T, W> {}
 unsafe impl<T: Send, W: Waiter> Sync for Stream<T, W> {}
 
 impl<T, W: Waiter> Default for Stream<T, W> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T, W: Waiter> Stream<T, W> {
@@ -210,12 +212,16 @@ impl<T, W: Waiter> Drop for Stream<T, W> {
                 debug_assert!(!next.is_null());
                 let old = seg;
                 seg = next;
-                unsafe { drop(Box::from_raw(old)); }
+                unsafe {
+                    drop(Box::from_raw(old));
+                }
                 continue;
             }
             let idx = seg_ref.idx(head);
             // Read + drop in one move.
-            unsafe { let _ = (*seg_ref.slots[idx].get()).assume_init_read(); }
+            unsafe {
+                let _ = (*seg_ref.slots[idx].get()).assume_init_read();
+            }
             head += 1;
         }
 
@@ -223,8 +229,12 @@ impl<T, W: Waiter> Drop for Stream<T, W> {
         // segments allocated past tail_pos).
         loop {
             let next = unsafe { (*seg).next.load(Ordering::Relaxed) };
-            unsafe { drop(Box::from_raw(seg)); }
-            if next.is_null() { break; }
+            unsafe {
+                drop(Box::from_raw(seg));
+            }
+            if next.is_null() {
+                break;
+            }
             seg = next;
         }
     }

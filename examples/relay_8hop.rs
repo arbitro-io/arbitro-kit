@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use arbitro_kit::gate::{Channel, Signal};
 
-const MSGS:  usize    = 200_000;
+const MSGS: usize = 200_000;
 const SIZES: &[usize] = &[16, 64, 256, 1024, 4096, 16_384];
 
 // ─── Channel (request/response) ───────────────────────────────────────
@@ -43,8 +43,9 @@ fn via_channel(size: usize) -> f64 {
                 unsafe {
                     std::ptr::copy_nonoverlapping(p as *const u8, local.as_mut_ptr(), size);
                 }
-                checksum = checksum.wrapping_add(local[0] as u64)
-                                  .wrapping_add(local[size - 1] as u64);
+                checksum = checksum
+                    .wrapping_add(local[0] as u64)
+                    .wrapping_add(local[size - 1] as u64);
             });
         }
         checksum
@@ -65,13 +66,19 @@ fn via_channel(size: usize) -> f64 {
 // ─── Signal + AtomicUsize (raw 1-way) ─────────────────────────────────
 
 #[repr(align(64))]
-struct Hop { signal: Signal, slot: AtomicUsize }
+struct Hop {
+    signal: Signal,
+    slot: AtomicUsize,
+}
 
 fn via_signal(size: usize) -> f64 {
     let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
     let ptr_usize = payload.as_ptr() as usize;
 
-    let hop = Arc::new(Hop { signal: Signal::new(), slot: AtomicUsize::new(0) });
+    let hop = Arc::new(Hop {
+        signal: Signal::new(),
+        slot: AtomicUsize::new(0),
+    });
     let h2 = hop.clone();
 
     let consumer = thread::spawn(move || {
@@ -85,15 +92,18 @@ fn via_signal(size: usize) -> f64 {
             unsafe {
                 std::ptr::copy_nonoverlapping(p as *const u8, local.as_mut_ptr(), size);
             }
-            checksum = checksum.wrapping_add(local[0] as u64)
-                              .wrapping_add(local[size - 1] as u64);
+            checksum = checksum
+                .wrapping_add(local[0] as u64)
+                .wrapping_add(local[size - 1] as u64);
         }
         checksum
     });
 
     let t0 = Instant::now();
     for _ in 0..MSGS {
-        while hop.signal.is_open() { std::hint::spin_loop(); }
+        while hop.signal.is_open() {
+            std::hint::spin_loop();
+        }
         hop.slot.store(ptr_usize, Ordering::Release);
         hop.signal.release();
     }
@@ -119,14 +129,17 @@ fn via_mpsc_sync(size: usize) -> f64 {
             unsafe {
                 std::ptr::copy_nonoverlapping(p as *const u8, local.as_mut_ptr(), size);
             }
-            checksum = checksum.wrapping_add(local[0] as u64)
-                              .wrapping_add(local[size - 1] as u64);
+            checksum = checksum
+                .wrapping_add(local[0] as u64)
+                .wrapping_add(local[size - 1] as u64);
         }
         checksum
     });
 
     let t0 = Instant::now();
-    for _ in 0..MSGS { tx.send(ptr_usize).unwrap(); }
+    for _ in 0..MSGS {
+        tx.send(ptr_usize).unwrap();
+    }
     drop(tx);
     let _ = consumer.join().unwrap();
     let ns = t0.elapsed().as_nanos() as f64;
@@ -150,14 +163,17 @@ fn via_mpsc_unbounded(size: usize) -> f64 {
             unsafe {
                 std::ptr::copy_nonoverlapping(p as *const u8, local.as_mut_ptr(), size);
             }
-            checksum = checksum.wrapping_add(local[0] as u64)
-                              .wrapping_add(local[size - 1] as u64);
+            checksum = checksum
+                .wrapping_add(local[0] as u64)
+                .wrapping_add(local[size - 1] as u64);
         }
         checksum
     });
 
     let t0 = Instant::now();
-    for _ in 0..MSGS { tx.send(ptr_usize).unwrap(); }
+    for _ in 0..MSGS {
+        tx.send(ptr_usize).unwrap();
+    }
     drop(tx);
     let _ = consumer.join().unwrap();
     let ns = t0.elapsed().as_nanos() as f64;
@@ -169,13 +185,19 @@ fn via_mpsc_unbounded(size: usize) -> f64 {
 // ─── Main ─────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("1-hop pointer delivery (producer → consumer copies {} bytes)", MSGS);
+    println!(
+        "1-hop pointer delivery (producer → consumer copies {} bytes)",
+        MSGS
+    );
     println!("messages = {} per run (best of 3 + warmup)\n", MSGS);
     println!(
         "{:<10} | {:>12} {:>12} {:>12} | {:>14}",
         "size", "Channel", "Signal+Atom", "mpsc sync(1)", "mpsc unbounded"
     );
-    println!("{:<10} | {:<38} | {}", "", "honest (1-slot, real backpressure)", "illusion (growing queue)");
+    println!(
+        "{:<10} | {:<38} | {}",
+        "", "honest (1-slot, real backpressure)", "illusion (growing queue)"
+    );
     println!("{}", "─".repeat(90));
 
     // Warmup.
@@ -185,17 +207,33 @@ fn main() {
     let _ = via_mpsc_unbounded(64);
 
     for &size in SIZES {
-        let ch = (0..3).map(|_| via_channel(size))        .fold(f64::INFINITY, f64::min);
-        let sg = (0..3).map(|_| via_signal(size))         .fold(f64::INFINITY, f64::min);
-        let ms = (0..3).map(|_| via_mpsc_sync(size))      .fold(f64::INFINITY, f64::min);
-        let mu = (0..3).map(|_| via_mpsc_unbounded(size)) .fold(f64::INFINITY, f64::min);
+        let ch = (0..3)
+            .map(|_| via_channel(size))
+            .fold(f64::INFINITY, f64::min);
+        let sg = (0..3)
+            .map(|_| via_signal(size))
+            .fold(f64::INFINITY, f64::min);
+        let ms = (0..3)
+            .map(|_| via_mpsc_sync(size))
+            .fold(f64::INFINITY, f64::min);
+        let mu = (0..3)
+            .map(|_| via_mpsc_unbounded(size))
+            .fold(f64::INFINITY, f64::min);
         println!(
             "{:<10} | {:>10.1}ns {:>10.1}ns {:>10.1}ns | {:>12.1}ns",
-            human(size), ch, sg, ms, mu
+            human(size),
+            ch,
+            sg,
+            ms,
+            mu
         );
     }
 }
 
 fn human(n: usize) -> String {
-    if n >= 1024 { format!("{} KiB", n / 1024) } else { format!("{} B", n) }
+    if n >= 1024 {
+        format!("{} KiB", n / 1024)
+    } else {
+        format!("{} B", n)
+    }
 }
