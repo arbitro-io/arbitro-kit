@@ -30,6 +30,7 @@ mod duplex;
 mod receipt;
 mod recv;
 mod ring;
+mod ring2;
 mod segment;
 mod send;
 #[allow(clippy::module_inception)]
@@ -42,4 +43,5 @@ pub use buffered::BufferedSender;
 pub use duplex::{Duplex, DuplexEnd};
 pub use receipt::Receipt;
 pub use ring::Ring;
+pub use ring2::Ring2;
 pub use stream::Stream;

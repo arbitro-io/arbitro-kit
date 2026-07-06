@@ -29,6 +29,19 @@ crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "io-util", "net"] }
 
+# Linux-only: raw io_uring for the `mem_ring_h2h` in-memory bench.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+io-uring = "0.7"
+
+# Loom is pulled in only when the crate is built with `--cfg loom`. Used
+# by `tests/loom_ring2.rs` and the `#[cfg(loom)]` atomic shim inside
+# `src/stream/ring2.rs`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [[bench]]
 name = "gate_overhead"
 harness = false
@@ -89,6 +102,11 @@ required-features = ["tokio"]
 
 [[bench]]
 name = "cap_sweep"
+harness = false
+required-features = ["tokio"]
+
+[[bench]]
+name = "mem_ring_h2h"
 harness = false
 required-features = ["tokio"]
 
