@@ -6,6 +6,11 @@
 //! - [`Ring<T, CAP>`] — **bounded** SPSC. Fixed-capacity ring; producer
 //!   blocks (or returns `Err`) when full. Use when memory must stay
 //!   constant and backpressure is desired.
+//! - [`Ring2<T, CAP, W>`] — **bounded** SPSC, split-handle variant.
+//!   [`Ring2::new`] returns a unique ([`Producer`], [`Consumer`]) pair —
+//!   the SPSC contract is compile-time enforced (handles are `Send` but
+//!   not `Clone`/`Sync`), with cached peer cursors and disconnect
+//!   detection on handle drop.
 //! - [`Stream<T>`] — **unbounded** SPSC sequenced log. Linked segments
 //!   grow on demand; producer never blocks while RAM is available.
 //!   Each `send` returns a [`Receipt`] for O(1) delivery verification.
@@ -43,5 +48,5 @@ pub use buffered::BufferedSender;
 pub use duplex::{Duplex, DuplexEnd};
 pub use receipt::Receipt;
 pub use ring::Ring;
-pub use ring2::Ring2;
+pub use ring2::{Consumer, Producer, Ring2, TryRecvError, TrySendError};
 pub use stream::Stream;

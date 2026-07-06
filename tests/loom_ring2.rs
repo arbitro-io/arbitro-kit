@@ -1,80 +1,93 @@
-//! Loom concurrency scenarios for `Ring2`.
+//! Loom concurrency scenarios for `Ring2` (split-handle v2).
 //!
 //! ## Verification scope (honest disclosure)
 //!
-//! This test file uses `loom::thread::spawn` and `loom::sync::Arc` for
-//! interleaving exploration. In addition, `ring2.rs` swaps its shared
-//! `AtomicUsize` / `Ordering` for `loom::sync::atomic::*` under
-//! `#[cfg(loom)]`, so loom **does** get to explore reorderings on the
-//! `head` and `tail` cursors.
+//! This test file uses `loom::thread::spawn` for interleaving exploration.
+//! In addition, `ring2.rs` swaps its shared `AtomicUsize` / `AtomicBool` /
+//! `Ordering` for `loom::sync::atomic::*` under `#[cfg(loom)]`, so loom
+//! **does** get to explore reorderings on the `head` / `tail` cursors and
+//! the `closed` flag.
 //!
 //! What this catches:
-//! - Weak-memory-model reorderings on the `head`/`tail` cursors (missing
+//! - Weak-memory-model reorderings on `head` / `tail` / `closed` (missing
 //!   `Acquire`/`Release`, `Relaxed` where it isn't safe).
 //! - Algorithmic races (missed items, doubled items, double drops).
-//! - Order-of-operations bugs in the send/recv sequence.
+//! - Order-of-operations bugs in the send/recv/close sequence, including
+//!   the "item published right before producer drop" disconnect race.
 //!
 //! What this does NOT catch:
-//! - `UnsafeCell` access races on the slot storage and the `cached_*`
-//!   cells. Loom's `UnsafeCell` was NOT swapped in — that would require
-//!   migrating every `.get()` call site to `.with(|p| ...)`, a much
-//!   larger diff. We rely on Miri (which was run separately and passed
-//!   all 10 unit tests) for UB detection at the cell level under the
-//!   real memory model.
+//! - `UnsafeCell` access races on the slot storage. Loom's `UnsafeCell`
+//!   was NOT swapped in — that would require migrating every `.get()`
+//!   call site to `.with(|p| ...)`. We rely on Miri (run separately) for
+//!   UB detection at the cell level under the real memory model. The v2
+//!   cached cursors are plain fields of the uniquely-owned handles, so
+//!   they need no cell modeling at all.
 //! - Wake/park handoff correctness through the `Waiter`: scenarios use
 //!   only `try_send` / `try_recv` to keep the OS-thread `ParkWaiter` out
 //!   of loom's model (loom doesn't shim `thread::park`).
 //!
-//! Loom scenarios use `try_send`/`try_recv` (not the blocking `send`/`recv`)
-//! to keep the `Waiter` (park/unpark) out of the model — the ring's cursor
-//! logic is the target here, and `.wake()` on an unparked `ParkWaiter` is a
-//! single relaxed load with no side effect that matters for correctness of
-//! the ring's data flow.
+//! Preemption bound: `LOOM_MAX_PREEMPTIONS` from the environment wins
+//! when set (the CI/verification runs use 3); otherwise defaults to 2.
 
 #![cfg(loom)]
 
-use arbitro_kit::stream::Ring2;
-use loom::sync::Arc;
+use arbitro_kit::stream::{Consumer, Producer, Ring2, TryRecvError};
 use loom::thread;
 
-/// Cap loom exploration. Preemption bound 2 keeps runtimes reasonable
-/// (single-digit seconds per scenario at N=2..3).
+/// Cap loom exploration. Respects `LOOM_MAX_PREEMPTIONS` when set;
+/// defaults to preemption bound 2 otherwise.
 fn model<F>(f: F)
 where
     F: Fn() + Sync + Send + 'static,
 {
     let mut builder = loom::model::Builder::new();
-    builder.preemption_bound = Some(2);
+    let bound = std::env::var("LOOM_MAX_PREEMPTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2);
+    builder.preemption_bound = Some(bound);
     builder.check(f);
 }
 
-/// Busy-loop `try_recv` from the consumer side until we've drained `n` items.
-/// This is *not* a spin loop in production code — it exists only to drive
-/// loom's scheduler forward without introducing a Waiter into the model.
-fn drain_n<const CAP: usize>(r: &Ring2<u32, CAP>, n: usize) -> Vec<u32> {
+/// Busy-loop `try_recv` from the consumer side until we've drained `n`
+/// items. This is *not* a spin loop in production code — it exists only to
+/// drive loom's scheduler forward without introducing a Waiter into the
+/// model.
+fn drain_n<const CAP: usize>(rx: &mut Consumer<u32, CAP>, n: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
-        if let Some(v) = r.try_recv() {
-            out.push(v);
-        } else {
-            thread::yield_now();
+        match rx.try_recv() {
+            Ok(v) => out.push(v),
+            Err(_) => thread::yield_now(),
         }
     }
     out
 }
 
 /// Busy-loop `try_send` until enqueued. Same rationale as `drain_n`.
-fn send_all<const CAP: usize>(r: &Ring2<u32, CAP>, values: &[u32]) {
+fn send_all<const CAP: usize>(tx: &mut Producer<u32, CAP>, values: &[u32]) {
     for &v in values {
         let mut cur = v;
         loop {
-            match r.try_send(cur) {
+            match tx.try_send(cur) {
                 Ok(()) => break,
-                Err(back) => {
-                    cur = back;
+                Err(e) => {
+                    cur = e.into_value();
                     thread::yield_now();
                 }
             }
+        }
+    }
+}
+
+trait IntoValue<T> {
+    fn into_value(self) -> T;
+}
+impl<T> IntoValue<T> for arbitro_kit::stream::TrySendError<T> {
+    fn into_value(self) -> T {
+        match self {
+            arbitro_kit::stream::TrySendError::Full(v) => v,
+            arbitro_kit::stream::TrySendError::Closed(v) => v,
         }
     }
 }
@@ -86,20 +99,18 @@ fn send_all<const CAP: usize>(r: &Ring2<u32, CAP>, values: &[u32]) {
 fn loom_a_two_items_cap2_no_backpressure() {
     // A static counter records how many interleavings loom actually
     // explored — a smoke check that the atomic shim inside `ring2.rs`
-    // is exposing enough state for meaningful exploration. Empirically
-    // this scenario visits ~23 iterations at preemption_bound = 2.
+    // is exposing enough state for meaningful exploration.
     static ITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     model(|| {
         ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let r: Arc<Ring2<u32, 2>> = Arc::new(Ring2::new());
-        let r2 = r.clone();
+        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
         let p = thread::spawn(move || {
-            send_all::<2>(&r2, &[10, 20]);
+            send_all::<2>(&mut tx, &[10, 20]);
         });
-        let got = drain_n::<2>(&r, 2);
+        let got = drain_n::<2>(&mut rx, 2);
         p.join().unwrap();
         assert_eq!(got, vec![10, 20]);
-        assert!(r.is_empty());
+        assert!(rx.is_empty());
     });
     // If this drops to a small single-digit number, the shim likely
     // regressed to std atomics — loom would only see thread spawn/join.
@@ -116,15 +127,14 @@ fn loom_a_two_items_cap2_no_backpressure() {
 #[test]
 fn loom_b_three_items_cap2_backpressure() {
     model(|| {
-        let r: Arc<Ring2<u32, 2>> = Arc::new(Ring2::new());
-        let r2 = r.clone();
+        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
         let p = thread::spawn(move || {
-            send_all::<2>(&r2, &[1, 2, 3]);
+            send_all::<2>(&mut tx, &[1, 2, 3]);
         });
-        let got = drain_n::<2>(&r, 3);
+        let got = drain_n::<2>(&mut rx, 3);
         p.join().unwrap();
         assert_eq!(got, vec![1, 2, 3]);
-        assert!(r.is_empty());
+        assert!(rx.is_empty());
     });
 }
 
@@ -135,35 +145,33 @@ fn loom_b_three_items_cap2_backpressure() {
 #[test]
 fn loom_c_single_item_lifecycle() {
     model(|| {
-        let r: Arc<Ring2<u32, 2>> = Arc::new(Ring2::new());
-        let r2 = r.clone();
+        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
         let c = thread::spawn(move || {
-            let mut got = None;
-            while got.is_none() {
-                got = r2.try_recv();
-                if got.is_none() {
-                    thread::yield_now();
+            loop {
+                match rx.try_recv() {
+                    Ok(v) => return v,
+                    Err(_) => thread::yield_now(),
                 }
             }
-            got.unwrap()
         });
-        while r.try_send(42).is_err() {
+        while tx.try_send(42).is_err() {
             thread::yield_now();
         }
         let v = c.join().unwrap();
         assert_eq!(v, 42);
-        // Arc drops both ends here — no double-drop must occur.
+        // Handles drop both ends here — no double-drop must occur.
     });
 }
 
 // ── Scenario D ────────────────────────────────────────────────────────
-// Drop the ring with unread items. `Ring2::drop` must drain each `T`
-// exactly once. We use an Arc<AtomicUsize> drop counter as the payload
-// witness. NB: still uses `loom::sync::atomic` inside the payload only.
+// Drop the ring with unread items. The shared `Ring2::drop` must drain
+// each `T` exactly once. We use an Arc<AtomicUsize> drop counter as the
+// payload witness.
 
 #[test]
 fn loom_d_drop_drains_unread() {
     use loom::sync::atomic::{AtomicUsize, Ordering as O};
+    use loom::sync::Arc;
 
     model(|| {
         let drops = Arc::new(AtomicUsize::new(0));
@@ -177,11 +185,13 @@ fn loom_d_drop_drains_unread() {
             }
         }
 
-        let r: Ring2<Tracked, 2> = Ring2::new();
-        assert!(r.try_send(Tracked { drops: drops.clone() }).is_ok());
-        assert!(r.try_send(Tracked { drops: drops.clone() }).is_ok());
-        // Drop `r` here with 2 items unread.
-        drop(r);
+        let (mut tx, rx) = Ring2::<Tracked, 2>::new();
+        assert!(tx.try_send(Tracked { drops: drops.clone() }).is_ok());
+        assert!(tx.try_send(Tracked { drops: drops.clone() }).is_ok());
+        // Drop both handles with 2 items unread — the shared drain runs
+        // when the second Arc reference goes away.
+        drop(tx);
+        drop(rx);
         assert_eq!(drops.load(O::Relaxed), 2);
     });
 }
@@ -193,14 +203,41 @@ fn loom_d_drop_drains_unread() {
 #[test]
 fn loom_e_cap1_ping_pong() {
     model(|| {
-        let r: Arc<Ring2<u32, 1>> = Arc::new(Ring2::new());
-        let r2 = r.clone();
+        let (mut tx, mut rx) = Ring2::<u32, 1>::new();
         let p = thread::spawn(move || {
-            send_all::<1>(&r2, &[1, 2, 3]);
+            send_all::<1>(&mut tx, &[1, 2, 3]);
         });
-        let got = drain_n::<1>(&r, 3);
+        let got = drain_n::<1>(&mut rx, 3);
         p.join().unwrap();
         assert_eq!(got, vec![1, 2, 3]);
-        assert!(r.is_empty());
+        assert!(rx.is_empty());
+    });
+}
+
+// ── Scenario F ────────────────────────────────────────────────────────
+// Disconnect race: producer sends 1 item and drops concurrently with the
+// consumer draining. The consumer must see the item BEFORE observing
+// Closed — the `closed` flag is stored Release after the final `head`
+// store, and try_recv re-reads `head` after Acquire-loading `closed`.
+
+#[test]
+fn loom_f_producer_drop_delivers_inflight_then_closes() {
+    model(|| {
+        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
+        let p = thread::spawn(move || {
+            tx.try_send(99).unwrap();
+            // tx drops here → closed set, after the send's head store.
+        });
+        let mut got = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(v) => got.push(v),
+                Err(TryRecvError::Empty) => thread::yield_now(),
+                Err(TryRecvError::Closed) => break,
+            }
+        }
+        p.join().unwrap();
+        // Closed must never surface before the in-flight item.
+        assert_eq!(got, vec![99]);
     });
 }

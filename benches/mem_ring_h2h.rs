@@ -173,20 +173,18 @@ mod kit_impl {
 mod kit2_impl {
     use super::{Msg, CAP, N};
     use arbitro_kit::stream::Ring2;
-    use std::sync::Arc;
     use std::thread;
     use std::time::Instant;
 
     pub fn run() -> f64 {
-        let ring: Arc<Ring2<Msg, CAP>> = Arc::new(Ring2::new());
-        let ring_c = ring.clone();
-
-        ring.set_producer(thread::current());
+        // v2 split-handle API: unique Producer/Consumer pair, no Arc or
+        // set_producer/set_consumer at the call site — handles register
+        // their own thread on the first blocking call.
+        let (mut tx, mut rx) = Ring2::<Msg, CAP>::new();
 
         let consumer = thread::spawn(move || {
-            ring_c.set_consumer(thread::current());
             for _ in 0..N {
-                let m = ring_c.recv();
+                let m = rx.recv().unwrap();
                 std::hint::black_box(m);
             }
         });
@@ -195,7 +193,7 @@ mod kit2_impl {
 
         let t0 = Instant::now();
         for i in 0..N {
-            ring.send(i as Msg);
+            tx.send(i as Msg).unwrap();
         }
         consumer.join().unwrap();
         let ns = t0.elapsed().as_nanos() as f64;
@@ -227,17 +225,17 @@ mod kit2_tokio_impl {
             // Both futures still run concurrently — join! polls them on
             // the same worker thread and yields cooperatively, which is
             // representative of typical tokio SPSC workloads.
-            let ring: Ring2<Msg, CAP, NotifyWaiter> = Ring2::new();
+            let (mut tx, mut rx) = Ring2::<Msg, CAP, NotifyWaiter>::new();
 
             let t0 = Instant::now();
             let producer = async {
                 for i in 0..N {
-                    ring.send_async(i as Msg).await;
+                    tx.send_async(i as Msg).await.unwrap();
                 }
             };
             let consumer = async {
                 for _ in 0..N {
-                    let m = ring.recv_async().await;
+                    let m = rx.recv_async().await.unwrap();
                     std::hint::black_box(m);
                 }
             };
