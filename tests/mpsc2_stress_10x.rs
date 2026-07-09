@@ -43,7 +43,7 @@ fn run_once(m: usize, iter: usize) {
         }
     });
 
-    let (ps, c, sd) = Mpsc2::<u64, CAP>::new(m);
+    let (ps, mut c, sd) = Mpsc2::<u64, CAP>::new(m);
     let sd2 = sd.clone();
     let barrier = Arc::new(Barrier::new(m + 1));
     let target = (m as u64) * PER;

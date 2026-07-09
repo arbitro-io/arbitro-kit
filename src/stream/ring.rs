@@ -422,6 +422,18 @@ impl<T, const CAP: usize, W: Waiter> Producer<T, CAP, W> {
         take
     }
 
+    /// Vyukov wake gate. Call after a successful `try_send` / `try_send_bulk`
+    /// that pushed `n_pushed` items. Refreshes `cached_tail` and returns
+    /// `true` iff the ring went 0 → `n_pushed` from the consumer's fresh
+    /// perspective — i.e. wake would not be redundant.
+    #[inline]
+    pub fn should_notify_consumer(&mut self, n_pushed: usize) -> bool {
+        let shared = &*self.shared;
+        self.cached_tail = shared.tail.0.load(Ordering::Acquire);
+        let head = shared.head.0.load(Ordering::Relaxed);
+        head.wrapping_sub(self.cached_tail) == n_pushed
+    }
+
     /// Register the current thread on the producer waiter if it is not
     /// already the registered one. Handles are `Send`, so a handle may
     /// legitimately block from a different thread than last time.
@@ -595,26 +607,13 @@ impl<T, const CAP: usize, W: Waiter> Consumer<T, CAP, W> {
         Ok(v)
     }
 
-    /// Drain every item currently visible in the ring, invoking `f` on each
-    /// in FIFO order. Returns the count drained.
-    ///
-    /// **Amortized fences.** One Acquire head-load, one Release tail-store,
-    /// one wake — regardless of how many items are drained. Compare
-    /// `try_recv()` which pays one Release + one wake **per item** because
-    /// each call is a self-contained SPSC transaction.
-    ///
-    /// Use this inside a batched consumer path (e.g. `Mpsc2::try_recv_batch`)
-    /// where publishing tail per item just bounces the producer's cache line
-    /// pointlessly.
-    ///
-    /// Does not block; does not signal `Closed`. If closed detection matters,
-    /// call `is_closed()` after a zero return.
+    /// Drain everything visible; one Acquire head-load, one Release
+    /// tail-store, one wake — regardless of item count. Does not block or
+    /// signal `Closed`.
     #[inline]
     pub fn drain<F: FnMut(T)>(&mut self, mut f: F) -> usize {
         let shared = &*self.shared;
         let mut tail = shared.tail.0.load(Ordering::Relaxed);
-        // ONE Acquire load — snapshots head. Items published after this load
-        // are for the next drain call.
         let head = shared.head.0.load(Ordering::Acquire);
         if tail == head {
             return 0;
@@ -627,12 +626,8 @@ impl<T, const CAP: usize, W: Waiter> Consumer<T, CAP, W> {
             tail = tail.wrapping_add(1);
             f(v);
         }
-        // ONE Release publishes every pop atomically to the producer's next
-        // `avail` computation.
         shared.tail.0.store(tail, Ordering::Release);
         shared.not_full.0.wake();
-        // Keep the handle-private head cache aligned with the snapshot we
-        // used so a following `try_recv` doesn't compare against a stale head.
         self.cached_head = head;
         tail.wrapping_sub(start)
     }

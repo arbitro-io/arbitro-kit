@@ -1,32 +1,6 @@
-//! M:1 multi-producer / single-consumer bounded channel, built on
-//! [`Ring<T, CAP, NoopWaiter>`](crate::stream::Ring).
-//!
-//! ## Design
-//!
-//! Each producer owns a private `Ring::Producer<T, CAP, NoopWaiter>`.
-//! Each ring is SPSC by construction (Ring's handles are `!Clone` and
-//! `!Sync`), so the SPSC contract per producer is compile-time enforced.
-//!
-//! The internal ring uses [`NoopWaiter`](crate::waiter::NoopWaiter), so
-//! Ring's per-op `wake()` compiles to nothing. Mpsc2 does its own wake
-//! on a shared fan-in waiter, so the consumer sees exactly one wake per
-//! producer op — no double-fence tax.
-//!
-//! ## Contrast with [`Mpsc`](super::Mpsc)
-//!
-//! `Mpsc` hand-rolls its per-producer ring (`PRing`) with raw
-//! `AtomicUsize` cursors. `Mpsc2` reuses `Ring` — inheriting its cursor
-//! cache, disconnect detection on handle drop, and drop-drain of
-//! in-flight items — without paying Ring's internal wake cost.
-//!
-//! Same wire behavior:
-//!   - Producer `try_send` = 1 slot write + 1 Release store + 0 wake fences
-//!     inside Ring + 1 fence on Mpsc2's fan-in waiter (steady state).
-//!   - Consumer `try_recv` = O(M) scan of ring cursors; first non-empty
-//!     ring yields.
-//!
-//! Zero unsafe code in this file — all `unsafe` is inside Ring, already
-//! Miri- and loom-verified.
+//! M:1 bounded channel built on per-producer [`Ring<T, CAP, NoopWaiter>`].
+//! The ring's internal `wake()` is a no-op; fan-in wakes go through
+//! Mpsc2's own shared waiter, gated by [`Producer::should_notify_consumer`].
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -42,21 +16,10 @@ pub const MAX_MPSC2_PRODUCERS: usize = 255;
 
 // ─── Shared state ─────────────────────────────────────────────────────────
 
-/// Cross-handle state — waiters, live producer count, shutdown flag.
-///
-/// **The ring Consumers are NOT here.** They live in `Mpsc2Consumer`
-/// directly (which is `!Sync` and owned by exactly one thread), so the
-/// consumer scan path has zero mutex overhead.
 struct Inner<W: Waiter> {
-    /// Fan-in waiter — wakes the consumer when any producer publishes.
     fanin_waiter: W,
-    /// Per-producer backpressure waiter — the consumer wakes producer p
-    /// after draining ring p, so `send` can re-attempt.
     producer_waiters: Vec<W>,
-    /// Live producer count. Decremented on `Mpsc2Producer::drop`. When it
-    /// hits 0 AND all rings are drained, `recv` returns `Err(Shutdown)`.
     live_producers: AtomicUsize,
-    /// Explicit shutdown flag (from `Mpsc2Shutdown::signal`).
     shutdown: AtomicBool,
     m: usize,
 }
@@ -185,8 +148,9 @@ impl<T: Send, const CAP: usize, W: Waiter> Mpsc2Producer<T, CAP, W> {
             .expect("ring_producer only None during drop");
         match rp.try_send(value) {
             Ok(()) => {
-                // ONE fan-in wake — Ring's internal `wake` was a no-op.
-                self.inner.fanin_waiter.wake();
+                if rp.should_notify_consumer(1) {
+                    self.inner.fanin_waiter.wake();
+                }
                 Ok(())
             }
             Err(TrySendError::Full(v)) => Err(v),
@@ -194,13 +158,9 @@ impl<T: Send, const CAP: usize, W: Waiter> Mpsc2Producer<T, CAP, W> {
         }
     }
 
-    /// Bulk send — pushes up to `min(items.len(), available)` items into
-    /// this producer's ring. Delegates to Ring's `try_send_bulk` for TRUE
-    /// bulk amortization: N slot writes + **1** Release store + **1**
-    /// fan-in wake. This is the batch path we compare against Mpsc's
-    /// `try_send_batch`.
-    ///
-    /// Returns the number consumed from `items`.
+    /// Bulk send — pushes up to `min(items.len(), available)` items via
+    /// Ring's `try_send_bulk`. One Release store + at most one fan-in
+    /// wake per call. Returns the number consumed from `items`.
     #[inline]
     pub fn try_send_bulk(&mut self, items: &mut Vec<T>) -> usize {
         if items.is_empty() || self.inner.shutdown.load(Ordering::Acquire) {
@@ -211,8 +171,7 @@ impl<T: Send, const CAP: usize, W: Waiter> Mpsc2Producer<T, CAP, W> {
             .as_mut()
             .expect("ring_producer only None during drop");
         let n = rp.try_send_bulk(items);
-        if n > 0 {
-            // ONE fan-in wake for the whole burst.
+        if n > 0 && rp.should_notify_consumer(n) {
             self.inner.fanin_waiter.wake();
         }
         n
@@ -233,22 +192,14 @@ impl<T: Send, const CAP: usize, W: BlockingWaiter> Mpsc2Producer<T, CAP, W> {
                 Ok(()) => return,
                 Err(v) => value = v,
             }
-            // Wait for the consumer to drain ring `my_idx`, or shutdown.
-            // The producer checks its OWN ring's is_full via the ring
-            // producer handle (which we own), no shared-state lock needed.
             let idx = self.my_idx;
             let inner = &*self.inner;
-            // Take a raw pointer to our ring_producer so the closure can
-            // read is_full without moving/borrowing self across await.
             let rp_ptr: *const Option<Producer<T, CAP, NoopWaiter>> = &self.ring_producer;
             self.inner.producer_waiters[idx].wait_until(|| {
                 if inner.shutdown.load(Ordering::Acquire) {
                     return true;
                 }
-                // SAFETY: same-thread read of ring_producer (a Send but
-                // !Sync field of this producer handle). We hold the outer
-                // &mut self while calling wait_until, so no other thread
-                // touches this handle.
+                // SAFETY: single-threaded read — we hold `&mut self`.
                 let rp = unsafe { &*rp_ptr };
                 match rp.as_ref() {
                     Some(p) => !p.is_full(),
@@ -261,17 +212,9 @@ impl<T: Send, const CAP: usize, W: BlockingWaiter> Mpsc2Producer<T, CAP, W> {
 
 impl<T, const CAP: usize, W: Waiter> Drop for Mpsc2Producer<T, CAP, W> {
     fn drop(&mut self) {
-        // Drop the ring producer first — this sets Ring's `closed` flag
-        // and wakes Ring's Consumer waiter (NoopWaiter, so no-op — fine).
-        // The Mpsc2 consumer discovers the close via `try_recv`
-        // returning `Closed`.
         drop(self.ring_producer.take());
-        // Decrement the live producer count. When it hits zero AND all
-        // rings drain, `recv` returns `Err(Shutdown)`.
         let prev = self.inner.live_producers.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            // Last producer gone — wake the consumer so it can observe
-            // shutdown.
             self.inner.fanin_waiter.wake();
         }
     }
@@ -279,15 +222,9 @@ impl<T, const CAP: usize, W: Waiter> Drop for Mpsc2Producer<T, CAP, W> {
 
 // ─── Consumer handle ──────────────────────────────────────────────────────
 
-/// Single-consumer handle. `Send` but `!Sync` — enforces the single
-/// consumer contract at compile time. Owns the ring `Consumer` halves
-/// directly (no mutex, no Arc contention).
+/// Single-consumer handle. `Send + !Sync`.
 pub struct Mpsc2Consumer<T, const CAP: usize, W: Waiter> {
     inner: Arc<Inner<W>>,
-    /// Per-ring consumer halves. Owned by this handle exclusively —
-    /// since the handle is `Send` + `!Sync`, only one thread ever
-    /// touches this Vec. `Option` so producer drops can be observed
-    /// (empty ring + no producer = will never fill again).
     ring_consumers: Vec<Option<Consumer<T, CAP, NoopWaiter>>>,
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -346,14 +283,8 @@ impl<T: Send, const CAP: usize, W: Waiter> Mpsc2Consumer<T, CAP, W> {
         None
     }
 
-    /// Drain every ring at least once, calling `f` on each item drained.
-    /// Loops until a full pass finds zero items. Returns the count.
-    ///
-    /// Uses [`Consumer::drain`] per ring, which pays **one** Release
-    /// tail-store + one wake per ring per pass — regardless of how many
-    /// items it drains. Calling `try_recv()` in a loop would pay one
-    /// Release per item and bounce the producer's `tail` cache line on
-    /// every consumed item.
+    /// Drain every ring at least once via [`Consumer::drain`]. Loops until
+    /// a full pass finds zero items. Returns the count.
     #[inline]
     pub fn try_recv_batch<F: FnMut(T)>(&mut self, mut f: F) -> usize {
         let mut total = 0;
@@ -389,26 +320,16 @@ impl<T: Send, const CAP: usize, W: BlockingWaiter> Mpsc2Consumer<T, CAP, W> {
             if self.is_finished() {
                 return Err(Shutdown);
             }
-            // Borrow-check dance: `wait_until` needs &self.inner, but the
-            // predicate needs to call self.any_ring_has_work() /
-            // self.is_finished() which borrow &self. Since the predicate
-            // only reads immutably from `self.ring_consumers`, we pass a
-            // raw pointer through — the SPSC contract guarantees no
-            // aliasing (only this thread touches ring_consumers).
             let self_ptr: *const Self = self;
             self.inner.fanin_waiter.wait_until(|| {
-                // SAFETY: `wait_until` calls the predicate on the same
-                // thread that holds `&mut self`. `ring_consumers` is only
-                // read (via is_empty), never mutated, so aliasing with
-                // the outer `&mut self` is a shared read — sound.
+                // SAFETY: predicate runs on the same thread holding `&mut self`;
+                // only reads `ring_consumers`.
                 let this = unsafe { &*self_ptr };
                 this.any_ring_has_work() || this.is_finished()
             });
         }
     }
 
-    /// Drain a batch; parks when empty. Returns `Err(Shutdown)` if the
-    /// channel is shut down AND drained.
     #[inline]
     pub fn recv_batch<F: FnMut(T)>(&mut self, mut f: F) -> Result<usize, Shutdown> {
         loop {
@@ -421,7 +342,6 @@ impl<T: Send, const CAP: usize, W: BlockingWaiter> Mpsc2Consumer<T, CAP, W> {
             }
             let self_ptr: *const Self = self;
             self.inner.fanin_waiter.wait_until(|| {
-                // SAFETY: same as above — read-only borrow, single thread.
                 let this = unsafe { &*self_ptr };
                 this.any_ring_has_work() || this.is_finished()
             });
