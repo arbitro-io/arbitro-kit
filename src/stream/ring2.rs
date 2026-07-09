@@ -94,7 +94,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter, Waiter};
+use crate::waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter2, Waiter};
 
 /// Pads (and aligns) `T` to a 64-byte cache line so adjacent fields never
 /// share a line. Local definition — the kit runtime stays dependency-free,
@@ -128,7 +128,7 @@ pub enum TryRecvError {
 ///
 /// See the module docs for the field-ownership table.
 #[repr(C)]
-pub struct Ring2<T, const CAP: usize, W: Waiter = ParkWaiter> {
+pub struct Ring2<T, const CAP: usize, W: Waiter = ParkWaiter2> {
     /// Monotonic write cursor. Producer writes with Release; consumer
     /// reads with Acquire. Own cache line (line 0).
     head: CachePadded<AtomicUsize>,
@@ -281,7 +281,7 @@ impl<T, const CAP: usize, W: Waiter> std::fmt::Debug for Ring2<T, CAP, W> {
 /// Dropping the producer closes the ring: the consumer drains remaining
 /// items, then `recv` returns `None` / `try_recv` returns
 /// [`TryRecvError::Closed`].
-pub struct Producer<T, const CAP: usize, W: Waiter = ParkWaiter> {
+pub struct Producer<T, const CAP: usize, W: Waiter = ParkWaiter2> {
     shared: Arc<Ring2<T, CAP, W>>,
     /// Private cache of the consumer's `tail`. Refreshed from the shared
     /// atomic only when the cache says "full" (once per batch).
@@ -456,7 +456,7 @@ impl<T, const CAP: usize, W: Waiter> std::fmt::Debug for Producer<T, CAP, W> {
 /// Dropping the consumer closes the ring: producer `send` returns
 /// `Err(value)` once the ring is full, `try_send` returns
 /// [`TrySendError::Closed`].
-pub struct Consumer<T, const CAP: usize, W: Waiter = ParkWaiter> {
+pub struct Consumer<T, const CAP: usize, W: Waiter = ParkWaiter2> {
     shared: Arc<Ring2<T, CAP, W>>,
     /// Private cache of the producer's `head`. Refreshed from the shared
     /// atomic only when the cache says "empty" (once per batch).

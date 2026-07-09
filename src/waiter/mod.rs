@@ -34,10 +34,12 @@ use std::future::Future;
 #[cfg(feature = "tokio")]
 mod notify;
 mod park;
+mod park2;
 
 #[cfg(feature = "tokio")]
 pub use notify::NotifyWaiter;
 pub use park::ParkWaiter;
+pub use park2::ParkWaiter2;
 
 /// Common surface every backend implements.
 ///
