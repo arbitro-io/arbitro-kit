@@ -108,7 +108,7 @@
 //!
 //! Measured cost of the wake-side barrier (`mem_ring_h2h`, WSL2, 1M
 //! msgs, CAP=32, saturated — the ring calls `wake()` on **every** op):
-//! Ring2/thread p50 11.4 ns/msg (old load-only probe) → 48.2 ns/msg
+//! Ring/thread p50 11.4 ns/msg (old load-only probe) → 48.2 ns/msg
 //! (T3b RMW). The regression is the StoreLoad barrier the proof
 //! requires, paid twice per message because ring send/recv call
 //! `wake()` unconditionally. The old number was bought with a formally
@@ -499,7 +499,7 @@ mod tests {
     }
 
     /// Finding-1 regression: the tightest possible wake-dependency loop
-    /// through a real consumer — `Ring2<u32, 1>` (default `ParkWaiter`)
+    /// through a real consumer — `Ring<u32, 1>` (default `ParkWaiter`)
     /// between two OS threads forces one not_full + one not_empty
     /// park/wake handoff per item. A single lost wake deadlocks the
     /// pair; the watchdog `recv_timeout` turns that into a test failure
@@ -507,9 +507,9 @@ mod tests {
     /// test has already failed at that point).
     #[test]
     fn ring2_cap1_ping_pong_park_waiter() {
-        use crate::stream::Ring2;
+        use crate::stream::Ring;
         const N: u32 = if cfg!(miri) { 300 } else { 100_000 };
-        let (mut tx, mut rx) = Ring2::<u32, 1>::new();
+        let (mut tx, mut rx) = Ring::<u32, 1>::new();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
         let d1 = done_tx.clone();
@@ -530,7 +530,7 @@ mod tests {
         for _ in 0..2 {
             done_rx
                 .recv_timeout(Duration::from_secs(60))
-                .expect("lost wake: Ring2 cap=1 ping-pong deadlocked");
+                .expect("lost wake: Ring cap=1 ping-pong deadlocked");
         }
         producer.join().unwrap();
         consumer.join().unwrap();

@@ -34,11 +34,13 @@
 mod hub;
 mod mpmc;
 mod mpsc;
+mod mpsc2;
 mod oneshot;
 
 pub use hub::{Hub, HubDrain, HubPort, HubReply, HubShutdown, Shutdown, MAX_HUB_PORTS};
 pub use mpmc::{Mpmc, MpmcConsumer, MpmcProducer, MpmcShutdown, MAX_MPMC_PRODUCERS};
 pub use mpsc::{Mpsc, MpscConsumer, MpscProducer, MpscSender, MpscShutdown, MAX_MPSC_PRODUCERS};
+pub use mpsc2::{Mpsc2, Mpsc2Consumer, Mpsc2Producer, Mpsc2Shutdown, MAX_MPSC2_PRODUCERS};
 pub use oneshot::{
     Closed as OneShotClosed, OneShot, Receiver as OneShotReceiver, Sender as OneShotSender,
 };

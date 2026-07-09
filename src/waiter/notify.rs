@@ -45,7 +45,7 @@
 //! This is the classic Dekker store→load race. It could be closed with
 //! `SeqCst` fences on both sides, but a waker-side fence is an `mfence`
 //! on every ring operation (measured: ~+8 ns/msg on the saturated
-//! Ring2/tokio path). Instead the waker's flag *check* is itself an
+//! Ring/tokio path). Instead the waker's flag *check* is itself an
 //! atomic RMW, and two properties of RMWs close the race with no fence:
 //!
 //! 1. **RMWs cannot read stale values.** An atomic RMW reads the latest
@@ -481,16 +481,16 @@ mod tests {
     }
 
     /// Same tightest-loop shape, but through the real consumer: a
-    /// `Ring2<u32, 1, NotifyWaiter>` forces one not_full + one not_empty
+    /// `Ring<u32, 1, NotifyWaiter>` forces one not_full + one not_empty
     /// wake per item. Confirms the two independent gates (producer-side
     /// and consumer-side are separate `NotifyWaiter` instances) do not
     /// interfere.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg_attr(miri, ignore)] // 100k await rounds — far too slow under Miri
     async fn ring2_cap1_ping_pong_100k() {
-        use crate::stream::Ring2;
+        use crate::stream::Ring;
         const N: u32 = 100_000;
-        let (mut tx, mut rx) = Ring2::<u32, 1, NotifyWaiter>::new();
+        let (mut tx, mut rx) = Ring::<u32, 1, NotifyWaiter>::new();
         // The RPITIT wait_until future cannot be proven `Send` through
         // `tokio::spawn` (rust-lang/rust#100013), so poll both halves
         // concurrently in one task via join! — every send still parks
@@ -510,6 +510,6 @@ mod tests {
             tokio::join!(p, c);
         })
         .await
-        .expect("Ring2 cap=1 ping-pong deadlocked — lost wake in the gate protocol");
+        .expect("Ring cap=1 ping-pong deadlocked — lost wake in the gate protocol");
     }
 }

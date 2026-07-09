@@ -1,9 +1,9 @@
-//! Loom concurrency scenarios for `Ring2` (split-handle v2).
+//! Loom concurrency scenarios for `Ring` (split-handle v2).
 //!
 //! ## Verification scope (honest disclosure)
 //!
 //! This test file uses `loom::thread::spawn` for interleaving exploration.
-//! In addition, `ring2.rs` swaps its shared `AtomicUsize` / `AtomicBool` /
+//! In addition, `ring.rs` swaps its shared `AtomicUsize` / `AtomicBool` /
 //! `Ordering` for `loom::sync::atomic::*` under `#[cfg(loom)]`, so loom
 //! **does** get to explore reorderings on the `head` / `tail` cursors and
 //! the `closed` flag.
@@ -31,7 +31,7 @@
 
 #![cfg(loom)]
 
-use arbitro_kit::stream::{Consumer, Producer, Ring2, TryRecvError};
+use arbitro_kit::stream::{Consumer, Producer, Ring, TryRecvError};
 use loom::thread;
 
 /// Cap loom exploration. Respects `LOOM_MAX_PREEMPTIONS` when set;
@@ -98,12 +98,12 @@ impl<T> IntoValue<T> for arbitro_kit::stream::TrySendError<T> {
 #[test]
 fn loom_a_two_items_cap2_no_backpressure() {
     // A static counter records how many interleavings loom actually
-    // explored — a smoke check that the atomic shim inside `ring2.rs`
+    // explored — a smoke check that the atomic shim inside `ring.rs`
     // is exposing enough state for meaningful exploration.
     static ITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     model(|| {
         ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
+        let (mut tx, mut rx) = Ring::<u32, 2>::new();
         let p = thread::spawn(move || {
             send_all::<2>(&mut tx, &[10, 20]);
         });
@@ -127,7 +127,7 @@ fn loom_a_two_items_cap2_no_backpressure() {
 #[test]
 fn loom_b_three_items_cap2_backpressure() {
     model(|| {
-        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
+        let (mut tx, mut rx) = Ring::<u32, 2>::new();
         let p = thread::spawn(move || {
             send_all::<2>(&mut tx, &[1, 2, 3]);
         });
@@ -145,7 +145,7 @@ fn loom_b_three_items_cap2_backpressure() {
 #[test]
 fn loom_c_single_item_lifecycle() {
     model(|| {
-        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
+        let (mut tx, mut rx) = Ring::<u32, 2>::new();
         let c = thread::spawn(move || {
             loop {
                 match rx.try_recv() {
@@ -164,7 +164,7 @@ fn loom_c_single_item_lifecycle() {
 }
 
 // ── Scenario D ────────────────────────────────────────────────────────
-// Drop the ring with unread items. The shared `Ring2::drop` must drain
+// Drop the ring with unread items. The shared `Ring::drop` must drain
 // each `T` exactly once. We use an Arc<AtomicUsize> drop counter as the
 // payload witness.
 
@@ -185,7 +185,7 @@ fn loom_d_drop_drains_unread() {
             }
         }
 
-        let (mut tx, rx) = Ring2::<Tracked, 2>::new();
+        let (mut tx, rx) = Ring::<Tracked, 2>::new();
         assert!(tx.try_send(Tracked { drops: drops.clone() }).is_ok());
         assert!(tx.try_send(Tracked { drops: drops.clone() }).is_ok());
         // Drop both handles with 2 items unread — the shared drain runs
@@ -203,7 +203,7 @@ fn loom_d_drop_drains_unread() {
 #[test]
 fn loom_e_cap1_ping_pong() {
     model(|| {
-        let (mut tx, mut rx) = Ring2::<u32, 1>::new();
+        let (mut tx, mut rx) = Ring::<u32, 1>::new();
         let p = thread::spawn(move || {
             send_all::<1>(&mut tx, &[1, 2, 3]);
         });
@@ -223,7 +223,7 @@ fn loom_e_cap1_ping_pong() {
 #[test]
 fn loom_f_producer_drop_delivers_inflight_then_closes() {
     model(|| {
-        let (mut tx, mut rx) = Ring2::<u32, 2>::new();
+        let (mut tx, mut rx) = Ring::<u32, 2>::new();
         let p = thread::spawn(move || {
             tx.try_send(99).unwrap();
             // tx drops here → closed set, after the send's head store.

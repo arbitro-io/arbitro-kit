@@ -3,11 +3,8 @@
 //! **FIFO transports.** Continuous flow of payloads from one producer to
 //! one consumer, with order preserved. Two flavors live here:
 //!
-//! - [`Ring<T, CAP>`] — **bounded** SPSC. Fixed-capacity ring; producer
-//!   blocks (or returns `Err`) when full. Use when memory must stay
-//!   constant and backpressure is desired.
-//! - [`Ring2<T, CAP, W>`] — **bounded** SPSC, split-handle variant.
-//!   [`Ring2::new`] returns a unique ([`Producer`], [`Consumer`]) pair —
+//! - [`Ring<T, CAP, W>`] — **bounded** SPSC, split-handle variant.
+//!   [`Ring::new`] returns a unique ([`Producer`], [`Consumer`]) pair —
 //!   the SPSC contract is compile-time enforced (handles are `Send` but
 //!   not `Clone`/`Sync`), with cached peer cursors and disconnect
 //!   detection on handle drop.
@@ -35,8 +32,6 @@ mod duplex;
 mod receipt;
 mod recv;
 mod ring;
-mod ring2;
-mod spsc2;
 mod segment;
 mod send;
 #[allow(clippy::module_inception)]
@@ -48,7 +43,5 @@ mod tests;
 pub use buffered::BufferedSender;
 pub use duplex::{Duplex, DuplexEnd};
 pub use receipt::Receipt;
-pub use ring::Ring;
-pub use ring2::{Consumer, Producer, Ring2, TryRecvError, TrySendError};
-pub use spsc2::{ConsumerSpsc2, ProducerSpsc2, Spsc2, TryRecvErrorSpsc2, TrySendErrorSpsc2};
+pub use ring::{Consumer, Producer, Ring, TryRecvError, TrySendError};
 pub use stream::Stream;

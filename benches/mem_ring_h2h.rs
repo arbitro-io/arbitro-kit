@@ -123,64 +123,17 @@ mod tokio_impl {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// arbitro-kit: Ring<Msg, CAP>, producer thread + consumer thread
+// arbitro-kit Ring (OS thread): split-handle SPSC ring
 // ══════════════════════════════════════════════════════════════════════
 
-mod kit_impl {
+mod ring_impl {
     use super::{Msg, CAP, N};
     use arbitro_kit::stream::Ring;
-    use std::sync::Arc;
     use std::thread;
     use std::time::Instant;
 
     pub fn run() -> f64 {
-        let ring: Arc<Ring<Msg, CAP>> = Arc::new(Ring::new());
-        let ring_c = ring.clone();
-
-        // Register this (main/producer) thread on the ring so the consumer
-        // can unpark it on backpressure, and hand the consumer's Thread
-        // handle to the ring via set_consumer inside the spawned thread.
-        ring.set_producer(thread::current());
-
-        // Consumer thread: blocking recv N times.
-        let consumer = thread::spawn(move || {
-            ring_c.set_consumer(thread::current());
-            for _ in 0..N {
-                let m = ring_c.recv();
-                std::hint::black_box(m);
-            }
-        });
-
-        // Give the consumer a moment to register itself so the first
-        // producer wake finds a real Thread handle (kit handles a missing
-        // handle either way, but this keeps steady-state clean).
-        thread::yield_now();
-
-        let t0 = Instant::now();
-        for i in 0..N {
-            ring.send(i as Msg);
-        }
-        consumer.join().unwrap();
-        let ns = t0.elapsed().as_nanos() as f64;
-        ns / N as f64
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// arbitro-kit Ring2 (OS thread): cursor-cached SPSC ring
-// ══════════════════════════════════════════════════════════════════════
-
-mod kit2_impl {
-    use super::{Msg, CAP, N};
-    use arbitro_kit::stream::Ring2;
-    use std::thread;
-    use std::time::Instant;
-
-    pub fn run() -> f64 {
-        // v2 split-handle API: unique Producer/Consumer pair, no Arc or
-        // set_producer/set_consumer at the call site — handles register
-        // their own thread on the first blocking call.
-        let (mut tx, mut rx) = Ring2::<Msg, CAP>::new();
+        let (mut tx, mut rx) = Ring::<Msg, CAP>::new();
 
         let consumer = thread::spawn(move || {
             for _ in 0..N {
@@ -198,6 +151,45 @@ mod kit2_impl {
         consumer.join().unwrap();
         let ns = t0.elapsed().as_nanos() as f64;
         ns / N as f64
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// arbitro-kit Ring (tokio): split-handle SPSC ring with NotifyWaiter
+// ══════════════════════════════════════════════════════════════════════
+
+mod ring_tokio_impl {
+    use super::{Msg, CAP, N};
+    use arbitro_kit::stream::Ring;
+    use arbitro_kit::waiter::NotifyWaiter;
+    use std::time::Instant;
+
+    pub fn run() -> f64 {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (mut tx, mut rx) = Ring::<Msg, CAP, NotifyWaiter>::new();
+
+            let t0 = Instant::now();
+            let producer = async {
+                for i in 0..N {
+                    tx.send_async(i as Msg).await.unwrap();
+                }
+            };
+            let consumer = async {
+                for _ in 0..N {
+                    let m = rx.recv_async().await.unwrap();
+                    std::hint::black_box(m);
+                }
+            };
+            tokio::join!(producer, consumer);
+            let ns = t0.elapsed().as_nanos() as f64;
+            ns / N as f64
+        })
     }
 }
 

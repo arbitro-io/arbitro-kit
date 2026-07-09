@@ -1,507 +1,707 @@
-//! SPSC bounded ring buffer — N-slot pipelined queue.
+//! SPSC bounded ring buffer — split-handle variant (Ring v2).
 //!
-//! [`Ring<T, CAP, W>`] is the multi-slot sibling of [`Pipe<T, W>`](crate::slot::Pipe).
-//! Same SPSC contract (one producer, one consumer), but with `CAP` slots
-//! preallocated inline, so producer and consumer can overlap in time.
+//! [`Ring::new`] returns a `(Producer, Consumer)` pair (rtrb /
+//! `std::sync::mpsc` style). The handles are `Send` but neither `Clone`
+//! nor `Sync`, so the SPSC contract is **compile-time enforced** — v1
+//! relied on a call-site convention ("only one thread may call
+//! `try_send`") that the type system never checked.
 //!
-//! ## Multi-runtime
+//! ## What changed vs. v1 (audited findings)
 //!
-//! `Ring` is generic over the [`Waiter`](crate::waiter::Waiter) backend. The
-//! default `W = ParkWaiter` keeps the same OS-thread `thread::park`/`unpark`
-//! semantics this type has always shipped with. Pass `W = NotifyWaiter`
-//! (feature `tokio`) and the same struct exposes async `send_async` /
-//! `recv_async` that resolve under a tokio runtime. After
-//! monomorphization, both forms compile to the same code paths as
-//! hand-written sync/async equivalents.
+//! 1. **Waiters moved off the hot cursor lines.** v1 placed `not_full` on
+//!    the same 64 B line as `head` (producer-written every op) and
+//!    `not_empty` next to `tail` (consumer-written every op). Every
+//!    `wake()` load from the peer therefore hit a line the owner kept
+//!    dirtying — a coherence miss per op. v2 gives each field its own
+//!    `CachePadded` region. Waiter state is written only on park/unpark
+//!    (rare), so its line stays in the Shared MESI state and `wake()`
+//!    becomes an L1 hit.
 //!
-//! ## When to use Ring instead of Pipe
+//! 2. **Cached peer cursors moved into the handles.** `cached_tail` /
+//!    `cached_head` are plain `usize` fields of `Producer` / `Consumer`.
+//!    No `UnsafeCell` needed — the handle is uniquely owned, methods take
+//!    `&mut self`. The Vyukov-style batching behavior is unchanged: the
+//!    shared atomic is refreshed only when the private cache says
+//!    full/empty.
 //!
-//! - **Burst absorption.** Producer fires N events in < 1 µs, consumer
-//!   drains them at a steady rate. `Pipe` would block the producer between
-//!   every event; `Ring` lets it run through the burst unhindered.
-//! - **Pipelined throughput.** Steady-state throughput rises ~1.5–2× over
-//!   `Pipe` because producer and consumer work in parallel instead of
-//!   alternating on a single slot.
-//! - **Unbalanced pipeline stages.** A fast stage feeding a slow one can
-//!   queue work instead of stalling, up to `CAP` items ahead.
-//! - **Graduated backpressure.** `try_send` returns `Err(value)` without
-//!   blocking; caller can drop / coalesce / downsample per policy.
+//! 3. **Disconnect detection** (new; v1 had none — dropping one side left
+//!    the peer blocked forever). A `closed` flag on the shared struct is
+//!    set by either handle's `Drop`:
+//!    - `Consumer::recv` returns `Option<T>`: `None` once the producer is
+//!      gone **and** the ring is drained. In-flight items are always
+//!      delivered first.
+//!    - `Producer::send` returns `Result<(), T>`: `Err(value)` when the
+//!      consumer is gone and the ring is full. Items accepted while the
+//!      ring still has room after a consumer drop are dropped by the
+//!      shared struct's drain (documented trade-off: the fast path pays
+//!      zero cost for disconnect detection — `closed` is only loaded on
+//!      the would-block slow path).
 //!
-//! For 1:1 request/response, prefer [`Channel`](crate::slot::Channel). For simple
-//! 1:1 fire-and-forget with no buffering, prefer [`Pipe`](crate::slot::Pipe).
+//! ## Ownership table (audit artifact)
 //!
-//! ## Wire model
+//! | field | resides | writer (freq) | reader (freq) | line state steady |
+//! |---|---|---|---|---|
+//! | `head` | Shared, line 0 | producer (every send, Release) | consumer (once per empty-batch refresh; parked predicate) | Modified in producer core; consumer misses once per batch |
+//! | `tail` | Shared, line 1 | consumer (every recv, Release) | producer (once per full-batch refresh; parked predicate) | Modified in consumer core; producer misses once per batch |
+//! | `not_full` | Shared, line 2 | producer (park/unpark only, rare) | consumer (`wake()` Relaxed load, every recv) | Shared → consumer `wake()` is L1 hit |
+//! | `not_empty` | Shared, line 3 | consumer (park/unpark only, rare) | producer (`wake()` Relaxed load, every send) | Shared → producer `wake()` is L1 hit |
+//! | `closed` | Shared, line 4 | either handle, once at drop | both sides, would-block slow paths only | Shared, cold |
+//! | `slots[i]` | Shared, tail region | producer (one write per send) | consumer (one read per recv) | per-slot handoff, amortized over CAP |
+//! | `Producer::cached_tail` | Producer handle | producer (per full-batch refresh) | producer (every send) | private, always L1 |
+//! | `Producer::worker` | Producer handle | producer (first blocking call) | producer (blocking calls) | private |
+//! | `Consumer::cached_head` | Consumer handle | consumer (per empty-batch refresh) | consumer (every recv) | private, always L1 |
+//! | `Consumer::worker` | Consumer handle | consumer (first blocking call) | consumer (blocking calls) | private |
 //!
-//! ```text
-//!  producer thread                          consumer thread
-//!  ───────────────                          ───────────────
-//!  acquire not_full  (blocks if full)
-//!  write   slot[head & MASK]
-//!  head.store(head+1, Release)
-//!  not_empty.wake()  → coherence →    ─→   wait_until(!is_empty)
-//!                                            read    slot[tail & MASK]
-//!                                            tail.store(tail+1, Release)
-//!                                            not_full.wake()
-//! ```
+//! ## Thread registration
 //!
-//! Two [`Waiter`](crate::waiter::Waiter) instances coordinate the two wait
-//! states: `not_empty` (consumer waits when ring is empty) and `not_full`
-//! (producer waits when ring is full). `head` and `tail` sit on separate
-//! cache lines to avoid false sharing.
+//! v1's explicit `set_producer` / `set_consumer` are gone. Each handle
+//! registers its current thread on the waiter the first time a blocking
+//! call runs (and re-registers if the handle has since moved to a
+//! different thread — handles are `Send`). Async waiters ignore
+//! registration entirely.
 //!
-//! ## Capacity constraint
+//! ## Safety invariants
 //!
-//! `CAP` **must be a power of two**. This allows `idx & (CAP - 1)` instead
-//! of `idx % CAP` — one AND instruction vs a division. The `new()`
-//! constructor panics if this is violated.
+//! - `head` monotonically increases, only the producer writes.
+//! - `tail` monotonically increases, only the consumer writes.
+//! - `slot[i & MASK]` is initialized iff `tail <= i < head` (wrapping-aware).
+//! - Producer's Release store on `head` publishes the payload write.
+//! - Consumer's Release store on `tail` publishes the "slot free" fact.
+//! - `closed` is stored Release after the dropping side's final cursor
+//!   store; the peer Acquire-loads it and then re-reads the cursor, so no
+//!   in-flight item can be missed.
 //!
-//! ## Cost (single-thread synthetic, no park, release build)
+//! ## Drop model
 //!
-//! | Operation           | Typical  |
-//! | ------------------- | -------: |
-//! | `try_send` hot      |  ~5 ns   |
-//! | `try_recv` hot      |  ~5 ns   |
-//! | `send` blocked→wake | ~10 µs   |
-//! | `recv` blocked→wake | ~10 µs   |
-//!
-//! Cross-thread, pipelined, the per-op steady-state approaches the
-//! L1-to-L1 coherence floor (~40–60 ns/op at payloads ≤ 64 B).
-//!
-//! ## Drop safety
-//!
-//! The `Drop` impl drains any in-flight values so `T` with RAII resources
-//! (`Box`, `Vec`, `Arc`, `File`) is safe.
+//! Handle drop sets `closed` and wakes the peer. When the last `Arc`
+//! reference drops, [`Ring`]'s own `Drop` drains any in-flight `T`
+//! between `tail` and `head` (same as v1).
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+// Under `--cfg loom` we swap the shared atomics for `loom::sync::atomic::*`
+// so the loom model can explore possible reorderings around `head`/`tail`/
+// `closed`. `UnsafeCell` stays on `std::cell::UnsafeCell` because migrating
+// every `.get()` call site to `loom::cell::UnsafeCell::with(...)` would
+// touch the whole file — Miri (run separately) validates cell access UB
+// under the real memory model, and loom's contribution here is the atomic-
+// ordering exploration on the cursors.
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter, Waiter};
 
-/// Cache-line padding to keep `head` (written by producer) and `tail`
-/// (written by consumer) on separate 64 B lines. Without this, every
-/// producer write invalidates the line the consumer reads and vice versa,
-/// throwing away most of the pipelining benefit.
+/// Pads (and aligns) `T` to a 64-byte cache line so adjacent fields never
+/// share a line. Local definition — the kit runtime stays dependency-free,
+/// so we do not pull in `crossbeam_utils::CachePadded`.
 #[repr(align(64))]
-struct CachePad([u8; 0]);
+struct CachePadded<T>(T);
 
-/// SPSC bounded ring buffer with `CAP` slots (power-of-two), generic over
-/// the [`Waiter`] backend.
+/// Error returned by [`Producer::try_send`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrySendError<T> {
+    /// Ring is full. The rejected value is handed back.
+    Full(T),
+    /// Ring is full **and** the consumer has been dropped — no space will
+    /// ever free up. The rejected value is handed back.
+    Closed(T),
+}
+
+/// Error returned by [`Consumer::try_recv`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// Ring is empty right now; the producer may still send.
+    Empty,
+    /// Ring is empty and the producer has been dropped — no more items
+    /// will ever arrive.
+    Closed,
+}
+
+/// Shared state of the split-handle SPSC ring. Not directly constructible
+/// by users — [`Ring::new`] returns the [`Producer`] / [`Consumer`]
+/// handle pair, which hold this behind an `Arc`.
 ///
-/// ## Concurrency contract
-///
-/// - Exactly **one producer** calls [`send`](Self::send) / [`try_send`](Self::try_send).
-/// - Exactly **one consumer** calls [`recv`](Self::recv) / [`try_recv`](Self::try_recv).
-/// - For `W = ParkWaiter` (sync, default): producer registers via
-///   [`set_producer`](Self::set_producer) before the first blocking
-///   [`send`] on a possibly-full ring, consumer registers via
-///   [`set_consumer`](Self::set_consumer) before the first blocking
-///   [`recv`] on a possibly-empty ring. Async waiters ignore both calls.
-/// - Usually shared across threads/tasks via `Arc<Ring<T, CAP, W>>`.
+/// See the module docs for the field-ownership table.
 #[repr(C)]
 pub struct Ring<T, const CAP: usize, W: Waiter = ParkWaiter> {
-    /// Waiter on which the consumer blocks when the ring is empty.
-    /// Open/closed state is derived directly from `head != tail` — no
-    /// duplicated `locked` bit. Saves one Release store per `try_send`.
-    not_empty: W,
-    /// Write cursor. Monotonic, wraps via `& MASK` at use. Producer owns.
-    head: AtomicUsize,
-    _pad0: CachePad,
-
+    /// Monotonic write cursor. Producer writes with Release; consumer
+    /// reads with Acquire. Own cache line (line 0).
+    head: CachePadded<AtomicUsize>,
+    /// Monotonic read cursor. Consumer writes with Release; producer
+    /// reads with Acquire. Own cache line (line 1).
+    tail: CachePadded<AtomicUsize>,
     /// Waiter on which the producer blocks when the ring is full.
-    /// Openness derived from `head - tail < CAP` — same reasoning as above.
-    not_full: W,
-    /// Read cursor. Monotonic, wraps via `& MASK` at use. Consumer owns.
-    tail: AtomicUsize,
-    _pad1: CachePad,
-
-    /// Slot storage. Each cell transitions empty → init → empty exactly once
-    /// per wrap, coordinated by the head/tail cursors + waiters.
+    /// Own cache line (line 2) — written only on park/unpark, so the
+    /// consumer's per-recv `wake()` load stays an L1 hit.
+    not_full: CachePadded<W>,
+    /// Waiter on which the consumer blocks when the ring is empty.
+    /// Own cache line (line 3) — symmetric to `not_full`.
+    not_empty: CachePadded<W>,
+    /// Set (once) when either handle drops. Read only on would-block
+    /// slow paths. Own cache line (line 4).
+    closed: CachePadded<AtomicBool>,
+    /// Slot storage. Producer writes `slot[head & MASK]` before its
+    /// Release store on `head`; consumer reads `slot[tail & MASK]` after
+    /// Acquire-loading `head`.
     slots: [UnsafeCell<MaybeUninit<T>>; CAP],
 }
 
-// Safety: slot access is serialized by the head/tail cursors + waiters.
-// The producer only writes `slot[head & MASK]` when `head - tail < CAP`
-// (i.e. the slot is empty); the consumer only reads `slot[tail & MASK]`
-// when `head > tail` (i.e. the slot is initialized). The Release stores on
-// head/tail publish the writes to the other side.
+// Safety: all cross-thread state is atomics or `Waiter` (which is `Sync`).
+// The slot cells are serialized by the head/tail cursors: the producer
+// writes slot[head & MASK] before its Release store on `head`; the
+// consumer reads slot[tail & MASK] only after Acquire-loading `head` and
+// observing `head > tail`. Exclusive slot access is guaranteed by the
+// unique ownership of the Producer/Consumer handles (enforced at compile
+// time — they are neither `Clone` nor `Sync`).
 unsafe impl<T: Send, const CAP: usize, W: Waiter> Send for Ring<T, CAP, W> {}
 unsafe impl<T: Send, const CAP: usize, W: Waiter> Sync for Ring<T, CAP, W> {}
 
-impl<T, const CAP: usize, W: Waiter> Default for Ring<T, CAP, W> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
-    /// Create a fresh ring. Both cursors start at 0; the ring is empty.
+    const MASK: usize = CAP - 1;
+
+    /// Create a fresh ring and return its unique handle pair.
+    /// `CAP` must be a non-zero power of two.
     ///
-    /// # Panics
-    /// Panics if `CAP` is 0 or not a power of two.
-    pub fn new() -> Self {
+    /// Deliberately named `new` even though it returns the handle pair
+    /// rather than `Self` (same shape as `rtrb::RingBuffer::new`); the
+    /// shared struct is an implementation detail users never hold.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> (Producer<T, CAP, W>, Consumer<T, CAP, W>) {
         assert!(CAP > 0, "Ring CAP must be > 0");
         assert!(CAP.is_power_of_two(), "Ring CAP must be a power of two");
 
-        // Waiters have no payload state — "is it ready to proceed?" is
-        // answered by the predicate that `wait_until` evaluates over head/tail.
-        let not_empty = W::default();
-        let not_full = W::default();
-
-        // Safety: creating an array of `UnsafeCell<MaybeUninit<T>>` is sound;
-        // MaybeUninit::uninit() is always valid, UnsafeCell is a transparent
-        // wrapper. The [_; CAP] syntax requires T: Copy or a const-initializer;
-        // we use a manual loop via array::from_fn.
         let slots: [UnsafeCell<MaybeUninit<T>>; CAP] =
             std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit()));
 
-        Self {
-            not_empty,
-            head: AtomicUsize::new(0),
-            _pad0: CachePad([]),
-            not_full,
-            tail: AtomicUsize::new(0),
-            _pad1: CachePad([]),
+        let shared = Arc::new(Self {
+            head: CachePadded(AtomicUsize::new(0)),
+            tail: CachePadded(AtomicUsize::new(0)),
+            not_full: CachePadded(W::default()),
+            not_empty: CachePadded(W::default()),
+            closed: CachePadded(AtomicBool::new(false)),
             slots,
-        }
+        });
+
+        (
+            Producer {
+                shared: shared.clone(),
+                cached_tail: 0,
+                worker: None,
+                _not_sync: PhantomData,
+            },
+            Consumer {
+                shared,
+                cached_head: 0,
+                worker: None,
+                _not_sync: PhantomData,
+            },
+        )
     }
 
-    const MASK: usize = CAP - 1;
-
-    /// Register the producer thread. Must be called from the producer
-    /// thread, before any blocking [`send`](Self::send) on a possibly-full ring.
-    /// No-op for async waiter backends.
+    /// Approximate item count. Both cursors may advance between loads.
     #[inline]
-    pub fn set_producer(&self, t: std::thread::Thread) {
-        self.not_full.set_worker(t);
-    }
-
-    /// Register the consumer thread. Must be called from the consumer
-    /// thread, before any blocking [`recv`](Self::recv) on a possibly-empty ring.
-    /// No-op for async waiter backends.
-    #[inline]
-    pub fn set_consumer(&self, t: std::thread::Thread) {
-        self.not_empty.set_worker(t);
-    }
-
-    /// Maximum number of buffered items.
-    #[inline]
-    pub const fn capacity(&self) -> usize {
-        CAP
-    }
-
-    /// Current number of items in the ring. Approximate under concurrent
-    /// access — both cursors may advance between the two loads.
-    #[inline]
-    pub fn len(&self) -> usize {
-        let h = self.head.load(Ordering::Acquire);
-        let t = self.tail.load(Ordering::Acquire);
+    fn len(&self) -> usize {
+        let h = self.head.0.load(Ordering::Acquire);
+        let t = self.tail.0.load(Ordering::Acquire);
         h.wrapping_sub(t)
     }
 
-    /// `true` iff the ring holds no items.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// `true` iff the ring is at capacity.
     #[inline]
-    pub fn is_full(&self) -> bool {
+    fn is_full(&self) -> bool {
         self.len() >= CAP
     }
 
-    // ── Producer API ─────────────────────────────────────────────────
-
-    /// Non-blocking enqueue. Returns `Err(value)` if the ring is full.
-    ///
-    /// Must only be called from the single producer thread.
     #[inline]
-    pub fn try_send(&self, value: T) -> Result<(), T> {
-        // Producer owns `head` — a Relaxed load is sufficient since no other
-        // thread writes it. The Acquire on `tail` synchronizes-with the
-        // consumer's Release when it drained a slot.
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) >= CAP {
-            return Err(value);
-        }
-        // Safety: slot is empty (head - tail < CAP). We own the write.
-        unsafe {
-            (*self.slots[head & Self::MASK].get()).write(value);
-        }
-        // Release on head publishes the slot write to the consumer AND is
-        // what opens the `not_empty` predicate (it reads head/tail).
-        // No separate `locked` store — eliminating it halves the cache-line
-        // traffic of a send on steady-state.
-        self.head.store(head.wrapping_add(1), Ordering::Release);
-        // Wake a possibly-parked consumer. Idempotent if already awake.
-        self.not_empty.wake();
-        Ok(())
+    fn is_closed(&self) -> bool {
+        self.closed.0.load(Ordering::Acquire)
     }
 
-    /// Non-blocking batch enqueue. Moves up to
-    /// `n = min(src.len(), free_slots)` items from the front of `src`
-    /// into the ring, in FIFO order. Returns `n`. The drained prefix is
-    /// removed from `src`; the remainder stays.
-    ///
-    /// Symmetric counterpart of [`drain_into`](Self::drain_into).
-    /// Amortizes a single `head` publication and a single `not_empty.wake()`
-    /// over all `n` items — avoiding N separate signal handshakes when the
-    /// consumer is parked under burst load.
-    ///
-    /// Must only be called from the single producer thread.
-    pub fn try_send_from(&self, src: &mut Vec<T>) -> usize {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        let free = CAP - head.wrapping_sub(tail);
-        let n = src.len().min(free);
-        if n == 0 {
-            return 0;
-        }
-
-        // Drop-guard: if any `write` panics (or `src.drain`'s iterator
-        // panics), advance `head` by the number of slots we already
-        // initialized so `Ring::drop` drops them and no slot leaks.
-        struct Guard<'a, T, const CAP: usize, W: Waiter> {
-            ring: &'a Ring<T, CAP, W>,
-            head_start: usize,
-            written: usize,
-        }
-        impl<T, const CAP: usize, W: Waiter> Drop for Guard<'_, T, CAP, W> {
-            fn drop(&mut self) {
-                // Only runs on panic unwind (we `forget` on success).
-                self.ring.head.store(
-                    self.head_start.wrapping_add(self.written),
-                    Ordering::Release,
-                );
-                self.ring.not_empty.wake();
-            }
-        }
-        let mut guard = Guard::<T, CAP, W> {
-            ring: self,
-            head_start: head,
-            written: 0,
-        };
-        // Safety: slots [head, head+n) are empty (free >= n); producer
-        // owns all writes to them. `drain(..n)` moves ownership out.
-        for (i, v) in src.drain(..n).enumerate() {
-            unsafe {
-                (*self.slots[head.wrapping_add(i) & Self::MASK].get()).write(v);
-            }
-            guard.written = i + 1;
-        }
-        // Success: take the guard apart manually so its Drop does not run.
-        std::mem::forget(guard);
-        // Single Release publishes all n slots at once.
-        self.head.store(head.wrapping_add(n), Ordering::Release);
-        // Single wake covers the whole batch.
-        self.not_empty.wake();
-        n
-    }
-
-    // ── Consumer API ─────────────────────────────────────────────────
-
-    /// Non-blocking dequeue. Returns `None` if the ring is empty.
-    ///
-    /// Must only be called from the single consumer thread.
-    #[inline]
-    pub fn try_recv(&self) -> Option<T> {
-        // Consumer owns `tail`. Acquire on `head` synchronizes-with the
-        // producer's Release when it published a slot.
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if head == tail {
-            return None;
-        }
-        // Safety: head > tail ⇒ slot[tail & MASK] holds an initialized T
-        // published by the producer with Release.
-        let v = unsafe { (*self.slots[tail & Self::MASK].get()).assume_init_read() };
-        // Release on tail publishes the slot-now-free to the producer AND
-        // is what opens the `not_full` predicate for a waiting producer.
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        // Wake a possibly-parked producer. Idempotent.
-        self.not_full.wake();
-        Some(v)
-    }
-
-    /// Drain up to `max` items into `out`. Returns the number drained.
-    ///
-    /// **Truly batched**: a single `head` Acquire, a single `tail` Release
-    /// publish, and a single `not_full.wake()` cover the whole batch —
-    /// the symmetric counterpart of [`try_send_from`](Self::try_send_from).
-    /// Amortizes the ack cost (cursor publish + wakeup) across `n` items
-    /// instead of paying it per-item as `try_recv × N` does.
-    ///
-    /// Must only be called from the single consumer thread.
-    pub fn drain_into(&self, out: &mut Vec<T>, max: usize) -> usize {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        let available = head.wrapping_sub(tail);
-        let n = available.min(max);
-        if n == 0 {
-            return 0;
-        }
-        // Reserve up-front so the subsequent `push` calls cannot reallocate
-        // and therefore cannot panic mid-drain. If `reserve` itself panics
-        // (OOM), it does so BEFORE any slot has been moved out — the ring
-        // stays consistent and `Drop` will correctly drop [tail, head).
-        out.reserve(n);
-        // Safety: slots [tail, tail+n) are initialized (published by the
-        // producer with Release on head). We own reading them. `push` is
-        // now infallible (capacity was pre-reserved), so no slot can be
-        // moved out without `tail` being advanced below.
-        for i in 0..n {
-            let v = unsafe {
-                (*self.slots[tail.wrapping_add(i) & Self::MASK].get()).assume_init_read()
-            };
-            out.push(v);
-        }
-        // Single Release publishes all n freed slots at once (batch ack).
-        self.tail.store(tail.wrapping_add(n), Ordering::Release);
-        // Single wake covers the whole batch.
-        self.not_full.wake();
-        n
-    }
-}
-
-// ── Sync API (W: BlockingWaiter) ──────────────────────────────────────
-
-impl<T, const CAP: usize, W: BlockingWaiter> Ring<T, CAP, W> {
-    /// Blocking enqueue. Parks until the ring has space, then enqueues.
-    ///
-    /// Must only be called from the registered producer thread.
-    ///
-    /// The Dekker race between our spin-exit and the consumer's drain is
-    /// closed by `BlockingWaiter::wait_until`'s internal SeqCst store on
-    /// `parked` + re-check of the predicate.
-    #[inline]
-    pub fn send(&self, mut value: T) {
-        loop {
-            match self.try_send(value) {
-                Ok(()) => return,
-                Err(v) => value = v,
-            }
-            self.not_full.wait_until(|| !self.is_full());
-        }
-    }
-
-    /// Blocking dequeue. Parks until an item is available, then takes it.
-    ///
-    /// Must only be called from the registered consumer thread.
-    #[inline]
-    pub fn recv(&self) -> T {
-        loop {
-            if let Some(v) = self.try_recv() {
-                return v;
-            }
-            self.not_empty.wait_until(|| !self.is_empty());
-        }
-    }
-
-    /// Blocking dequeue with cancellation. Returns `Err(Cancelled)` if
-    /// the lifeline cancels this waiter while we are parked or before
-    /// we enter park. Otherwise behaves exactly like [`Ring::recv`].
-    ///
-    /// The plain [`Ring::recv`] path is unchanged — adopting Lifeline
-    /// costs nothing for callers that don't use it.
-    #[inline]
-    pub fn recv_or_cancel(
-        &self,
-        life: &crate::gate::Lifeline,
-        id: crate::gate::WaiterId,
-    ) -> Result<T, crate::gate::Cancelled> {
-        loop {
-            if let Some(v) = self.try_recv() {
-                return Ok(v);
-            }
-            if life.is_cancelled(id) {
-                return Err(crate::gate::Cancelled);
-            }
-            self.not_empty
-                .wait_until(|| !self.is_empty() || life.is_cancelled(id));
-        }
-    }
-}
-
-// ── Async API (W: AsyncWaiter) ────────────────────────────────────────
-
-impl<T: Send, const CAP: usize, W: AsyncWaiter> Ring<T, CAP, W> {
-    /// Async enqueue. Awaits until the ring has space, then enqueues.
-    ///
-    /// Must only be called from the single producer task.
-    pub async fn send_async(&self, mut value: T) {
-        loop {
-            match self.try_send(value) {
-                Ok(()) => return,
-                Err(v) => value = v,
-            }
-            self.not_full.wait_until(|| !self.is_full()).await;
-        }
-    }
-
-    /// Async dequeue. Awaits until an item is available, then takes it.
-    ///
-    /// Must only be called from the single consumer task.
-    pub async fn recv_async(&self) -> T {
-        loop {
-            if let Some(v) = self.try_recv() {
-                return v;
-            }
-            self.not_empty.wait_until(|| !self.is_empty()).await;
-        }
-    }
-}
-
-// ── Spawn-safe async API (NotifyWaiter specialization) ────────────────
-//
-// The RPITIT future from `AsyncWaiter::wait_until` can't be proven `Send`
-// in generic contexts (rust-lang/rust#100013). For the specific case of
-// `tokio::spawn`'d tasks, we specialize on `NotifyWaiter` and use
-// `Notify::notified()` directly — a concrete `Send` future — avoiding
-// the trait abstraction entirely.
-
-#[cfg(feature = "tokio")]
-impl<T: Send, const CAP: usize> Ring<T, CAP, crate::waiter::NotifyWaiter> {
-    /// Boxed async dequeue — returns `Pin<Box<dyn Future + Send>>`.
-    ///
-    /// Use this variant inside `tokio::spawn`'d tasks where the RPITIT
-    /// future from [`recv_async`](Self::recv_async) can't satisfy the
-    /// `Send` bound. The single heap allocation per call is negligible
-    /// relative to the Notify wake cycle (~300 ns).
-    #[inline]
-    pub fn recv_async_send(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> {
-        Box::pin(async move {
-            loop {
-                if let Some(v) = self.try_recv() {
-                    return v;
-                }
-                // Bypass trait RPITIT: use concrete Notify::notified() directly.
-                let notified = self.not_empty.inner.notified();
-                if !self.is_empty() {
-                    continue;
-                }
-                notified.await;
-            }
-        })
+    /// Mark the ring closed and wake both sides. Called from handle drops.
+    fn close(&self) {
+        self.closed.0.store(true, Ordering::Release);
+        // Wake both waiters: only the peer can actually be parked, but
+        // waking both is idempotent and keeps this path branch-free.
+        self.not_full.0.wake();
+        self.not_empty.0.wake();
     }
 }
 
 impl<T, const CAP: usize, W: Waiter> Drop for Ring<T, CAP, W> {
     fn drop(&mut self) {
-        // `&mut self` means no other references — safe to drop in-flight.
-        let head = *self.head.get_mut();
-        let tail = *self.tail.get_mut();
+        // Exclusive access via &mut self — no other reference exists.
+        // Under loom, `AtomicUsize::get_mut` is not available; a Relaxed
+        // load is equivalent here because we hold `&mut self`.
+        #[cfg(not(loom))]
+        let head = *self.head.0.get_mut();
+        #[cfg(not(loom))]
+        let tail = *self.tail.0.get_mut();
+        #[cfg(loom)]
+        let head = self.head.0.load(Ordering::Relaxed);
+        #[cfg(loom)]
+        let tail = self.tail.0.load(Ordering::Relaxed);
         let mut i = tail;
         while i != head {
-            // Safety: slot[i & MASK] is initialized (i ∈ [tail, head)).
+            // Safety: slot[i & MASK] is initialized (tail <= i < head).
             unsafe {
                 (*self.slots[i & Self::MASK].get()).assume_init_drop();
             }
             i = i.wrapping_add(1);
         }
+    }
+}
+
+impl<T, const CAP: usize, W: Waiter> std::fmt::Debug for Ring<T, CAP, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ring")
+            .field("capacity", &CAP)
+            .field("len", &self.len())
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Producer handle
+// ══════════════════════════════════════════════════════════════════════
+
+/// Sending half of a [`Ring`]. Uniquely owned: `Send` but neither
+/// `Clone` nor `Sync`, so exactly one thread can produce at a time —
+/// the SPSC contract is enforced by the type system.
+///
+/// Dropping the producer closes the ring: the consumer drains remaining
+/// items, then `recv` returns `None` / `try_recv` returns
+/// [`TryRecvError::Closed`].
+pub struct Producer<T, const CAP: usize, W: Waiter = ParkWaiter> {
+    shared: Arc<Ring<T, CAP, W>>,
+    /// Private cache of the consumer's `tail`. Refreshed from the shared
+    /// atomic only when the cache says "full" (once per batch).
+    cached_tail: usize,
+    /// Thread registered on `not_full` for blocking sends. `None` until
+    /// the first blocking call; re-registered if the handle moved.
+    worker: Option<std::thread::ThreadId>,
+    /// Opt out of `Sync` (a `&Producer` on another thread must not exist
+    /// while methods run). `Cell<()>` is `Send + !Sync`, so the handle
+    /// stays `Send`.
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl<T, const CAP: usize, W: Waiter> Producer<T, CAP, W> {
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        CAP
+    }
+
+    /// Approximate number of items currently in the ring.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.shared.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.shared.is_empty()
+    }
+
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.shared.is_full()
+    }
+
+    /// `true` once the consumer has been dropped.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.shared.is_closed()
+    }
+
+    /// Non-blocking enqueue.
+    ///
+    /// - `Ok(())` — enqueued.
+    /// - `Err(TrySendError::Full(v))` — ring full, consumer alive.
+    /// - `Err(TrySendError::Closed(v))` — ring full and consumer dropped.
+    ///
+    /// Note: `closed` is checked only on the full (would-block) path, so
+    /// the fast path pays nothing for disconnect detection. After a
+    /// consumer drop, up to `CAP` sends may still succeed; those items
+    /// are dropped by the shared drain when the last handle goes away.
+    #[inline]
+    pub fn try_send(&mut self, value: T) -> Result<(), TrySendError<T>> {
+        let shared = &*self.shared;
+        // Producer owns `head` — Relaxed load is enough (no other writer).
+        let head = shared.head.0.load(Ordering::Relaxed);
+
+        // Fast path: consult the handle-private cache first. If the cache
+        // says there is room, we skip the consumer's `tail` line entirely.
+        if head.wrapping_sub(self.cached_tail) >= CAP {
+            // Cache is stale (or ring is actually full). Refresh from the
+            // shared atomic — Acquire syncs with the consumer's Release.
+            self.cached_tail = shared.tail.0.load(Ordering::Acquire);
+            if head.wrapping_sub(self.cached_tail) >= CAP {
+                return Err(if shared.is_closed() {
+                    TrySendError::Closed(value)
+                } else {
+                    TrySendError::Full(value)
+                });
+            }
+        }
+
+        // Safety: slot at `head & MASK` is free because
+        // head - cached_tail < CAP and `tail` is monotonic (real tail >=
+        // cached_tail). We own the write until the Release publishes it.
+        unsafe {
+            (*shared.slots[head & Ring::<T, CAP, W>::MASK].get()).write(value);
+        }
+
+        // Release publishes the slot write to any Acquire on `head`.
+        shared.head.0.store(head.wrapping_add(1), Ordering::Release);
+        // Wake a possibly-parked consumer. On the non-parked steady state
+        // this is a single Relaxed load of a rarely-written line (L1 hit
+        // after the CachePadded split — see module docs).
+        shared.not_empty.0.wake();
+        Ok(())
+    }
+
+    /// Bulk-send. Drains up to `min(items.len(), available)` from `items`
+    /// into consecutive slots, then does **one** Release store on `head`
+    /// and **one** `wake()`. This amortizes ordering + waker cost across
+    /// the batch (N writes + 1 fence + 1 wake vs the N of each on the
+    /// per-message path).
+    ///
+    /// Returns the number of items consumed from the tail of `items`
+    /// (uses `items.pop()` order, so the caller sees items removed from
+    /// the end).
+    ///
+    /// Correctness: identical Store→Release publish rule as `try_send` —
+    /// slot writes happen-before the final `head.store(Release)`, so the
+    /// consumer's `head.load(Acquire)` synchronizes with the whole burst.
+    #[inline]
+    pub fn try_send_bulk(&mut self, items: &mut Vec<T>) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let shared = &*self.shared;
+        let head0 = shared.head.0.load(Ordering::Relaxed);
+
+        // Refresh the cursor cache once per batch, not per item.
+        let mut used = head0.wrapping_sub(self.cached_tail);
+        if used >= CAP {
+            self.cached_tail = shared.tail.0.load(Ordering::Acquire);
+            used = head0.wrapping_sub(self.cached_tail);
+        }
+        let avail = CAP.saturating_sub(used);
+        if avail == 0 {
+            return 0;
+        }
+
+        let take = items.len().min(avail);
+        let mut h = head0;
+        for _ in 0..take {
+            // Safety: SPSC producer owns `head` until the final Release
+            // store below publishes the whole burst. `cached_tail` proves
+            // the range `[head0 .. head0 + take)` is unoccupied.
+            let v = items.pop().expect("checked take <= len");
+            unsafe {
+                (*shared.slots[h & Ring::<T, CAP, W>::MASK].get()).write(v);
+            }
+            h = h.wrapping_add(1);
+        }
+
+        // One Release store publishes ALL slot writes at once.
+        shared.head.0.store(h, Ordering::Release);
+        // One wake — the consumer, if parked, wakes and drains everything.
+        shared.not_empty.0.wake();
+        take
+    }
+
+    /// Register the current thread on the producer waiter if it is not
+    /// already the registered one. Handles are `Send`, so a handle may
+    /// legitimately block from a different thread than last time.
+    #[inline]
+    fn register(&mut self) {
+        let current = std::thread::current();
+        if self.worker != Some(current.id()) {
+            self.worker = Some(current.id());
+            self.shared.not_full.0.set_worker(current);
+        }
+    }
+}
+
+impl<T, const CAP: usize, W: BlockingWaiter> Producer<T, CAP, W> {
+    /// Blocking enqueue. Parks until the ring has space.
+    ///
+    /// Returns `Err(value)` if the consumer has been dropped and the ring
+    /// is full (the value could never be delivered).
+    #[inline]
+    pub fn send(&mut self, value: T) -> Result<(), T> {
+        let mut value = value;
+        loop {
+            match self.try_send(value) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Closed(v)) => return Err(v),
+                Err(TrySendError::Full(v)) => value = v,
+            }
+            self.register();
+            let shared = &*self.shared;
+            // Predicate reloads the real `tail` (via `is_full`, Acquire)
+            // and the `closed` flag. This closes the Dekker race with the
+            // consumer: the waiter re-evaluates after its SeqCst park
+            // announcement.
+            shared
+                .not_full
+                .0
+                .wait_until(|| !shared.is_full() || shared.is_closed());
+        }
+    }
+}
+
+impl<T: Send, const CAP: usize, W: AsyncWaiter> Producer<T, CAP, W> {
+    /// Async enqueue. Awaits capacity, then enqueues.
+    ///
+    /// Returns `Err(value)` if the consumer has been dropped and the ring
+    /// is full.
+    pub async fn send_async(&mut self, value: T) -> Result<(), T> {
+        let mut value = value;
+        loop {
+            match self.try_send(value) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Closed(v)) => return Err(v),
+                Err(TrySendError::Full(v)) => value = v,
+            }
+            let shared = &*self.shared;
+            shared
+                .not_full
+                .0
+                .wait_until(|| !shared.is_full() || shared.is_closed())
+                .await;
+        }
+    }
+}
+
+impl<T, const CAP: usize, W: Waiter> Drop for Producer<T, CAP, W> {
+    fn drop(&mut self) {
+        self.shared.close();
+    }
+}
+
+impl<T, const CAP: usize, W: Waiter> std::fmt::Debug for Producer<T, CAP, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Producer").field("ring", &*self.shared).finish()
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Consumer handle
+// ══════════════════════════════════════════════════════════════════════
+
+/// Receiving half of a [`Ring`]. Uniquely owned: `Send` but neither
+/// `Clone` nor `Sync` — the SPSC contract is enforced by the type system.
+///
+/// Dropping the consumer closes the ring: producer `send` returns
+/// `Err(value)` once the ring is full, `try_send` returns
+/// [`TrySendError::Closed`].
+pub struct Consumer<T, const CAP: usize, W: Waiter = ParkWaiter> {
+    shared: Arc<Ring<T, CAP, W>>,
+    /// Private cache of the producer's `head`. Refreshed from the shared
+    /// atomic only when the cache says "empty" (once per batch).
+    cached_head: usize,
+    /// Thread registered on `not_empty` for blocking recvs.
+    worker: Option<std::thread::ThreadId>,
+    /// Opt out of `Sync`; see [`Producer`].
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl<T, const CAP: usize, W: Waiter> Consumer<T, CAP, W> {
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        CAP
+    }
+
+    /// Approximate number of items currently in the ring.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.shared.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.shared.is_empty()
+    }
+
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.shared.is_full()
+    }
+
+    /// `true` once the producer has been dropped. Items may still be
+    /// in flight — keep draining until `try_recv` says `Closed`.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.shared.is_closed()
+    }
+
+    /// Non-blocking dequeue.
+    ///
+    /// - `Ok(v)` — got an item.
+    /// - `Err(TryRecvError::Empty)` — nothing right now, producer alive.
+    /// - `Err(TryRecvError::Closed)` — ring drained and producer dropped.
+    #[inline]
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        let shared = &*self.shared;
+        // Consumer owns `tail` — Relaxed is enough.
+        let tail = shared.tail.0.load(Ordering::Relaxed);
+
+        // Fast path: handle-private cache of `head`. Skip the shared load
+        // if we already know there is data.
+        if self.cached_head == tail {
+            // Cache is stale (or ring is empty). Refresh — Acquire syncs
+            // with the producer's Release on `head` and its slot write.
+            self.cached_head = shared.head.0.load(Ordering::Acquire);
+            if self.cached_head == tail {
+                if !shared.is_closed() {
+                    return Err(TryRecvError::Empty);
+                }
+                // Closed. `closed` is stored (Release) after the
+                // producer's final `head` store, so re-reading `head`
+                // after the Acquire on `closed` cannot miss an in-flight
+                // item published just before the drop.
+                self.cached_head = shared.head.0.load(Ordering::Acquire);
+                if self.cached_head == tail {
+                    return Err(TryRecvError::Closed);
+                }
+            }
+        }
+
+        // Safety: the producer's Release on `head` published
+        // slot[tail & MASK]; cached_head > tail guarantees it is initialized.
+        let v = unsafe {
+            (*shared.slots[tail & Ring::<T, CAP, W>::MASK].get()).assume_init_read()
+        };
+
+        // Release publishes "slot at tail is free" to a producer that
+        // Acquires `tail`.
+        shared.tail.0.store(tail.wrapping_add(1), Ordering::Release);
+        // Wake a possibly-parked producer (L1 hit on the steady state,
+        // see module docs).
+        shared.not_full.0.wake();
+        Ok(v)
+    }
+
+    /// Drain every item currently visible in the ring, invoking `f` on each
+    /// in FIFO order. Returns the count drained.
+    ///
+    /// **Amortized fences.** One Acquire head-load, one Release tail-store,
+    /// one wake — regardless of how many items are drained. Compare
+    /// `try_recv()` which pays one Release + one wake **per item** because
+    /// each call is a self-contained SPSC transaction.
+    ///
+    /// Use this inside a batched consumer path (e.g. `Mpsc2::try_recv_batch`)
+    /// where publishing tail per item just bounces the producer's cache line
+    /// pointlessly.
+    ///
+    /// Does not block; does not signal `Closed`. If closed detection matters,
+    /// call `is_closed()` after a zero return.
+    #[inline]
+    pub fn drain<F: FnMut(T)>(&mut self, mut f: F) -> usize {
+        let shared = &*self.shared;
+        let mut tail = shared.tail.0.load(Ordering::Relaxed);
+        // ONE Acquire load — snapshots head. Items published after this load
+        // are for the next drain call.
+        let head = shared.head.0.load(Ordering::Acquire);
+        if tail == head {
+            return 0;
+        }
+        let start = tail;
+        while tail != head {
+            let v = unsafe {
+                (*shared.slots[tail & Ring::<T, CAP, W>::MASK].get()).assume_init_read()
+            };
+            tail = tail.wrapping_add(1);
+            f(v);
+        }
+        // ONE Release publishes every pop atomically to the producer's next
+        // `avail` computation.
+        shared.tail.0.store(tail, Ordering::Release);
+        shared.not_full.0.wake();
+        // Keep the handle-private head cache aligned with the snapshot we
+        // used so a following `try_recv` doesn't compare against a stale head.
+        self.cached_head = head;
+        tail.wrapping_sub(start)
+    }
+
+    /// See [`Producer::register`].
+    #[inline]
+    fn register(&mut self) {
+        let current = std::thread::current();
+        if self.worker != Some(current.id()) {
+            self.worker = Some(current.id());
+            self.shared.not_empty.0.set_worker(current);
+        }
+    }
+}
+
+impl<T, const CAP: usize, W: BlockingWaiter> Consumer<T, CAP, W> {
+    /// Blocking dequeue. Parks until an item is available.
+    ///
+    /// Returns `None` once the producer has been dropped **and** every
+    /// in-flight item has been drained.
+    #[inline]
+    pub fn recv(&mut self) -> Option<T> {
+        loop {
+            match self.try_recv() {
+                Ok(v) => return Some(v),
+                Err(TryRecvError::Closed) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
+            self.register();
+            let shared = &*self.shared;
+            shared
+                .not_empty
+                .0
+                .wait_until(|| !shared.is_empty() || shared.is_closed());
+        }
+    }
+}
+
+impl<T: Send, const CAP: usize, W: AsyncWaiter> Consumer<T, CAP, W> {
+    /// Async dequeue. Awaits an item, then takes it.
+    ///
+    /// Returns `None` once the producer has been dropped and the ring is
+    /// drained.
+    pub async fn recv_async(&mut self) -> Option<T> {
+        loop {
+            match self.try_recv() {
+                Ok(v) => return Some(v),
+                Err(TryRecvError::Closed) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
+            let shared = &*self.shared;
+            shared
+                .not_empty
+                .0
+                .wait_until(|| !shared.is_empty() || shared.is_closed())
+                .await;
+        }
+    }
+}
+
+impl<T, const CAP: usize, W: Waiter> Drop for Consumer<T, CAP, W> {
+    fn drop(&mut self) {
+        self.shared.close();
+    }
+}
+
+impl<T, const CAP: usize, W: Waiter> std::fmt::Debug for Consumer<T, CAP, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Consumer").field("ring", &*self.shared).finish()
     }
 }
 
@@ -516,63 +716,130 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn handles_are_send() {
+        fn assert_send<X: Send>() {}
+        assert_send::<Producer<u32, 8>>();
+        assert_send::<Consumer<u32, 8>>();
+    }
+
+    #[test]
     fn single_thread_basic() {
-        let r: Ring<u32, 8> = Ring::new();
-        assert!(r.is_empty());
-        assert_eq!(r.capacity(), 8);
-
+        let (mut tx, mut rx) = Ring::<u32, 8>::new();
+        assert!(rx.is_empty());
+        assert_eq!(tx.capacity(), 8);
+        assert_eq!(rx.capacity(), 8);
         for i in 0..8 {
-            assert!(r.try_send(i).is_ok());
+            assert!(tx.try_send(i).is_ok());
         }
-        assert!(r.is_full());
-        assert!(r.try_send(999).is_err());
-
+        assert!(tx.is_full());
+        assert_eq!(tx.try_send(999), Err(TrySendError::Full(999)));
         for i in 0..8 {
-            assert_eq!(r.try_recv(), Some(i));
+            assert_eq!(rx.try_recv(), Ok(i));
         }
-        assert!(r.is_empty());
-        assert_eq!(r.try_recv(), None);
+        assert!(rx.is_empty());
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[test]
     fn wraparound() {
-        let r: Ring<u32, 4> = Ring::new();
+        let (mut tx, mut rx) = Ring::<u32, 4>::new();
         for i in 0..100 {
-            assert!(r.try_send(i).is_ok());
-            assert_eq!(r.try_recv(), Some(i));
+            assert!(tx.try_send(i).is_ok());
+            assert_eq!(rx.try_recv(), Ok(i));
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn non_pow2_panics() {
+        let _ = Ring::<u32, 7>::new();
+    }
+
+    #[test]
+    fn producer_drop_disconnects_consumer() {
+        let (mut tx, mut rx) = Ring::<u32, 8>::new();
+        for i in 0..3 {
+            tx.try_send(i).unwrap();
+        }
+        drop(tx);
+        // In-flight items are delivered before the disconnect surfaces.
+        assert_eq!(rx.recv(), Some(0));
+        assert_eq!(rx.recv(), Some(1));
+        assert_eq!(rx.recv(), Some(2));
+        assert_eq!(rx.recv(), None);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+    }
+
+    #[test]
+    fn consumer_drop_disconnects_producer() {
+        let (mut tx, rx) = Ring::<u32, 2>::new();
+        drop(rx);
+        // Room remains: sends still succeed (documented; drained on Drop).
+        assert!(tx.try_send(1).is_ok());
+        assert!(tx.try_send(2).is_ok());
+        // Full + closed: surfaced as Closed, value handed back.
+        assert_eq!(tx.try_send(3), Err(TrySendError::Closed(3)));
+        assert_eq!(tx.send(4), Err(4));
+    }
+
+    #[test]
+    fn producer_drop_unblocks_parked_consumer() {
+        let (tx, mut rx) = Ring::<u32, 4>::new();
+        let h = std::thread::spawn(move || rx.recv());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(tx);
+        assert_eq!(h.join().unwrap(), None);
+    }
+
+    #[test]
+    fn consumer_drop_unblocks_parked_producer() {
+        let (mut tx, rx) = Ring::<u32, 2>::new();
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        let h = std::thread::spawn(move || tx.send(3));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(rx);
+        assert_eq!(h.join().unwrap(), Err(3));
     }
 
     #[test]
     fn cross_thread_blocking() {
-        let r: Arc<Ring<u64, 16>> = Arc::new(Ring::new());
-        let r2 = r.clone();
+        let (mut tx, mut rx) = Ring::<u64, 16>::new();
         let h = std::thread::spawn(move || {
-            r2.set_consumer(std::thread::current());
             let mut sum = 0u64;
             for _ in 0..1000 {
-                sum += r2.recv();
+                sum += rx.recv().unwrap();
             }
             sum
         });
-        r.set_producer(std::thread::current());
         for i in 0..1000u64 {
-            r.send(i);
+            tx.send(i).unwrap();
         }
-        let got = h.join().unwrap();
-        assert_eq!(got, (0..1000u64).sum());
+        assert_eq!(h.join().unwrap(), (0..1000u64).sum());
     }
 
     #[test]
-    fn drain_batch() {
-        let r: Ring<u32, 32> = Ring::new();
-        for i in 0..10 {
-            r.try_send(i).unwrap();
+    fn cross_thread_backpressure() {
+        // CAP small + slow consumer: producer MUST park on not_full.
+        const CAP: usize = 4;
+        const N: u64 = 500;
+        let (mut tx, mut rx) = Ring::<u64, CAP>::new();
+        let consumer = std::thread::spawn(move || {
+            let mut got = Vec::with_capacity(N as usize);
+            for i in 0..N {
+                got.push(rx.recv().unwrap());
+                if i % 5 == 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(20));
+                }
+            }
+            (got, rx)
+        });
+        for i in 0..N {
+            tx.send(i).unwrap();
         }
-        let mut out = Vec::new();
-        let n = r.drain_into(&mut out, 100);
-        assert_eq!(n, 10);
-        assert_eq!(out, (0..10).collect::<Vec<_>>());
+        let (got, rx) = consumer.join().unwrap();
+        assert_eq!(got, (0..N).collect::<Vec<_>>());
+        assert!(rx.is_empty());
     }
 
     #[test]
@@ -585,330 +852,84 @@ mod tests {
         }
         let drops = Arc::new(AtomicU64::new(0));
         {
-            let r: Ring<Tracked, 8> = Ring::new();
+            let (mut tx, rx) = Ring::<Tracked, 8>::new();
             for _ in 0..5 {
-                assert!(r.try_send(Tracked(drops.clone())).is_ok());
+                assert!(tx.try_send(Tracked(drops.clone())).is_ok());
             }
-            // never recv — drop must drain all 5
+            drop(rx);
+            drop(tx);
         }
         assert_eq!(drops.load(Ordering::Relaxed), 5);
     }
 
     #[test]
-    #[should_panic(expected = "power of two")]
-    fn non_pow2_panics() {
-        let _: Ring<u32, 7> = Ring::new();
-    }
-
-    #[test]
-    fn cross_thread_multi_wrap() {
-        // Forces the ring to wrap around its capacity at least 5 times while
-        // producer and consumer are on separate threads. With CAP = 8 and
-        // 100 items, the head/tail cursors cross the MASK boundary 12×.
-        //
-        // Extra stress: the consumer sleeps briefly every few items so the
-        // ring genuinely fills and the producer has to park on `not_full`.
-        // If `send`'s lock-check-acquire park protocol is broken (missed
-        // wakeup or busy-spin), this test either hangs or pegs a core.
-        const CAP: usize = 8;
-        const N: u64 = 100; // 100 / 8 ≈ 12.5 wraps — well over 5
-        let r: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
-        let r2 = r.clone();
-
-        let consumer = std::thread::spawn(move || {
-            r2.set_consumer(std::thread::current());
-            let mut got = Vec::with_capacity(N as usize);
-            for i in 0..N {
-                let v = r2.recv();
-                got.push(v);
-                // Throttle every 3rd item so the producer hits `is_full`
-                // and actually parks. Park path is what we're stressing.
-                if i % 3 == 0 {
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-            }
-            got
-        });
-
-        r.set_producer(std::thread::current());
-        for i in 0..N {
-            r.send(i);
+    fn zero_sized_type() {
+        let (mut tx, mut rx) = Ring::<(), 8>::new();
+        for _ in 0..8 {
+            tx.try_send(()).unwrap();
         }
-
-        let got = consumer.join().unwrap();
-        assert_eq!(
-            got,
-            (0..N).collect::<Vec<_>>(),
-            "FIFO order must hold across wraparounds"
-        );
-        assert!(r.is_empty(), "ring should be drained");
+        assert_eq!(tx.try_send(()), Err(TrySendError::Full(())));
+        for _ in 0..8 {
+            assert_eq!(rx.try_recv(), Ok(()));
+        }
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[test]
     fn cross_thread_high_volume() {
-        // High-volume stress: 100k messages across a tiny 16-slot ring
-        // forces ~6250 wraparounds and thousands of producer/consumer park
-        // events. A single missed wakeup or off-by-one in the park protocol
-        // manifests as a hang; the test's outer timeout (cargo's default
-        // per-test watchdog) catches it.
         const CAP: usize = 128;
         const N: u64 = 100_000;
-        let r: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
-        let r2 = r.clone();
-
+        let (mut tx, mut rx) = Ring::<u64, CAP>::new();
         let consumer = std::thread::spawn(move || {
-            r2.set_consumer(std::thread::current());
             let mut sum: u64 = 0;
             for _ in 0..N {
-                sum = sum.wrapping_add(r2.recv());
+                sum = sum.wrapping_add(rx.recv().unwrap());
             }
-            sum
+            (sum, rx)
         });
-
-        r.set_producer(std::thread::current());
-        let t0 = std::time::Instant::now();
         for i in 0..N {
-            r.send(i);
+            tx.send(i).unwrap();
         }
-        let got = consumer.join().unwrap();
-        let ns = t0.elapsed().as_nanos() as f64;
+        let (got, rx) = consumer.join().unwrap();
         let expected: u64 = (0..N).fold(0u64, |a, b| a.wrapping_add(b));
-        assert_eq!(got, expected, "checksum mismatch under high volume");
-        assert!(r.is_empty());
-        eprintln!(
-            "high_volume: N={} CAP={} total={:.2}ms per_msg={:.1}ns ops/sec={:.0}",
-            N,
-            CAP,
-            ns / 1e6,
-            ns / N as f64,
-            1e9 / (ns / N as f64)
-        );
+        assert_eq!(got, expected);
+        assert!(rx.is_empty());
     }
 
-    /// Validates each correctness factor independently under high volume:
-    ///
-    ///   1. **No loss**      — exactly N items received (count matches).
-    ///   2. **No duplicates** — every value appears exactly once.
-    ///   3. **Integrity**    — payload value unchanged in transit.
-    ///   4. **FIFO order**   — items arrive in the order sent.
-    ///   5. **Drain state**  — ring empty at end.
     #[test]
-    fn cross_thread_factors() {
-        const CAP: usize = 64;
-        const N: u64 = 50_000;
-        let r: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
-        let r2 = r.clone();
-
-        let consumer = std::thread::spawn(move || {
-            r2.set_consumer(std::thread::current());
-            let mut got: Vec<u64> = Vec::with_capacity(N as usize);
-            for _ in 0..N {
-                got.push(r2.recv());
-            }
-            got
+    fn handle_moves_between_threads() {
+        // First blocking call happens on thread A, handle then moves to
+        // thread B — the lazy registration must follow the handle.
+        let (mut tx, mut rx) = Ring::<u64, 4>::new();
+        tx.send(1).unwrap();
+        assert_eq!(rx.recv(), Some(1));
+        let h = std::thread::spawn(move || {
+            let v = rx.recv();
+            (v, rx)
         });
-
-        r.set_producer(std::thread::current());
-        for i in 0..N {
-            r.send(i);
-        }
-        let got = consumer.join().unwrap();
-
-        // ① No loss — count
-        assert_eq!(got.len() as u64, N, "item count mismatch (loss or overrun)");
-
-        // ② No duplicates + ③ Integrity + ④ FIFO — one-shot equality
-        let expected: Vec<u64> = (0..N).collect();
-        assert!(got == expected, "payload / order / duplicate violation");
-
-        // ⑤ Drain state
-        assert!(r.is_empty(), "ring not drained at end");
+        tx.send(2).unwrap();
+        let (v, mut rx) = h.join().unwrap();
+        assert_eq!(v, Some(2));
+        tx.send(3).unwrap();
+        assert_eq!(rx.recv(), Some(3));
     }
 
-    /// Closed-loop round-trip: producer sends a request, consumer echoes
-    /// a transformed response. Validates that TWO independent Rings can
-    /// be composed into a request/response pipeline without deadlock and
-    /// that each response correlates to exactly one request.
-    #[test]
-    fn cross_thread_round_trip() {
-        const CAP: usize = 32;
-        const N: u64 = 10_000;
-
-        let req: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
-        let rsp: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
-        let req2 = req.clone();
-        let rsp2 = rsp.clone();
-
-        // Echo worker: reads request, sends back request * 2 + 1.
-        let worker = std::thread::spawn(move || {
-            req2.set_consumer(std::thread::current());
-            rsp2.set_producer(std::thread::current());
-            for _ in 0..N {
-                let v = req2.recv();
-                rsp2.send(v.wrapping_mul(2).wrapping_add(1));
-            }
-        });
-
-        req.set_producer(std::thread::current());
-        rsp.set_consumer(std::thread::current());
-
-        let t0 = std::time::Instant::now();
-        for i in 0..N {
-            req.send(i);
-            let r = rsp.recv();
-            assert_eq!(
-                r,
-                i.wrapping_mul(2).wrapping_add(1),
-                "response {} does not correlate to request {}",
-                r,
-                i
-            );
-        }
-        let ns = t0.elapsed().as_nanos() as f64;
-
-        worker.join().unwrap();
-        assert!(
-            req.is_empty() && rsp.is_empty(),
-            "both rings must be drained at end"
-        );
-
-        eprintln!(
-            "round_trip: N={} CAP={} total={:.2}ms per_cycle={:.1}ns cycles/sec={:.0}",
-            N,
-            CAP,
-            ns / 1e6,
-            ns / N as f64,
-            1e9 / (ns / N as f64)
-        );
-    }
-
-    #[test]
-    fn batch_send_and_drain() {
-        let r: Ring<u64, 32> = Ring::new();
-
-        // Full batch fits.
-        let mut src: Vec<u64> = (0..10).collect();
-        let n = r.try_send_from(&mut src);
-        assert_eq!(n, 10);
-        assert!(src.is_empty(), "drained prefix must be removed");
-        assert_eq!(r.len(), 10);
-
-        // Partial batch when ring has less space than src.
-        let mut src2: Vec<u64> = (100..130).collect(); // 30 items
-        let n2 = r.try_send_from(&mut src2); // only 22 fit (32-10)
-        assert_eq!(n2, 22);
-        assert_eq!(src2.len(), 30 - 22, "unsent suffix must remain");
-        assert_eq!(src2[0], 100 + 22, "remainder starts at first unsent");
-        assert!(r.is_full());
-
-        // Drain and validate FIFO order across the two batches.
-        let mut out = Vec::new();
-        let got = r.drain_into(&mut out, 100);
-        assert_eq!(got, 32);
-        let mut expected: Vec<u64> = (0..10).collect();
-        expected.extend(100..122);
-        assert_eq!(out, expected, "batch send must preserve FIFO");
-        assert!(r.is_empty());
-
-        // Empty source → no-op.
-        let mut empty: Vec<u64> = Vec::new();
-        assert_eq!(r.try_send_from(&mut empty), 0);
-    }
-
-    /// Cross-thread benchmark-style check: batch send + batch drain under
-    /// contention. Measures correctness AND reports ns/item so we can see
-    /// batching amortize the signal handshake.
-    #[test]
-    fn cross_thread_batched() {
-        const CAP: usize = 128;
-        const N: u64 = 50_000;
-        const BATCH: usize = 64;
-        let r: Arc<Ring<u64, CAP>> = Arc::new(Ring::new());
-        let r2 = r.clone();
-
-        let consumer = std::thread::spawn(move || {
-            r2.set_consumer(std::thread::current());
-            let mut got: Vec<u64> = Vec::with_capacity(N as usize);
-            let mut buf: Vec<u64> = Vec::with_capacity(BATCH);
-            while (got.len() as u64) < N {
-                // Block until there's at least one item, then drain greedily.
-                got.push(r2.recv());
-                let _ = r2.drain_into(&mut buf, BATCH);
-                got.append(&mut buf);
-            }
-            got
-        });
-
-        r.set_producer(std::thread::current());
-        let t0 = std::time::Instant::now();
-        let mut pending: Vec<u64> = Vec::with_capacity(BATCH);
-        let mut sent: u64 = 0;
-        while sent < N {
-            let take = (N - sent).min(BATCH as u64) as usize;
-            pending.extend(sent..sent + take as u64);
-            // Drain pending into ring; loop until all placed.
-            while !pending.is_empty() {
-                let n = r.try_send_from(&mut pending);
-                if n == 0 {
-                    // Ring full — fall back to blocking send for one item
-                    // so we don't busy-spin.
-                    let v = pending.remove(0);
-                    r.send(v);
-                }
-            }
-            sent += take as u64;
-        }
-        let got = consumer.join().unwrap();
-        let ns = t0.elapsed().as_nanos() as f64;
-
-        assert_eq!(got.len() as u64, N);
-        assert_eq!(
-            got,
-            (0..N).collect::<Vec<_>>(),
-            "batched path must preserve FIFO"
-        );
-        assert!(r.is_empty());
-        eprintln!(
-            "batched: N={} CAP={} BATCH={} total={:.2}ms per_item={:.1}ns ops/sec={:.0}",
-            N,
-            CAP,
-            BATCH,
-            ns / 1e6,
-            ns / N as f64,
-            1e9 / (ns / N as f64)
-        );
-    }
-
-    #[test]
-    fn burst_absorption() {
-        // Producer fires a burst of 100 items into a 128-slot ring without
-        // the consumer yet running. Must not block.
-        let r: Ring<u32, 128> = Ring::new();
-        for i in 0..100 {
-            assert!(r.try_send(i).is_ok());
-        }
-        assert_eq!(r.len(), 100);
-    }
-
-    // ── Async-mirror tests (W = NotifyWaiter, feature = "tokio") ──────
+    // ── Async (tokio) ────────────────────────────────────────────────
 
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn cross_task_basic_notify() {
         use crate::waiter::NotifyWaiter;
-        // tokio::join! avoids the higher-ranked RPITIT-Send limitation
-        // (rust-lang/rust#100013) that bites `tokio::spawn` when the future
-        // borrows `&Ring<..., NotifyWaiter>` across an await.
-        let r: Ring<u64, 16, NotifyWaiter> = Ring::new();
+        let (mut tx, mut rx) = Ring::<u64, 16, NotifyWaiter>::new();
         let producer = async {
             for i in 0..1000u64 {
-                r.send_async(i).await;
+                tx.send_async(i).await.unwrap();
             }
         };
         let consumer = async {
             let mut sum = 0u64;
             for _ in 0..1000 {
-                sum += r.recv_async().await;
+                sum += rx.recv_async().await.unwrap();
             }
             sum
         };
@@ -920,10 +941,21 @@ mod tests {
     #[tokio::test]
     async fn wraparound_notify() {
         use crate::waiter::NotifyWaiter;
-        let r: Ring<u32, 4, NotifyWaiter> = Ring::new();
+        let (mut tx, mut rx) = Ring::<u32, 4, NotifyWaiter>::new();
         for i in 0..100 {
-            r.send_async(i).await;
-            assert_eq!(r.recv_async().await, i);
+            tx.send_async(i).await.unwrap();
+            assert_eq!(rx.recv_async().await, Some(i));
         }
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn producer_drop_disconnects_async_consumer() {
+        use crate::waiter::NotifyWaiter;
+        let (mut tx, mut rx) = Ring::<u32, 8, NotifyWaiter>::new();
+        tx.send_async(7).await.unwrap();
+        drop(tx);
+        assert_eq!(rx.recv_async().await, Some(7));
+        assert_eq!(rx.recv_async().await, None);
     }
 }

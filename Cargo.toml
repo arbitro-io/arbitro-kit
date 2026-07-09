@@ -124,3 +124,7 @@ codegen-units = 1
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[[bench]]
+name = "mpsc_vs_mpsc2"
+harness = false
