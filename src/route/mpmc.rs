@@ -156,8 +156,23 @@ struct MpmcInner<T: Send, const RING_CAP: usize, W: Waiter> {
     /// after advancing `tail` on one of its rings.
     producer_waiters: Box<[W]>,
     shutdown: AtomicBool,
+    live_producers: AtomicUsize,
+    live_consumers: AtomicUsize,
     m: usize,
     n: usize,
+}
+
+impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcInner<T, RING_CAP, W> {
+    #[inline]
+    fn is_terminal_for_consumer(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+            || self.live_producers.load(Ordering::Acquire) == 0
+    }
+    #[inline]
+    fn is_terminal_for_producer(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+            || self.live_consumers.load(Ordering::Acquire) == 0
+    }
 }
 
 unsafe impl<T: Send, const RING_CAP: usize, W: Waiter> Sync for MpmcInner<T, RING_CAP, W> {}
@@ -186,6 +201,8 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcInner<T, RING_CAP, W> {
             shards: shards_vec.into_boxed_slice(),
             producer_waiters: producer_waiters.into_boxed_slice(),
             shutdown: AtomicBool::new(false),
+            live_producers: AtomicUsize::new(m),
+            live_consumers: AtomicUsize::new(n),
             m,
             n,
         }
@@ -366,6 +383,9 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcProducer<T, RING_CAP, W> {
     /// Non-blocking send.
     #[inline]
     pub fn try_send(&self, value: T) -> Result<(), T> {
+        if self.inner.is_terminal_for_producer() {
+            return Err(value);
+        }
         let n = self.inner.n;
         let start = (self.cursor.get() as usize) % n;
         for k in 0..n {
@@ -429,11 +449,16 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcProducer<T, RING_CAP
     #[inline]
     pub fn send(&self, mut value: T) {
         loop {
+            if self.inner.is_terminal_for_producer() {
+                return;
+            }
             match self.try_send(value) {
                 Ok(()) => return,
                 Err(v) => value = v,
             }
-            self.inner.producer_waiters[self.my_idx].wait_until(|| self.has_idle_shard());
+            let inner = &*self.inner;
+            self.inner.producer_waiters[self.my_idx]
+                .wait_until(|| self.has_idle_shard() || inner.is_terminal_for_producer());
         }
     }
 }
@@ -442,17 +467,20 @@ impl<T: Send, const RING_CAP: usize, W: AsyncWaiter> MpmcProducer<T, RING_CAP, W
     /// Async send. Awaits when every ring for this producer is full.
     pub async fn send_async(&self, mut value: T) {
         loop {
+            if self.inner.is_terminal_for_producer() {
+                return;
+            }
             match self.try_send(value) {
                 Ok(()) => return,
                 Err(v) => value = v,
             }
-            // Borrow Sync references explicitly — `MpmcProducer` is `!Sync`
-            // (it owns a `Cell<u32>` cursor), so the closure cannot borrow
-            // `self` directly and stay `Send`.
             let inner = &*self.inner;
             let my_idx = self.my_idx;
             inner.producer_waiters[my_idx]
                 .wait_until(|| {
+                    if inner.is_terminal_for_producer() {
+                        return true;
+                    }
                     for shard in inner.shards.iter() {
                         let ring = &shard.rings[my_idx];
                         let h = ring.head.load(Ordering::Relaxed);
@@ -464,6 +492,17 @@ impl<T: Send, const RING_CAP: usize, W: AsyncWaiter> MpmcProducer<T, RING_CAP, W
                     false
                 })
                 .await;
+        }
+    }
+}
+
+impl<T: Send, const RING_CAP: usize, W: Waiter> Drop for MpmcProducer<T, RING_CAP, W> {
+    fn drop(&mut self) {
+        let prev = self.inner.live_producers.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            for shard in self.inner.shards.iter() {
+                shard.consumer_waiter.wake();
+            }
         }
     }
 }
@@ -575,10 +614,18 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
         self.drain_all(&mut f)
     }
 
-    /// Drain every ring on this shard at least once. Loops until a full
-    /// pass finds zero new items.
     #[inline]
     fn drain_all<F: FnMut(T)>(&self, f: &mut F) -> usize {
+        struct TailGuard<'a> {
+            tail: &'a AtomicUsize,
+            t: usize,
+        }
+        impl<'a> Drop for TailGuard<'a> {
+            fn drop(&mut self) {
+                self.tail.store(self.t, Ordering::Release);
+            }
+        }
+
         let shard = &self.inner.shards[self.shard_idx];
         let m = self.inner.m;
         let mut count: usize = 0;
@@ -586,21 +633,22 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
             let mut progress = false;
             for p in 0..m {
                 let ring = &shard.rings[p];
-                let mut t = ring.tail.load(Ordering::Relaxed);
+                let t0 = ring.tail.load(Ordering::Relaxed);
                 let h = ring.head.load(Ordering::Acquire);
-                if t == h {
+                if t0 == h {
                     continue;
                 }
-                while t != h {
+                let mut guard = TailGuard { tail: &ring.tail, t: t0 };
+                while guard.t != h {
                     let v = unsafe {
-                        (*ring.slots[t & PRing::<T, RING_CAP>::MASK].get()).assume_init_read()
+                        (*ring.slots[guard.t & PRing::<T, RING_CAP>::MASK].get()).assume_init_read()
                     };
-                    t = t.wrapping_add(1);
+                    guard.t = guard.t.wrapping_add(1);
                     f(v);
                     count += 1;
                     progress = true;
                 }
-                ring.tail.store(t, Ordering::Release);
+                drop(guard);
                 self.inner.producer_waiters[p].wake();
             }
             if !progress {
@@ -618,12 +666,12 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcConsumer<T, RING_CAP
             if let Some(v) = self.try_recv() {
                 return Ok(v);
             }
-            if self.inner.shutdown.load(Ordering::Acquire) {
+            if self.inner.is_terminal_for_consumer() {
                 return Err(Shutdown);
             }
             let shard = &self.inner.shards[self.shard_idx];
             shard.consumer_waiter.wait_until(|| {
-                shard.any_ring_has_work() || self.inner.shutdown.load(Ordering::Acquire)
+                shard.any_ring_has_work() || self.inner.is_terminal_for_consumer()
             });
         }
     }
@@ -636,12 +684,12 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcConsumer<T, RING_CAP
             if count > 0 {
                 return Ok(count);
             }
-            if self.inner.shutdown.load(Ordering::Acquire) {
+            if self.inner.is_terminal_for_consumer() {
                 return Err(Shutdown);
             }
             let shard = &self.inner.shards[self.shard_idx];
             shard.consumer_waiter.wait_until(|| {
-                shard.any_ring_has_work() || self.inner.shutdown.load(Ordering::Acquire)
+                shard.any_ring_has_work() || self.inner.is_terminal_for_consumer()
             });
         }
     }
@@ -654,17 +702,28 @@ impl<T: Send, const RING_CAP: usize, W: AsyncWaiter> MpmcConsumer<T, RING_CAP, W
             if let Some(v) = self.try_recv() {
                 return Ok(v);
             }
-            if self.inner.shutdown.load(Ordering::Acquire) {
+            if self.inner.is_terminal_for_consumer() {
                 return Err(Shutdown);
             }
             let shard = &self.inner.shards[self.shard_idx];
             // Borrow only the shard + shutdown atomic (both Sync) — not
             // `self`, because `MpmcConsumer` is intentionally `!Sync`.
-            let shutdown = &self.inner.shutdown;
+            let inner = &*self.inner;
             shard
                 .consumer_waiter
-                .wait_until(|| shard.any_ring_has_work() || shutdown.load(Ordering::Acquire))
+                .wait_until(|| shard.any_ring_has_work() || inner.is_terminal_for_consumer())
                 .await;
+        }
+    }
+}
+
+impl<T: Send, const RING_CAP: usize, W: Waiter> Drop for MpmcConsumer<T, RING_CAP, W> {
+    fn drop(&mut self) {
+        let prev = self.inner.live_consumers.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            for w in self.inner.producer_waiters.iter() {
+                w.wake();
+            }
         }
     }
 }
@@ -1289,5 +1348,80 @@ mod tests {
         };
         let (_, got) = tokio::join!(producer, consumer);
         assert_eq!(got, (0..1000u64).sum());
+    }
+
+    #[test]
+    fn recv_batch_panic_does_not_double_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct Bomb(u64);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        DROPS.store(0, Ordering::SeqCst);
+        let sent;
+        {
+            let (mut ps, mut cs, _sd) = Mpmc::<Bomb, 8>::new(1, 1);
+            let p = ps.remove(0);
+            let c = cs.remove(0);
+            for k in 0..5 {
+                p.try_send(Bomb(k)).ok().unwrap();
+            }
+            sent = 5;
+            let mut seen = 0usize;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = c.recv_batch(|v| {
+                    seen += 1;
+                    if seen == 2 {
+                        panic!("boom");
+                    }
+                    drop(v);
+                });
+            }));
+            assert!(r.is_err());
+        }
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            sent,
+            "each Bomb must drop exactly once (got {} for {} sent)",
+            DROPS.load(Ordering::SeqCst),
+            sent
+        );
+    }
+
+    #[test]
+    fn last_producer_drop_wakes_consumer() {
+        let (mut ps, mut cs, _sd) = Mpmc::<u64>::new(1, 1);
+        let p = ps.remove(0);
+        let c = cs.remove(0);
+        let h = std::thread::spawn(move || {
+            c.bind();
+            c.recv()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(p);
+        match h.join().unwrap() {
+            Err(_) => {}
+            Ok(_) => panic!("recv should return Shutdown after last producer drop"),
+        }
+    }
+
+    #[test]
+    fn last_consumer_drop_wakes_producer() {
+        let (mut ps, mut cs, _sd) = Mpmc::<u64, 2>::new(1, 1);
+        let p = ps.remove(0);
+        let c = cs.remove(0);
+        for k in 0..2u64 {
+            p.try_send(k).ok().unwrap();
+        }
+        let h = std::thread::spawn(move || {
+            p.bind();
+            p.send(999);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(c);
+        h.join().unwrap();
     }
 }
