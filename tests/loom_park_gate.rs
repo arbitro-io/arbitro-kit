@@ -1,10 +1,10 @@
-//! Loom model of the `ParkWaiter2` parked-flag protocol
-//! (`src/waiter/park2.rs`).
+//! Loom model of the `ParkWaiter` parked-flag protocol
+//! (`src/waiter/park.rs`).
 //!
 //! ## Verification scope (honest disclosure)
 //!
 //! `std::thread::park`/`unpark` cannot run under loom (loom does not
-//! shim them), so the real `ParkWaiter2` is not model-checked directly.
+//! shim them), so the real `ParkWaiter` is not model-checked directly.
 //! What CAN be checked — and what the audited bug lived in — is the
 //! Dekker flag protocol between the waiter's (announce-park →
 //! predicate-check) sequence and the waker's (data-store → parked-probe
@@ -76,7 +76,7 @@ where
     builder.check(f);
 }
 
-/// Model of the `ParkWaiter2` gate — same atomics, same orderings as
+/// Model of the `ParkWaiter` gate — same atomics, same orderings as
 /// park.rs.
 struct ParkGateModel {
     parked: AtomicUsize,
@@ -93,7 +93,7 @@ impl ParkGateModel {
     }
 
     /// T1 — announce park + SC fence (pairs with the waker's T3b fence;
-    /// SC-fence Dekker theorem). Mirrors park2.rs.
+    /// SC-fence Dekker theorem). Mirrors park.rs.
     fn announce(&self) {
         self.parked.swap(PARKED, Ordering::SeqCst);
         loom::sync::atomic::fence(Ordering::SeqCst);
@@ -105,7 +105,7 @@ impl ParkGateModel {
     }
 
     /// T3 — `wake()`: positive-only Acquire fast probe (T3a), then the
-    /// authoritative SC-fence probe (T3b). Mirrors park2.rs.
+    /// authoritative SC-fence probe (T3b). Mirrors park.rs.
     fn wake(&self) {
         if self.parked.load(Ordering::Acquire) == PARKED {
             self.unparks.fetch_add(1, Ordering::Relaxed);

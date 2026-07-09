@@ -247,6 +247,77 @@ mod kit2_tokio_impl {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// arbitro-kit Spsc2 (OS thread) (v2)
+// ══════════════════════════════════════════════════════════════════════
+
+mod spsc2_impl {
+    use super::{Msg, CAP, N};
+    use arbitro_kit::stream::Spsc2;
+    use std::thread;
+    use std::time::Instant;
+
+    pub fn run() -> f64 {
+        let (mut tx, mut rx) = Spsc2::<Msg, CAP>::new();
+
+        let consumer = thread::spawn(move || {
+            for _ in 0..N {
+                let m = rx.recv().unwrap();
+                std::hint::black_box(m);
+            }
+        });
+
+        thread::yield_now();
+
+        let t0 = Instant::now();
+        for i in 0..N {
+            tx.send(i as Msg).unwrap();
+        }
+        consumer.join().unwrap();
+        let ns = t0.elapsed().as_nanos() as f64;
+        ns / N as f64
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// arbitro-kit Spsc2 (tokio) (v2)
+// ══════════════════════════════════════════════════════════════════════
+
+mod spsc2_tokio_impl {
+    use super::{Msg, CAP, N};
+    use arbitro_kit::stream::Spsc2;
+    use arbitro_kit::waiter::NotifyWaiter;
+    use std::time::Instant;
+
+    pub fn run() -> f64 {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (mut tx, mut rx) = Spsc2::<Msg, CAP, NotifyWaiter>::new();
+
+            let t0 = Instant::now();
+            let producer = async {
+                for i in 0..N {
+                    tx.send_async(i as Msg).await.unwrap();
+                }
+            };
+            let consumer = async {
+                for _ in 0..N {
+                    let m = rx.recv_async().await.unwrap();
+                    std::hint::black_box(m);
+                }
+            };
+            tokio::join!(producer, consumer);
+            let ns = t0.elapsed().as_nanos() as f64;
+            ns / N as f64
+        })
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // io_uring: SQ→CQ ring roundtrip via IORING_OP_NOP, single-threaded
 // ══════════════════════════════════════════════════════════════════════
 //
@@ -343,6 +414,8 @@ fn main() {
     println!("  kit (Ring):  {:.1} ns/msg", kit_impl::run());
     println!("  kit (Ring2): {:.1} ns/msg", kit2_impl::run());
     println!("  kit (Ring2/tokio): {:.1} ns/msg", kit2_tokio_impl::run());
+    println!("  kit (Spsc2): {:.1} ns/msg", spsc2_impl::run());
+    println!("  kit (Spsc2/tokio): {:.1} ns/msg", spsc2_tokio_impl::run());
     #[cfg(target_os = "linux")]
     {
         println!("  uring:       {:.1} ns/msg", uring_impl::run());
@@ -353,6 +426,8 @@ fn main() {
     row("kit Ring (thread)", measure(kit_impl::run));
     row("kit Ring2 (thread)", measure(kit2_impl::run));
     row("kit Ring2 (tokio)", measure(kit2_tokio_impl::run));
+    row("kit Spsc2 (thread)", measure(spsc2_impl::run));
+    row("kit Spsc2 (tokio)", measure(spsc2_tokio_impl::run));
 
     #[cfg(target_os = "linux")]
     {

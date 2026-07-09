@@ -86,3 +86,4 @@ pub type MpscAsyncConsumer<T, const RING_CAP: usize = 64> = MpscConsumer<T, RING
 /// Async sibling of [`MpscShutdown<T, RING_CAP>`].
 #[cfg(feature = "tokio")]
 pub type MpscAsyncShutdown<T, const RING_CAP: usize = 64> = MpscShutdown<T, RING_CAP, NotifyWaiter>;
+

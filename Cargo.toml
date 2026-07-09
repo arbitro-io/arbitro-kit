@@ -110,6 +110,11 @@ name = "mem_ring_h2h"
 harness = false
 required-features = ["tokio"]
 
+[[bench]]
+name = "mem_ring_batched"
+harness = false
+required-features = ["tokio"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"
