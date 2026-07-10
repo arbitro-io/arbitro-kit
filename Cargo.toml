@@ -59,15 +59,7 @@ name = "hub_overhead"
 harness = false
 
 [[bench]]
-name = "ring_overhead"
-harness = false
-
-[[bench]]
 name = "mpmc_overhead"
-harness = false
-
-[[bench]]
-name = "stream_overhead"
 harness = false
 
 [[bench]]
@@ -79,36 +71,8 @@ name = "lifeline_overhead"
 harness = false
 
 [[bench]]
-name = "mpsc_overhead"
-harness = false
-
-[[bench]]
-name = "mpsc_clone_overhead"
-harness = false
-
-[[bench]]
-name = "mpsc_clone_async_overhead"
-harness = false
-required-features = ["tokio"]
-
-[[bench]]
 name = "oneshot_h2h"
 harness = false
-
-[[bench]]
-name = "async_h2h"
-harness = false
-required-features = ["tokio"]
-
-[[bench]]
-name = "cap_sweep"
-harness = false
-required-features = ["tokio"]
-
-[[bench]]
-name = "mem_ring_h2h"
-harness = false
-required-features = ["tokio"]
 
 [[bench]]
 name = "mem_ring_batched"
@@ -125,6 +89,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
-[[bench]]
-name = "mpsc_vs_mpsc2"
-harness = false

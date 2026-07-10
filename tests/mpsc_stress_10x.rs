@@ -1,4 +1,4 @@
-//! Stress harness for `Mpsc2` — 10 iterations, 10s watchdog each.
+//! Stress harness for `Mpsc` — 10 iterations, 10s watchdog each.
 //!
 //! Goal: verify no hang / deadlock / lost-wake at various M values.
 //! Each iteration:
@@ -9,7 +9,7 @@
 //! If ANY iteration hangs → the whole test fails with a panic from the
 //! watchdog.
 
-use arbitro_kit::route::{Mpsc2, Shutdown};
+use arbitro_kit::route::{Mpsc, Shutdown};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -34,7 +34,7 @@ fn run_once(m: usize, iter: usize) {
                 eprintln!(
                     "\n╔══ HANG DETECTED ══════════════════════════════════════╗\
                      \n║  Iteration {} (m={}) did not complete in {:?}.\
-                     \n║  Very likely deadlock / lost-wake in Mpsc2.\
+                     \n║  Very likely deadlock / lost-wake in Mpsc.\
                      \n╚═══════════════════════════════════════════════════════╝",
                     iter, m, WATCHDOG,
                 );
@@ -43,7 +43,7 @@ fn run_once(m: usize, iter: usize) {
         }
     });
 
-    let (ps, mut c, sd) = Mpsc2::<u64, CAP>::new(m);
+    let (ps, mut c, sd) = Mpsc::<u64, CAP>::new(m);
     let sd2 = sd.clone();
     let barrier = Arc::new(Barrier::new(m + 1));
     let target = (m as u64) * PER;
@@ -96,7 +96,7 @@ fn run_once(m: usize, iter: usize) {
 }
 
 #[test]
-fn mpsc2_stress_10_iterations_no_hang() {
+fn mpsc_stress_10_iterations_no_hang() {
     // Sweep M each iteration so we hit the full range.
     let ms = [1usize, 2, 4, 8, 16];
     for i in 0..ITERS {
