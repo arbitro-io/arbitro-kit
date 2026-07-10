@@ -89,3 +89,12 @@ pub type MpscAsyncConsumer<T, const RING_CAP: usize = 64> = MpscConsumer<T, RING
 #[cfg(feature = "tokio")]
 pub type MpscAsyncShutdown<T, const RING_CAP: usize = 64> = MpscShutdown<T, RING_CAP, NotifyWaiter>;
 
+#[cfg(feature = "tokio")]
+pub type Mpsc2Async<T, const CAP: usize = 64> = Mpsc2<T, CAP, NotifyWaiter>;
+#[cfg(feature = "tokio")]
+pub type Mpsc2AsyncProducer<T, const CAP: usize = 64> = Mpsc2Producer<T, CAP, NotifyWaiter>;
+#[cfg(feature = "tokio")]
+pub type Mpsc2AsyncConsumer<T, const CAP: usize = 64> = Mpsc2Consumer<T, CAP, NotifyWaiter>;
+#[cfg(feature = "tokio")]
+pub type Mpsc2AsyncShutdown = Mpsc2Shutdown<NotifyWaiter>;
+

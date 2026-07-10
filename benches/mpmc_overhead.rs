@@ -707,32 +707,46 @@ fn main() {
     bench_mpsc::<2>("mpmc 2P/1C");
     bench_mpsc::<4>("mpmc 4P/1C");
     bench_mpsc::<8>("mpmc 8P/1C");
+    bench_mpsc::<12>("mpmc 12P/1C");
+    bench_mpsc::<16>("mpmc 16P/1C");
 
     header("D. 1P/NC fan-out");
     bench_spmc::<2>("mpmc 1P/2C");
     bench_spmc::<4>("mpmc 1P/4C");
     bench_spmc::<8>("mpmc 1P/8C");
+    bench_spmc::<12>("mpmc 1P/12C");
+    bench_spmc::<16>("mpmc 1P/16C");
 
     header("E. MP/NC symmetric");
     bench_mpmc_symmetric::<2, 2>("mpmc 2P/2C");
     bench_mpmc_symmetric::<4, 4>("mpmc 4P/4C");
     bench_mpmc_symmetric::<8, 8>("mpmc 8P/8C");
+    bench_mpmc_symmetric::<12, 12>("mpmc 12P/12C");
+    bench_mpmc_symmetric::<16, 16>("mpmc 16P/16C");
 
     header("F. crossbeam::channel::bounded(1024) baselines");
     bench_crossbeam_mpsc::<2>("crossbeam 2P/1C");
     bench_crossbeam_mpsc::<4>("crossbeam 4P/1C");
     bench_crossbeam_mpsc::<8>("crossbeam 8P/1C");
+    bench_crossbeam_mpsc::<12>("crossbeam 12P/1C");
+    bench_crossbeam_mpsc::<16>("crossbeam 16P/1C");
     bench_crossbeam_spmc::<2>("crossbeam 1P/2C");
     bench_crossbeam_spmc::<4>("crossbeam 1P/4C");
     bench_crossbeam_spmc::<8>("crossbeam 1P/8C");
+    bench_crossbeam_spmc::<12>("crossbeam 1P/12C");
+    bench_crossbeam_spmc::<16>("crossbeam 1P/16C");
     bench_crossbeam_mpmc::<2, 2>("crossbeam 2P/2C");
     bench_crossbeam_mpmc::<4, 4>("crossbeam 4P/4C");
     bench_crossbeam_mpmc::<8, 8>("crossbeam 8P/8C");
+    bench_crossbeam_mpmc::<12, 12>("crossbeam 12P/12C");
+    bench_crossbeam_mpmc::<16, 16>("crossbeam 16P/16C");
 
     header("G. MP/NC producer-batched via try_send_batch (chunk=64)");
     bench_mpmc_batched::<2, 2>("mpmc 2P/2C batched-64", 64);
     bench_mpmc_batched::<4, 4>("mpmc 4P/4C batched-64", 64);
     bench_mpmc_batched::<8, 8>("mpmc 8P/8C batched-64", 64);
+    bench_mpmc_batched::<12, 12>("mpmc 12P/12C batched-64", 64);
+    bench_mpmc_batched::<16, 16>("mpmc 16P/16C batched-64", 64);
 
     println!("\nDone.");
 }

@@ -31,7 +31,7 @@ use std::sync::Barrier;
 use std::thread;
 use std::time::Instant;
 
-use arbitro_kit::route::{Mpsc, Mpsc2, Shutdown};
+use arbitro_kit::route::{Mpmc, Mpsc, Mpsc2, Shutdown};
 
 const PER: u64 = 1_000_000;
 const CAP: usize = 64;
@@ -145,6 +145,51 @@ fn mpsc2_single(m: usize) -> f64 {
     let handles: Vec<_> = ps
         .into_iter()
         .map(|mut p| {
+            let b = barrier.clone();
+            thread::spawn(move || {
+                p.bind();
+                b.wait();
+                for k in 0..PER {
+                    p.send(k as usize);
+                }
+            })
+        })
+        .collect();
+    let t0 = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    consumer_h.join().unwrap();
+    let el = t0.elapsed().as_secs_f64() * 1000.0;
+    sd2.signal();
+    drop(sd);
+    el
+}
+
+fn mpmc_single(m: usize) -> f64 {
+    let (ps, mut cs, sd) = Mpmc::<usize, CAP>::new(m, 1);
+    let sd2 = sd.clone();
+    let barrier = Arc::new(Barrier::new(m + 1));
+    let c = cs.remove(0);
+
+    let consumer_h = {
+        let b = barrier.clone();
+        thread::spawn(move || {
+            c.bind();
+            b.wait();
+            let target = (m as u64) * PER;
+            let mut got: u64 = 0;
+            while got < target {
+                match c.recv_batch(|_| got += 1) {
+                    Ok(_) => {}
+                    Err(Shutdown) => break,
+                }
+            }
+        })
+    };
+    let handles: Vec<_> = ps
+        .into_iter()
+        .map(|p| {
             let b = barrier.clone();
             thread::spawn(move || {
                 p.bind();
@@ -406,6 +451,7 @@ fn main() {
     for &m in &ms {
         measure("kit Mpsc (single)", m, || mpsc_single(m));
         measure("kit Mpsc2 (single)", m, || mpsc2_single(m));
+        measure("kit Mpmc N=1 (single)", m, || mpmc_single(m));
         println!();
     }
 
@@ -424,4 +470,100 @@ fn main() {
         measure("kit Mpsc2 (batch)", m, || mpsc2_batch(m));
         println!();
     }
+
+    // Section 4: tokio SINGLE
+    header("TOKIO SINGLE  (T = usize, NotifyWaiter, one send per msg)");
+    for &m in &ms {
+        measure("kit MpscAsync (single)", m, || mpsc_single_tokio(m));
+        measure("kit Mpsc2Async (single)", m, || mpsc2_single_tokio(m));
+        println!();
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Tokio Section: SINGLE async
+// ══════════════════════════════════════════════════════════════════════════
+
+fn mpsc_single_tokio(m: usize) -> f64 {
+    use arbitro_kit::route::MpscAsync;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(m + 1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let (ps, mut c, sd) = MpscAsync::<usize, CAP>::new(m);
+        let sd2 = sd.clone();
+        let target = (m as u64) * PER;
+        let consumer = tokio::spawn(async move {
+            let mut got: u64 = 0;
+            while got < target {
+                match c.recv_async().await {
+                    Ok(_) => got += 1,
+                    Err(_) => break,
+                }
+            }
+        });
+        let t0 = Instant::now();
+        let mut ph: Vec<tokio::task::JoinHandle<()>> = ps
+            .into_iter()
+            .map(|p| {
+                tokio::spawn(async move {
+                    for k in 0..PER {
+                        p.send_async(k as usize).await;
+                    }
+                })
+            })
+            .collect();
+        for h in ph.drain(..) {
+            h.await.unwrap();
+        }
+        consumer.await.unwrap();
+        let el = t0.elapsed().as_secs_f64() * 1000.0;
+        sd2.signal();
+        drop(sd);
+        el
+    })
+}
+
+fn mpsc2_single_tokio(m: usize) -> f64 {
+    use arbitro_kit::route::Mpsc2Async;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(m + 1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let (ps, mut c, sd) = Mpsc2Async::<usize, CAP>::new(m);
+        let sd2 = sd.clone();
+        let target = (m as u64) * PER;
+        let consumer = tokio::spawn(async move {
+            let mut got: u64 = 0;
+            while got < target {
+                match c.recv_async().await {
+                    Ok(_) => got += 1,
+                    Err(_) => break,
+                }
+            }
+        });
+        let t0 = Instant::now();
+        let mut ph: Vec<tokio::task::JoinHandle<()>> = ps
+            .into_iter()
+            .map(|mut p| {
+                tokio::spawn(async move {
+                    for k in 0..PER {
+                        p.send_async(k as usize).await;
+                    }
+                })
+            })
+            .collect();
+        for h in ph.drain(..) {
+            h.await.unwrap();
+        }
+        consumer.await.unwrap();
+        let el = t0.elapsed().as_secs_f64() * 1000.0;
+        sd2.signal();
+        drop(sd);
+        el
+    })
 }

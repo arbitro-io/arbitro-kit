@@ -349,6 +349,237 @@ impl<T: Send, const CAP: usize, W: BlockingWaiter> Mpsc2Consumer<T, CAP, W> {
     }
 }
 
+// ─── Async send / recv (AsyncWaiter only) ─────────────────────────────────
+
+#[cfg(feature = "tokio")]
+impl<T: Send + 'static, const CAP: usize, W: crate::waiter::AsyncWaiter + 'static>
+    Mpsc2Producer<T, CAP, W>
+{
+    pub fn send_async<'a>(
+        &'a mut self,
+        value: T,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        let inner_addr = Arc::as_ptr(&self.inner) as usize;
+        let idx = self.my_idx;
+        let rp_addr = (&self.ring_producer) as *const _ as usize;
+        Box::pin(async move {
+            let mut value = value;
+            loop {
+                if self.inner.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                match self.try_send(value) {
+                    Ok(()) => return,
+                    Err(v) => value = v,
+                }
+                // SAFETY: inner is kept alive by `self` for `'a`.
+                let inner_ref: &'a Inner<W> = unsafe { &*(inner_addr as *const Inner<W>) };
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> =
+                    Box::pin(inner_ref.producer_waiters[idx].wait_until(move || {
+                        if inner_ref.shutdown.load(Ordering::Acquire) {
+                            return true;
+                        }
+                        let rp = unsafe {
+                            &*(rp_addr as *const Option<Producer<T, CAP, NoopWaiter>>)
+                        };
+                        match rp.as_ref() {
+                            Some(p) => !p.is_full(),
+                            None => true,
+                        }
+                    }));
+                fut.await;
+            }
+        })
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T: Send + 'static, const CAP: usize, W: crate::waiter::AsyncWaiter + 'static>
+    Mpsc2Consumer<T, CAP, W>
+{
+    pub fn recv_async<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Shutdown>> + Send + 'a>> {
+        let inner_addr = Arc::as_ptr(&self.inner) as usize;
+        let self_addr = self as *const Self as usize;
+        Box::pin(async move {
+            loop {
+                if let Some(v) = self.try_recv() {
+                    return Ok(v);
+                }
+                if self.is_finished() {
+                    return Err(Shutdown);
+                }
+                let inner_ref: &'a Inner<W> = unsafe { &*(inner_addr as *const Inner<W>) };
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> =
+                    Box::pin(inner_ref.fanin_waiter.wait_until(move || {
+                        let this = unsafe { &*(self_addr as *const Self) };
+                        this.any_ring_has_work() || this.is_finished()
+                    }));
+                fut.await;
+            }
+        })
+    }
+
+    pub fn recv_batch_async<'a, F: FnMut(T) + Send + 'a>(
+        &'a mut self,
+        mut f: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, Shutdown>> + Send + 'a>> {
+        let inner_addr = Arc::as_ptr(&self.inner) as usize;
+        let self_addr = self as *const Self as usize;
+        Box::pin(async move {
+            loop {
+                let n = self.try_recv_batch(&mut f);
+                if n > 0 {
+                    return Ok(n);
+                }
+                if self.is_finished() {
+                    return Err(Shutdown);
+                }
+                let inner_ref: &'a Inner<W> = unsafe { &*(inner_addr as *const Inner<W>) };
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> =
+                    Box::pin(inner_ref.fanin_waiter.wait_until(move || {
+                        let this = unsafe { &*(self_addr as *const Self) };
+                        this.any_ring_has_work() || this.is_finished()
+                    }));
+                fut.await;
+            }
+        })
+    }
+}
+
+// ─── NotifyWaiter zero-alloc specialization ───────────────────────────────
+
+#[cfg(feature = "tokio")]
+impl<T: Send, const CAP: usize> Mpsc2Producer<T, CAP, crate::waiter::NotifyWaiter> {
+    #[inline]
+    pub fn send_async_send<'a>(
+        &'a mut self,
+        value: T,
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        // Split borrow: `inner` (immut/Sync) and `ring_producer` (mut) are
+        // disjoint fields, so their borrows can coexist inside the loop.
+        let Mpsc2Producer {
+            inner,
+            ring_producer,
+            my_idx,
+            ..
+        } = self;
+        let my_idx = *my_idx;
+        async move {
+            let mut value = value;
+            loop {
+                let notified = inner.producer_waiters[my_idx].inner.notified();
+                if inner.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                let rp = match ring_producer.as_mut() {
+                    Some(p) => p,
+                    None => return,
+                };
+                match rp.try_send(value) {
+                    Ok(()) => {
+                        if rp.should_notify_consumer(1) {
+                            inner.fanin_waiter.wake();
+                        }
+                        return;
+                    }
+                    Err(TrySendError::Full(v)) => value = v,
+                    Err(TrySendError::Closed(v)) => {
+                        drop(v);
+                        return;
+                    }
+                }
+                notified.await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T: Send, const CAP: usize> Mpsc2Consumer<T, CAP, crate::waiter::NotifyWaiter> {
+    #[inline]
+    pub fn recv_async_send<'a>(
+        &'a mut self,
+    ) -> impl std::future::Future<Output = Result<T, Shutdown>> + Send + 'a {
+        let Mpsc2Consumer {
+            inner,
+            ring_consumers,
+            ..
+        } = self;
+        async move {
+            let m = inner.m;
+            loop {
+                let notified = inner.fanin_waiter.inner.notified();
+                for idx in 0..m {
+                    if let Some(c) = ring_consumers[idx].as_mut() {
+                        if let Ok(v) = c.try_recv() {
+                            inner.producer_waiters[idx].wake();
+                            return Ok(v);
+                        }
+                    }
+                }
+                if inner.is_shutdown_signaled()
+                    || (inner.all_producers_gone()
+                        && !ring_consumers
+                            .iter()
+                            .flatten()
+                            .any(|c| !c.is_empty()))
+                {
+                    return Err(Shutdown);
+                }
+                notified.await;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn recv_batch_async_send<'a, F: FnMut(T) + Send + 'a>(
+        &'a mut self,
+        mut f: F,
+    ) -> impl std::future::Future<Output = Result<usize, Shutdown>> + Send + 'a {
+        let Mpsc2Consumer {
+            inner,
+            ring_consumers,
+            ..
+        } = self;
+        async move {
+            let m = inner.m;
+            loop {
+                let notified = inner.fanin_waiter.inner.notified();
+                let mut total = 0usize;
+                let mut round = true;
+                while round {
+                    round = false;
+                    for idx in 0..m {
+                        if let Some(c) = ring_consumers[idx].as_mut() {
+                            let n = c.drain(&mut f);
+                            if n > 0 {
+                                total += n;
+                                round = true;
+                                inner.producer_waiters[idx].wake();
+                            }
+                        }
+                    }
+                }
+                if total > 0 {
+                    return Ok(total);
+                }
+                if inner.is_shutdown_signaled()
+                    || (inner.all_producers_gone()
+                        && !ring_consumers
+                            .iter()
+                            .flatten()
+                            .any(|c| !c.is_empty()))
+                {
+                    return Err(Shutdown);
+                }
+                notified.await;
+            }
+        }
+    }
+}
+
 // ─── Shutdown handle ──────────────────────────────────────────────────────
 
 pub struct Mpsc2Shutdown<W: Waiter = ParkWaiter> {
