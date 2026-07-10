@@ -1,4 +1,39 @@
 use arbitro_kit::route::{Mpsc2Async, MpscAsync};
+
+async fn run_mpsc2_batch(m: usize) -> f64 {
+    let (ps, mut c, sd) = Mpsc2Async::<usize, CAP>::new(m);
+    let sd2 = sd.clone();
+    let target = (m as u64) * PER;
+    let consumer = tokio::spawn(async move {
+        let mut got: u64 = 0;
+        while got < target {
+            match c.recv_batch_async_send(|_| got += 1).await {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        got
+    });
+    let t0 = std::time::Instant::now();
+    let handles: Vec<_> = ps
+        .into_iter()
+        .map(|mut p| {
+            tokio::spawn(async move {
+                for k in 0..PER {
+                    p.send_async_send(k as usize).await;
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.await.unwrap();
+    }
+    consumer.await.unwrap();
+    let el = t0.elapsed().as_secs_f64() * 1000.0;
+    sd2.signal();
+    drop(sd);
+    el
+}
 use std::time::Instant;
 
 const PER: u64 = 200_000;
@@ -100,6 +135,16 @@ async fn main() {
         let mpsc2_rate = (target as f64) / (t2 / 1000.0) / 1e6;
         let ratio = mpsc2_rate / mpsc_rate;
         println!("{:<16} {:>4} {:>14.2} {:>14.2} {:>13.2}×", "Mpsc2Async", m, t2, mpsc2_rate, ratio);
+        // Mpsc2Async recv_batch
+        let t3 = tokio::time::timeout(std::time::Duration::from_secs(60), run_mpsc2_batch(m))
+            .await
+            .expect("Mpsc2Async batch timeout");
+        let mpsc2b_rate = (target as f64) / (t3 / 1000.0) / 1e6;
+        let ratio3 = mpsc2b_rate / mpsc_rate;
+        println!(
+            "{:<16} {:>4} {:>14.2} {:>14.2} {:>13.2}×",
+            "Mpsc2Async batch", m, t3, mpsc2b_rate, ratio3
+        );
         println!();
     }
 }
