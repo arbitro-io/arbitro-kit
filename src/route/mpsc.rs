@@ -136,6 +136,21 @@ impl<T: Send, const CAP: usize, W: Waiter> MpscProducer<T, CAP, W> {
         CAP
     }
 
+    /// Items this producer has published but the consumer has not drained
+    /// yet. Snapshot; races with concurrent drain. One Acquire load on the
+    /// consumer-owned tail line — cheap but not free; use for metrics, not
+    /// in the hot path.
+    #[inline]
+    pub fn pending(&self) -> usize {
+        self.ring_producer.as_ref().map(|p| p.len()).unwrap_or(0)
+    }
+
+    /// Slots free in this producer's ring. `capacity - pending()`.
+    #[inline]
+    pub fn available(&self) -> usize {
+        CAP.saturating_sub(self.pending())
+    }
+
     /// Non-blocking send. Returns the value back on full or shutdown.
     #[inline]
     pub fn try_send(&mut self, value: T) -> Result<(), T> {
@@ -245,6 +260,18 @@ impl<T: Send, const CAP: usize, W: Waiter> MpscConsumer<T, CAP, W> {
     #[inline]
     pub fn total_capacity(&self) -> usize {
         self.inner.m * CAP
+    }
+
+    /// Sum of items visible across all rings from this consumer's fresh
+    /// perspective. O(M). Snapshot; races with concurrent producers. Use
+    /// for metrics, not in the hot recv path.
+    #[inline]
+    pub fn pending(&self) -> usize {
+        self.ring_consumers
+            .iter()
+            .flatten()
+            .map(|c| c.len())
+            .sum()
     }
 
     /// `true` iff at least one ring has an item. O(M) direct-scan.
