@@ -150,6 +150,49 @@ mod kit_ring_tokio {
     }
 }
 
+mod kit_mpsc_async_tokio {
+    use super::{Batch, Msg, BATCH_SIZE, CAP, N};
+    use arbitro_kit::route::MpscAsync;
+    use std::time::Instant;
+
+    pub fn run() -> f64 {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (mut producers, mut consumer, _sd) =
+                MpscAsync::<Batch, CAP>::new(1);
+            let mut producer = producers.remove(0);
+            producer.bind();
+            consumer.bind();
+            let n_batches = N / BATCH_SIZE;
+            let t0 = Instant::now();
+            let producer_task = async {
+                for i in 0..n_batches {
+                    let mut batch = [0usize; BATCH_SIZE];
+                    for j in 0..BATCH_SIZE {
+                        batch[j] = (i * BATCH_SIZE + j) as Msg;
+                    }
+                    producer.send_async(batch).await;
+                }
+            };
+            let consumer_task = async {
+                for _ in 0..n_batches {
+                    let batch = consumer.recv_async().await.unwrap();
+                    for m in batch {
+                        std::hint::black_box(m);
+                    }
+                }
+            };
+            tokio::join!(producer_task, consumer_task);
+            let ns = t0.elapsed().as_nanos() as f64;
+            ns / (n_batches * BATCH_SIZE) as f64
+        })
+    }
+}
+
 fn measure<F: FnMut() -> f64>(mut f: F) -> Vec<f64> {
     for _ in 0..WARMUP {
         let _ = f();
@@ -171,5 +214,6 @@ fn main() {
     row("tokio mpsc [batched]", measure(tokio_batched_impl::run));
     row("kit Ring (thread) [batched]", measure(kit_ring_thread::run));
     row("kit Ring (tokio) [batched]", measure(kit_ring_tokio::run));
+    row("kit MpscAsync (tokio) [batched]", measure(kit_mpsc_async_tokio::run));
     println!("Done.");
 }

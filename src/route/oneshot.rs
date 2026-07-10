@@ -51,13 +51,16 @@ use crate::waiter::BlockingWaiter;
 use crate::waiter::{ParkWaiter, Waiter};
 
 /// State of the OneShot's slot. Transitions are one-way:
-/// `EMPTY` → `FULL` (sender sent), or `EMPTY` → `CLOSED` (sender dropped).
-/// Once `FULL`, a successful `try_take` swaps to `TAKEN` so subsequent
-/// reads return `Closed` instead of double-reading the slot.
+/// `EMPTY` → `FULL` (sender sent), `EMPTY` → `CLOSED` (sender dropped),
+/// or `EMPTY` → `RX_DROPPED` (receiver dropped before send — lets
+/// `send` skip the write entirely). Once `FULL`, a successful
+/// `try_take` swaps to `TAKEN` so subsequent reads return `Closed`
+/// instead of double-reading the slot.
 const STATE_EMPTY: u8 = 0;
 const STATE_FULL: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 const STATE_TAKEN: u8 = 3;
+const STATE_RX_DROPPED: u8 = 4;
 
 /// Error returned when the [`Sender`] dropped without sending, or when
 /// the value has already been taken.
@@ -66,7 +69,7 @@ pub struct Closed;
 
 #[repr(C, align(64))]
 struct Inner<T: Send, W: Waiter> {
-    /// State machine: EMPTY / FULL / CLOSED / TAKEN.
+    /// State machine: EMPTY / FULL / CLOSED / TAKEN / RX_DROPPED.
     state: AtomicU8,
     /// Wait/wake backend. The trait is generic — `ParkWaiter` for sync
     /// OS-thread, `NotifyWaiter` for tokio, future impls for io_uring.
@@ -87,12 +90,16 @@ unsafe impl<T: Send, W: Waiter> Sync for Inner<T, W> {}
 
 impl<T: Send, W: Waiter> Drop for Inner<T, W> {
     fn drop(&mut self) {
-        // If a value was sent but never received, drop it.
-        if self.state.load(Ordering::Acquire) == STATE_FULL {
+        // If a value was sent but never received, drop it. Every other
+        // state (EMPTY, CLOSED, TAKEN, RX_DROPPED) means the slot was
+        // never written or already taken — nothing to do.
+        match self.state.load(Ordering::Acquire) {
             // Safety: state == FULL ⇒ slot is initialised and untaken.
-            unsafe {
+            STATE_FULL => unsafe {
                 (*self.slot.get()).assume_init_drop();
-            }
+            },
+            STATE_EMPTY | STATE_CLOSED | STATE_TAKEN | STATE_RX_DROPPED => {}
+            _ => {}
         }
     }
 }
@@ -135,6 +142,12 @@ impl<T: Send, W: Waiter> Sender<T, W> {
     /// `W::wake` if it had announced parking.
     #[inline]
     pub fn send(mut self, value: T) {
+        // Receiver already gone: skip the write/store/wake entirely.
+        if self.inner.state.load(Ordering::Relaxed) == STATE_RX_DROPPED {
+            drop(value);
+            self.sent = true;
+            return;
+        }
         // Safety: state is EMPTY (we are the only sender, no concurrent
         // writer to the slot exists yet); Release store on state makes
         // the slot's contents visible to the receiver's Acquire CAS.
@@ -142,8 +155,8 @@ impl<T: Send, W: Waiter> Sender<T, W> {
             (*self.inner.slot.get()).write(value);
         }
         self.inner.state.store(STATE_FULL, Ordering::Release);
-        self.inner.waiter.wake();
         self.sent = true;
+        self.inner.waiter.wake();
     }
 }
 
@@ -162,6 +175,21 @@ impl<T: Send, W: Waiter> Drop for Sender<T, W> {
 /// Consumer half. Receives exactly one value or `Closed`.
 pub struct Receiver<T: Send, W: Waiter = ParkWaiter> {
     inner: Arc<Inner<T, W>>,
+}
+
+impl<T: Send, W: Waiter> Drop for Receiver<T, W> {
+    fn drop(&mut self) {
+        // If the sender hasn't published yet, mark RX_DROPPED so `send`
+        // can skip straight to dropping the value. If the CAS fails the
+        // state is already FULL/CLOSED/TAKEN — leave it; FULL is handled
+        // by Inner::Drop, the rest need no cleanup.
+        let _ = self.inner.state.compare_exchange(
+            STATE_EMPTY,
+            STATE_RX_DROPPED,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
 }
 
 impl<T: Send, W: Waiter> Receiver<T, W> {
@@ -262,7 +290,14 @@ impl<T: Send + 'static, W: AsyncWaiter + 'static> Receiver<T, W> {
     pub fn recv_async(
         self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Closed>> + Send>> {
-        Box::pin(do_recv_async(self.inner))
+        // `self` now runs a Drop that CASes EMPTY→RX_DROPPED, which must
+        // NOT fire here — ownership of the wait moves into the returned
+        // future, it isn't being abandoned. ManuallyDrop + ptr::read move
+        // the `inner` field out (no refcount change) while suppressing
+        // that Drop.
+        let this = std::mem::ManuallyDrop::new(self);
+        let inner = unsafe { std::ptr::read(&this.inner) };
+        Box::pin(do_recv_async(inner))
     }
 }
 
@@ -270,6 +305,24 @@ impl<T: Send + 'static, W: AsyncWaiter + 'static> Receiver<T, W> {
 async fn do_recv_async<T: Send + 'static, W: AsyncWaiter + 'static>(
     inner: std::sync::Arc<Inner<T, W>>,
 ) -> Result<T, Closed> {
+    match inner.state.load(Ordering::Acquire) {
+        STATE_FULL => {
+            return match inner.state.compare_exchange(
+                STATE_FULL,
+                STATE_TAKEN,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let v = unsafe { (*inner.slot.get()).assume_init_read() };
+                    Ok(v)
+                }
+                Err(_) => Err(Closed),
+            };
+        }
+        STATE_CLOSED | STATE_TAKEN => return Err(Closed),
+        _ => {}
+    }
     let inner_for_pred = inner.clone();
     // Box the wait_until future to erase its `'a` borrow before the outer
     // `async fn` auto-trait inference runs.
@@ -366,7 +419,8 @@ mod tests {
         let (tx, rx) = OneShot::<u64>::new();
         drop(rx);
         tx.send(99);
-        // Inner's Drop will run assume_init_drop. No panic, no leak.
+        // rx drop marks RX_DROPPED; send observes it and drops 99 inline.
+        // No panic, no leak.
     }
 
     #[test]
@@ -405,6 +459,27 @@ mod tests {
             tx.send(Tracked(drops.clone()));
             // Receiver dropped without recv → Inner::Drop must drop the value.
             drop(rx);
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn send_after_rx_dropped_drops_value_exactly_once() {
+        // Receiver dropped BEFORE send (RX_DROPPED fast path), not after
+        // (that's `dropped_value_runs_destructor`, the FULL path).
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let (tx, rx) = OneShot::<Tracked>::new();
+            drop(rx);
+            // send() must not panic even though the receiver is gone,
+            // and must drop the value exactly once (inline, no slot write).
+            tx.send(Tracked(drops.clone()));
         }
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
