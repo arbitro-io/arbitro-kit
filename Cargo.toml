@@ -63,6 +63,10 @@ name = "mpmc_overhead"
 harness = false
 
 [[bench]]
+name = "mpsc_overhead"
+harness = false
+
+[[bench]]
 name = "duplex_overhead"
 harness = false
 

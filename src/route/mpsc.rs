@@ -2,9 +2,10 @@
 //! The ring's internal `wake()` is a no-op; fan-in wakes go through
 //! Mpsc's own shared waiter, gated by [`Producer::should_notify_consumer`].
 
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::route::hub::Shutdown;
@@ -101,6 +102,56 @@ impl<T: Send + 'static, const CAP: usize, W: Waiter + 'static> Mpsc<T, CAP, W> {
         let shutdown = MpscShutdown { inner };
 
         (producers, consumer, shutdown)
+    }
+
+    /// Like [`Mpsc::new`], but hands back a leasable [`MpscProducerPool`]
+    /// instead of a static `Vec<MpscProducer>`, so producer slots can be
+    /// recycled across short-lived connections instead of leaked.
+    ///
+    /// # Panics
+    /// Same as [`Mpsc::new`].
+    pub fn producer_pool(
+        m: usize,
+    ) -> (
+        Arc<MpscProducerPool<T, CAP, W>>,
+        MpscConsumer<T, CAP, W>,
+        MpscShutdown<W>,
+    ) {
+        let (producers, consumer, shutdown) = Self::new(m);
+        (Self::pool_from_producers(producers), consumer, shutdown)
+    }
+
+    /// Wrap an already-built `Vec<MpscProducer>` in a pool for dynamic reuse.
+    ///
+    /// # Panics
+    /// - `producers` is empty
+    /// - `producers.len() > MAX_MPSC_PRODUCERS`
+    pub fn pool_from_producers(
+        producers: Vec<MpscProducer<T, CAP, W>>,
+    ) -> Arc<MpscProducerPool<T, CAP, W>> {
+        let m = producers.len();
+        assert!(m > 0, "Mpsc::pool_from_producers: producers must be non-empty");
+        assert!(
+            m <= MAX_MPSC_PRODUCERS,
+            "Mpsc::pool_from_producers: m must be <= {MAX_MPSC_PRODUCERS}"
+        );
+        // Any producer's Inner Arc keeps the channel alive for the pool.
+        let inner = producers[0].inner.clone();
+        let slots = producers
+            .into_iter()
+            .map(|p| UnsafeCell::new(Some(p)))
+            .collect();
+        Arc::new(MpscProducerPool {
+            slots,
+            occupancy: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            m,
+            _inner: inner,
+        })
     }
 }
 
@@ -235,6 +286,154 @@ impl<T, const CAP: usize, W: Waiter> Drop for MpscProducer<T, CAP, W> {
     }
 }
 
+// ─── Producer pool ────────────────────────────────────────────────────────
+
+/// 4*64 = 256 bits, sized to cover `MAX_MPSC_PRODUCERS` (255).
+const BITMAP_WORDS: usize = 4;
+
+/// Dynamic pool of [`MpscProducer`] slots leased out via
+/// [`MpscProducerLease`]. Slot occupancy is a fixed 256-bit atomic bitmap,
+/// so `acquire`/release cost is O(1) regardless of `m`. Built by
+/// [`Mpsc::producer_pool`] or [`Mpsc::pool_from_producers`].
+#[repr(align(64))] // isolate the bitmap's cache lines from the slot storage
+pub struct MpscProducerPool<T, const CAP: usize, W: Waiter> {
+    // slots[i] is Some(producer) iff occupancy bit i is 0.
+    slots: Vec<UnsafeCell<Option<MpscProducer<T, CAP, W>>>>,
+    // Bit i set = slot i currently leased. Word 0 = slots 0..64, etc.
+    occupancy: [AtomicU64; BITMAP_WORDS],
+    m: usize,
+    // Keeps the channel alive independently of any single producer/consumer.
+    _inner: Arc<Inner<W>>,
+}
+
+// SAFETY: interior access to each slot's UnsafeCell is guarded by the
+// occupancy bit — holding the bit == holding &mut on that slot's
+// Option<MpscProducer>, so concurrent Pool access across threads is sound.
+unsafe impl<T: Send, const CAP: usize, W: Waiter> Sync for MpscProducerPool<T, CAP, W> {}
+
+impl<T: Send, const CAP: usize, W: Waiter> MpscProducerPool<T, CAP, W> {
+    /// Number of producer slots configured for this pool (== `m` at build).
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.m
+    }
+
+    /// Number of slots currently NOT leased. O(4) — sums popcnt over the
+    /// 4 occupancy words.
+    pub fn available(&self) -> usize {
+        let mut free = 0usize;
+        for word_i in 0..BITMAP_WORDS {
+            let word_min = word_i * 64;
+            if word_min >= self.m {
+                break;
+            }
+            let live_bits = ((word_i + 1) * 64).min(self.m) - word_min;
+            let mask: u64 = if live_bits == 64 {
+                !0u64
+            } else {
+                (1u64 << live_bits) - 1
+            };
+            let cur = self.occupancy[word_i].load(Ordering::Relaxed);
+            free += ((!cur) & mask).count_ones() as usize;
+        }
+        free
+    }
+
+    /// Try to lease a producer. Returns `None` iff every slot is currently
+    /// held. Cold path: one relaxed load per 64-bit word plus one AcqRel
+    /// `fetch_or` retry loop on the word holding a free bit.
+    ///
+    /// The lease hands back the *same* underlying ring a previous holder of
+    /// this slot used, so [`MpscProducer::index`] is not a stable per-item
+    /// tag across lease cycles: items sent before and after a lease
+    /// boundary share one ring and are delivered in that ring's publish
+    /// order.
+    pub fn acquire(self: &Arc<Self>) -> Option<MpscProducerLease<T, CAP, W>> {
+        for word_i in 0..BITMAP_WORDS {
+            let word_min = word_i * 64;
+            if word_min >= self.m {
+                break;
+            }
+            let live_bits = ((word_i + 1) * 64).min(self.m) - word_min;
+            let mask: u64 = if live_bits == 64 {
+                !0u64
+            } else {
+                (1u64 << live_bits) - 1
+            };
+            loop {
+                let cur = self.occupancy[word_i].load(Ordering::Relaxed);
+                let free = (!cur) & mask;
+                if free == 0 {
+                    break;
+                }
+                let bit = free.trailing_zeros() as u64;
+                let mask_bit = 1u64 << bit;
+                // AcqRel: the Acquire side synchronizes-with the previous
+                // lease's Release fetch_and, giving happens-before on the
+                // slot's UnsafeCell contents.
+                let prev = self.occupancy[word_i].fetch_or(mask_bit, Ordering::AcqRel);
+                if prev & mask_bit == 0 {
+                    let slot = word_min + bit as usize;
+                    // SAFETY: we just won the bit; every unleased slot holds
+                    // a producer by construction/release invariant.
+                    let producer = unsafe { (*self.slots[slot].get()).take().unwrap() };
+                    return Some(MpscProducerLease {
+                        pool: self.clone(),
+                        slot: slot as u16,
+                        producer: ManuallyDrop::new(producer),
+                    });
+                }
+                // Lost the race to another acquirer — retry this word.
+            }
+        }
+        None
+    }
+}
+
+/// A [`MpscProducer`] leased from an [`MpscProducerPool`]. Derefs to
+/// `MpscProducer` at zero cost; returns the producer to the pool on drop
+/// instead of tearing down the underlying ring, so the slot can be reused
+/// by the next lease.
+pub struct MpscProducerLease<T, const CAP: usize, W: Waiter> {
+    pool: Arc<MpscProducerPool<T, CAP, W>>,
+    slot: u16,
+    producer: ManuallyDrop<MpscProducer<T, CAP, W>>,
+}
+
+impl<T: Send, const CAP: usize, W: Waiter> std::ops::Deref for MpscProducerLease<T, CAP, W> {
+    type Target = MpscProducer<T, CAP, W>;
+    #[inline]
+    fn deref(&self) -> &MpscProducer<T, CAP, W> {
+        &self.producer
+    }
+}
+
+impl<T: Send, const CAP: usize, W: Waiter> std::ops::DerefMut for MpscProducerLease<T, CAP, W> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut MpscProducer<T, CAP, W> {
+        &mut self.producer
+    }
+}
+
+impl<T, const CAP: usize, W: Waiter> Drop for MpscProducerLease<T, CAP, W> {
+    fn drop(&mut self) {
+        // SAFETY: this Drop impl is the only call site that takes from
+        // this lease's ManuallyDrop, and it runs at most once.
+        let producer = unsafe { ManuallyDrop::take(&mut self.producer) };
+        let slot = self.slot as usize;
+        // SAFETY: we still hold the occupancy bit here, so no other thread
+        // can be touching this cell concurrently.
+        unsafe {
+            *self.pool.slots[slot].get() = Some(producer);
+        }
+        let word = slot / 64;
+        let bit = slot % 64;
+        // Release: pairs with acquire()'s AcqRel fetch_or so the next
+        // holder observes the restored Option<MpscProducer>.
+        self.pool.occupancy[word].fetch_and(!(1u64 << bit), Ordering::Release);
+    }
+}
+
 // ─── Consumer handle ──────────────────────────────────────────────────────
 
 /// Single-consumer handle. `Send + !Sync`.
@@ -290,6 +489,15 @@ impl<T: Send, const CAP: usize, W: Waiter> MpscConsumer<T, CAP, W> {
     fn is_finished(&self) -> bool {
         self.inner.is_shutdown_signaled()
             || (self.inner.all_producers_gone() && !self.any_ring_has_work())
+    }
+
+    /// True iff no more items can ever be sent on this channel: shutdown
+    /// signaled OR every producer permanently dropped. Rings may still
+    /// hold buffered items — use `pending()` for that; this is distinct
+    /// from `is_finished` (the recv termination condition). Non-mutating.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_shutdown_signaled() || self.inner.all_producers_gone()
     }
 
     /// O(M) scan. Returns the first item found; wakes that ring's
@@ -372,6 +580,39 @@ impl<T: Send, const CAP: usize, W: BlockingWaiter> MpscConsumer<T, CAP, W> {
                 let this = unsafe { &*self_ptr };
                 this.any_ring_has_work() || this.is_finished()
             });
+        }
+    }
+}
+
+impl<T: Send, const CAP: usize, W: BlockingWaiter> MpscConsumer<T, CAP, W> {
+    /// Drain the channel until shutdown, calling `f` for every item.
+    /// Takes ownership so the caller cannot use the consumer afterwards.
+    ///
+    /// Returns when either the shutdown handle has been signaled OR all
+    /// producers have been dropped AND every ring is empty (same
+    /// condition as [`Self::recv_batch`] returning `Err(Shutdown)`).
+    ///
+    /// The caller MUST have called [`Self::bind`] before invoking this on
+    /// `W = ParkWaiter` (same requirement as `recv_batch`).
+    ///
+    /// `run_blocking` takes `self` by value, so the consumer cannot be
+    /// used again afterwards:
+    ///
+    /// ```compile_fail
+    /// use arbitro_kit::route::Mpsc;
+    ///
+    /// let (_ps, c, sd) = Mpsc::<u64>::new(1);
+    /// sd.signal();
+    /// c.run_blocking(|_v| {});
+    /// c.recv(); // moved: fails to compile
+    /// ```
+    #[inline]
+    pub fn run_blocking<F: FnMut(T)>(mut self, mut f: F) {
+        loop {
+            match self.recv_batch(&mut f) {
+                Ok(_) => continue,
+                Err(Shutdown) => return,
+            }
         }
     }
 }
@@ -636,6 +877,13 @@ impl<W: Waiter> MpscShutdown<W> {
     pub fn is_signaled(&self) -> bool {
         self.inner.shutdown.load(Ordering::Acquire)
     }
+
+    /// Same predicate as `MpscConsumer::is_closed`: shutdown signaled OR
+    /// every producer permanently dropped.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_shutdown_signaled() || self.inner.all_producers_gone()
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -831,5 +1079,152 @@ mod tests {
         }
         assert_eq!(sum, expected);
         assert_eq!(got, total);
+    }
+
+    #[test]
+    fn run_blocking_delivers_all_items_then_returns() {
+        const N: u64 = 1000;
+        let (mut ps, c, sd) = Mpsc::<u64>::new(1);
+        let mut p = ps.remove(0);
+        c.bind();
+
+        let producer_h = thread::spawn(move || {
+            p.bind();
+            for i in 0..N {
+                p.send(i);
+            }
+        });
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = count.clone();
+        let consumer_h = thread::spawn(move || {
+            c.run_blocking(|_v| {
+                count2.fetch_add(1, Ordering::Relaxed);
+            });
+        });
+
+        producer_h.join().unwrap();
+        // Give the consumer a chance to drain in-flight items before shutdown.
+        thread::sleep(Duration::from_millis(30));
+        sd.signal();
+        consumer_h.join().unwrap();
+
+        assert_eq!(count.load(Ordering::Relaxed), N as usize);
+    }
+
+    #[test]
+    fn run_blocking_returns_immediately_when_already_closed() {
+        let (_ps, c, sd) = Mpsc::<u64>::new(1);
+        c.bind();
+        sd.signal();
+
+        let called = Arc::new(AtomicUsize::new(0));
+        let called2 = called.clone();
+        c.run_blocking(move |_v: u64| {
+            called2.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn run_blocking_forwards_panics_from_f() {
+        let (mut ps, c, _sd) = Mpsc::<u64, 16>::new(1);
+        let mut p = ps.remove(0);
+        for i in 0..10u64 {
+            p.try_send(i).unwrap();
+        }
+        drop(p);
+
+        c.run_blocking(|v| {
+            if v == 3 {
+                panic!("boom");
+            }
+        });
+    }
+
+    #[test]
+    fn is_closed_false_at_start() {
+        let (_ps, c, sd) = Mpsc::<u64>::new(4);
+        assert!(!c.is_closed());
+        assert!(!sd.is_closed());
+    }
+
+    #[test]
+    fn is_closed_true_after_shutdown_signal() {
+        let (_ps, c, sd) = Mpsc::<u64>::new(4);
+        sd.signal();
+        assert!(c.is_closed());
+        assert!(sd.is_closed());
+    }
+
+    #[test]
+    fn is_closed_true_after_all_producers_drop() {
+        let (ps, c, sd) = Mpsc::<u64>::new(4);
+        drop(ps);
+        assert!(c.is_closed());
+        assert!(sd.is_closed());
+    }
+
+    #[test]
+    fn is_closed_survives_pending_items() {
+        let (mut ps, c, _sd) = Mpsc::<u64, 16>::new(1);
+        let mut p = ps.remove(0);
+        p.try_send(1).unwrap();
+        p.try_send(2).unwrap();
+        p.try_send(3).unwrap();
+        drop(ps);
+        drop(p);
+        // Closed for new writes even though 3 items are still buffered.
+        assert!(c.is_closed());
+        assert!(c.pending() > 0);
+    }
+
+    #[test]
+    fn concurrent_probe_during_recv() {
+        // MpscConsumer is Send + !Sync, so it stays on the recv thread.
+        // MpscShutdown (Arc<Inner<W>>-backed, Clone) is the intended
+        // cross-thread probe handle — hammer is_closed() on a clone from
+        // thread A while thread B drives recv_batch, and assert the latch
+        // is monotonic (once true, never flips back to false).
+        let (mut ps, mut c, sd) = Mpsc::<u64, 64>::new(2);
+        let mut p0 = ps.remove(0);
+        let mut p1 = ps.remove(0);
+        c.bind();
+        p0.bind();
+        p1.bind();
+
+        let consumer_h = thread::spawn(move || loop {
+            match c.recv_batch(|_v| {}) {
+                Ok(_) => continue,
+                Err(Shutdown) => break,
+            }
+        });
+
+        let sd_probe = sd.clone();
+        let seen_closed = Arc::new(AtomicUsize::new(0)); // 0 = false, 1 = true
+        let seen_closed2 = seen_closed.clone();
+        let probe_h = thread::spawn(move || {
+            for _ in 0..100_000 {
+                let closed_now = sd_probe.is_closed();
+                if seen_closed2.load(Ordering::Relaxed) == 1 {
+                    assert!(closed_now, "is_closed must not flip back to false");
+                } else if closed_now {
+                    seen_closed2.store(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        for i in 0..1000u64 {
+            p0.try_send(i).ok();
+            p1.try_send(i).ok();
+        }
+        drop(p0);
+        drop(p1);
+
+        probe_h.join().unwrap();
+        consumer_h.join().unwrap();
+        assert!(sd.is_closed());
     }
 }
