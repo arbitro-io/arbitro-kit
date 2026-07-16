@@ -93,6 +93,105 @@ impl Signal {
     }
 }
 
+// ─── `SignalAcquire` shim — Fable-audit hardened variant ─────────────────────────
+//
+// Same OS-thread contract as `Signal` (N producers → 1 blocking consumer),
+// with three deliberate changes from the original composition:
+//
+//   1. Cache-padded flag (128 B) — isolates producer `swap` traffic from
+//      the ParkWaiter's parked/mutex line. 128 not 64 to sidestep the
+//      x86 spatial prefetcher pulling paired lines.
+//   2. Coalescing `release()` — `swap(true, Release)` returns the prior
+//      value; the wake path only fires on the 0→1 transition. In a
+//      1→1 burst the producer touches ONE atomic line and nothing else
+//      (the current `Signal` unconditionally calls `waiter.wake()`,
+//      which even on the awake path is at least one extra atomic load
+//      on the ParkWaiter's `parked` word).
+//   3. `acquire_take()` consuming variant — atomically waits for AND
+//      clears the flag in one `swap(false, AcqRel)`. Closes the
+//      check-then-`lock()` lost-signal window that afflicts any
+//      protocol built on `acquire()` + `lock()` (a producer's release
+//      fired between the emptiness check and the clear is silently
+//      wiped in the plain-flag variant; here the wait/consume RMW is
+//      linearizable with the producer's release RMW).
+//
+// SAFETY: `release()` MUST RMW unconditionally. A test-and-then-swap
+// fast path could observe a stale `true` that the consumer has just
+// cleared, skip the store, and strand the append forever.
+#[repr(align(128))]
+struct FlagLine(AtomicBool);
+
+struct SignalAcquire {
+    open: FlagLine,
+    waiter: ParkWaiter,
+}
+
+impl SignalAcquire {
+    fn new() -> Self {
+        Self {
+            open: FlagLine(AtomicBool::new(false)),
+            waiter: ParkWaiter::default(),
+        }
+    }
+    fn with_spin(spin: u32) -> Self {
+        Self {
+            open: FlagLine(AtomicBool::new(false)),
+            waiter: ParkWaiter::with_spin(spin),
+        }
+    }
+    #[inline]
+    fn set_worker(&self, t: thread::Thread) {
+        self.waiter.set_worker(t);
+    }
+    /// Producer: coalescing release — wake fires ONLY on 0→1.
+    /// Lost-wake proof: the consumer only parks after observing the flag
+    /// false; a 0→1 swap that observation missed cannot happen-before
+    /// the observation, so this `wake()` is guaranteed delivered.
+    #[inline]
+    fn release(&self) {
+        if !self.open.0.swap(true, Ordering::Release) {
+            self.waiter.wake();
+        }
+    }
+    /// Legacy: non-consuming wait. Pair with `lock()` iff the caller
+    /// re-checks for work after clearing (otherwise use `acquire_take`).
+    #[inline]
+    fn acquire(&self) {
+        self.waiter.wait_until(|| self.open.0.load(Ordering::Acquire));
+    }
+    /// Consuming wait — waits for AND atomically clears the flag.
+    /// The AcqRel swap synchronizes-with the producer's Release swap in
+    /// `release()`. Recommended over `acquire() + lock()`.
+    #[inline]
+    fn acquire_take(&self) {
+        // Fast path: flag already set — take it without touching the
+        // waiter. Cold path: park until the flag flips, then take.
+        if self.open.0.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.waiter.wait_until(|| {
+            // TTAS (test-and-test-and-set): read-only load first, and only
+            // pay the AcqRel RMW when the load already sees `true`. Keeps
+            // the spin loop off the producer's release cache line (a raw
+            // `swap` per spin iteration is a `lock xchg` that pulls the
+            // flag exclusive, contending the producer's release swap and
+            // partially defeating the FlagLine padding). Sound because:
+            //   - False-returning load → we didn't touch the flag; nothing
+            //     to consume, wait again.
+            //   - True-returning load → single AcqRel swap consumes; if a
+            //     racing consumer/producer got there first, the swap
+            //     returns false and we spin again — no double-consume.
+            self.open.0.load(Ordering::Acquire)
+                && self.open.0.swap(false, Ordering::AcqRel)
+        });
+    }
+    /// Legacy clear — retained for parity with `Signal` in the bench.
+    #[inline]
+    fn lock(&self) {
+        self.open.0.store(false, Ordering::Relaxed);
+    }
+}
+
 fn rounds() -> usize {
     std::env::var("BENCH_ROUNDS")
         .ok()
@@ -171,6 +270,46 @@ fn st_signal() -> Row {
     }
     let el = t_wall.elapsed().as_nanos() as u64;
     finish("Signal", lats, el)
+}
+
+fn st_signal_acquire_acqlock() -> Row {
+    let s = SignalAcquire::new();
+    s.set_worker(thread::current());
+    for _ in 0..warmup() {
+        s.release();
+        s.acquire();
+        s.lock();
+    }
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for _ in 0..rounds() {
+        let t0 = Instant::now();
+        s.release();
+        s.acquire();
+        s.lock();
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    finish("SignalAcquire (acquire+lock)", lats, el)
+}
+
+fn st_signal_acquire_take() -> Row {
+    let s = SignalAcquire::new();
+    s.set_worker(thread::current());
+    for _ in 0..warmup() {
+        s.release();
+        s.acquire_take();
+    }
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for _ in 0..rounds() {
+        let t0 = Instant::now();
+        s.release();
+        s.acquire_take();
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+    finish("SignalAcquire (acquire_take)", lats, el)
 }
 
 fn st_atomic_spin() -> Row {
@@ -338,6 +477,109 @@ fn xt_hot_signal() -> Row {
     sig.release();
     h.join().unwrap();
     finish("Signal", lats, el)
+}
+
+fn xt_hot_signal_acquire_acqlock() -> Row {
+    let sig = Arc::new(SignalAcquire::new());
+    let ready = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let round_nr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let s = sig.clone();
+    let r = ready.clone();
+    let d = done.clone();
+    let rn = round_nr.clone();
+    let h = thread::spawn(move || {
+        s.set_worker(thread::current());
+        r.store(true, Ordering::Release);
+        let mut seen = 0usize;
+        while !d.load(Ordering::Relaxed) {
+            s.acquire();
+            s.lock();
+            seen += 1;
+            rn.store(seen, Ordering::Release);
+        }
+    });
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+
+    let total = warmup() + rounds();
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall_start_round = warmup();
+    let mut t_wall = Instant::now();
+
+    for i in 0..total {
+        let expect = i + 1;
+        if i == t_wall_start_round {
+            t_wall = Instant::now();
+        }
+        let t0 = Instant::now();
+        sig.release();
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
+        if i >= t_wall_start_round {
+            lats.push(t0.elapsed().as_nanos() as u64);
+        }
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+
+    done.store(true, Ordering::Relaxed);
+    sig.release();
+    h.join().unwrap();
+    finish("SignalAcquire (acquire+lock)", lats, el)
+}
+
+fn xt_hot_signal_acquire_take() -> Row {
+    let sig = Arc::new(SignalAcquire::new());
+    let ready = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let round_nr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let s = sig.clone();
+    let r = ready.clone();
+    let d = done.clone();
+    let rn = round_nr.clone();
+    let h = thread::spawn(move || {
+        s.set_worker(thread::current());
+        r.store(true, Ordering::Release);
+        let mut seen = 0usize;
+        while !d.load(Ordering::Relaxed) {
+            s.acquire_take();
+            seen += 1;
+            rn.store(seen, Ordering::Release);
+        }
+    });
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+
+    let total = warmup() + rounds();
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall_start_round = warmup();
+    let mut t_wall = Instant::now();
+
+    for i in 0..total {
+        let expect = i + 1;
+        if i == t_wall_start_round {
+            t_wall = Instant::now();
+        }
+        let t0 = Instant::now();
+        sig.release();
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
+        if i >= t_wall_start_round {
+            lats.push(t0.elapsed().as_nanos() as u64);
+        }
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+
+    done.store(true, Ordering::Relaxed);
+    sig.release();
+    h.join().unwrap();
+    finish("SignalAcquire (acquire_take)", lats, el)
 }
 
 fn xt_hot_atomic_spin() -> Row {
@@ -630,6 +872,109 @@ fn xt_parked_signal() -> Row {
     sig.release();
     h.join().unwrap();
     finish("Signal", lats, el)
+}
+
+fn xt_parked_signal_acquire_acqlock() -> Row {
+    let sig = Arc::new(SignalAcquire::with_spin(0));
+    let ready = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let round_nr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let s = sig.clone();
+    let r = ready.clone();
+    let d = done.clone();
+    let rn = round_nr.clone();
+    let h = thread::spawn(move || {
+        s.set_worker(thread::current());
+        r.store(true, Ordering::Release);
+        let mut seen = 0usize;
+        while !d.load(Ordering::Relaxed) {
+            s.acquire();
+            s.lock();
+            seen += 1;
+            rn.store(seen, Ordering::Release);
+        }
+    });
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+
+    for i in 0..warmup() {
+        sig.release();
+        while round_nr.load(Ordering::Acquire) < i + 1 {
+            std::hint::spin_loop();
+        }
+    }
+
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for i in 0..rounds() {
+        thread::sleep(XT_PARKED_PRE_SLEEP);
+        let expect = warmup() + i + 1;
+        let t0 = Instant::now();
+        sig.release();
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+
+    done.store(true, Ordering::Relaxed);
+    sig.release();
+    h.join().unwrap();
+    finish("SignalAcquire (acquire+lock)", lats, el)
+}
+
+fn xt_parked_signal_acquire_take() -> Row {
+    let sig = Arc::new(SignalAcquire::with_spin(0));
+    let ready = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let round_nr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let s = sig.clone();
+    let r = ready.clone();
+    let d = done.clone();
+    let rn = round_nr.clone();
+    let h = thread::spawn(move || {
+        s.set_worker(thread::current());
+        r.store(true, Ordering::Release);
+        let mut seen = 0usize;
+        while !d.load(Ordering::Relaxed) {
+            s.acquire_take();
+            seen += 1;
+            rn.store(seen, Ordering::Release);
+        }
+    });
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+
+    for i in 0..warmup() {
+        sig.release();
+        while round_nr.load(Ordering::Acquire) < i + 1 {
+            std::hint::spin_loop();
+        }
+    }
+
+    let mut lats = Vec::with_capacity(rounds());
+    let t_wall = Instant::now();
+    for i in 0..rounds() {
+        thread::sleep(XT_PARKED_PRE_SLEEP);
+        let expect = warmup() + i + 1;
+        let t0 = Instant::now();
+        sig.release();
+        while round_nr.load(Ordering::Acquire) < expect {
+            std::hint::spin_loop();
+        }
+        lats.push(t0.elapsed().as_nanos() as u64);
+    }
+    let el = t_wall.elapsed().as_nanos() as u64;
+
+    done.store(true, Ordering::Relaxed);
+    sig.release();
+    h.join().unwrap();
+    finish("SignalAcquire (acquire_take)", lats, el)
 }
 
 fn xt_parked_atomic_spin() -> Row {
@@ -1111,8 +1456,36 @@ fn main() {
         XT_PARKED_PRE_SLEEP.as_micros()
     );
 
+    // BENCH_FILTER env var — run only a subset:
+    //   signal_xt   → Signal cross-thread HOT + PARKED only
+    //   signal_acquire_xt  → SignalAcquire (both variants) cross-thread HOT + PARKED only
+    // Any other value / unset → full matrix.
+    match std::env::var("BENCH_FILTER").as_deref() {
+        Ok("signal_xt") => {
+            print_scenario_header("Cross-thread HOT (Signal only)");
+            print_row(xt_hot_signal());
+            print_scenario_header("Cross-thread PARKED (Signal only)");
+            print_row(xt_parked_signal());
+            println!("\nDone.");
+            return;
+        }
+        Ok("signal_acquire_xt") => {
+            print_scenario_header("Cross-thread HOT (SignalAcquire only)");
+            print_row(xt_hot_signal_acquire_acqlock());
+            print_row(xt_hot_signal_acquire_take());
+            print_scenario_header("Cross-thread PARKED (SignalAcquire only)");
+            print_row(xt_parked_signal_acquire_acqlock());
+            print_row(xt_parked_signal_acquire_take());
+            println!("\nDone.");
+            return;
+        }
+        _ => {}
+    }
+
     print_scenario_header("Single-thread (release + acquire same thread)");
     print_row(st_signal());
+    print_row(st_signal_acquire_acqlock());
+    print_row(st_signal_acquire_take());
     print_row(st_atomic_spin());
     print_row(st_atomic_park());
     print_row(st_condvar());
@@ -1122,6 +1495,8 @@ fn main() {
 
     print_scenario_header("Cross-thread HOT (consumer spinning, no pre-sleep)");
     print_row(xt_hot_signal());
+    print_row(xt_hot_signal_acquire_acqlock());
+    print_row(xt_hot_signal_acquire_take());
     print_row(xt_hot_atomic_spin());
     print_row(xt_hot_atomic_park());
     print_row(xt_hot_condvar());
@@ -1131,6 +1506,8 @@ fn main() {
 
     print_scenario_header("Cross-thread PARKED (500µs pre-sleep — true wake latency)");
     print_row(xt_parked_signal());
+    print_row(xt_parked_signal_acquire_acqlock());
+    print_row(xt_parked_signal_acquire_take());
     print_row(xt_parked_atomic_spin());
     print_row(xt_parked_atomic_park());
     print_row(xt_parked_condvar());
