@@ -9,6 +9,9 @@
 //! wsl bash -lc "cd '/mnt/.../arbitro-kit' && cargo run --release --example mpmc_memory_10k"
 //! ```
 
+// The header comment draws an ASCII layout tree, not a strict markdown list.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
+
 use std::fs;
 
 use arbitro_kit::route::Mpmc;

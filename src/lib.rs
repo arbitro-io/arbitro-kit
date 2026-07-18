@@ -43,6 +43,10 @@
 //! [`OneShot`]: route::OneShot
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// This crate's constructors are split-handle factories: `new()` returns a
+// `(Producer, Consumer, Shutdown)` tuple, not `Self`. Both lints fire on that
+// intentional, public API shape across every transport.
+#![allow(clippy::new_ret_no_self, clippy::type_complexity)]
 
 pub mod gate;
 pub mod route;

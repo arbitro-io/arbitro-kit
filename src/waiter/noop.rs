@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn set_worker_is_noop() {
-        let w = NoopWaiter::default();
+        let w = NoopWaiter;
         w.set_worker(std::thread::current());
         assert!(w.has_worker());
     }

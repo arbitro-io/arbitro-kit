@@ -88,7 +88,7 @@ fn bench_single_thread() {
     // crossbeam bounded
     {
         let (tx, rx) = bounded::<u64>(CAP);
-        let mut do_batch = || {
+        let do_batch = || {
             let t0 = Instant::now();
             for i in 0..BATCH {
                 while tx.try_send(i as u64).is_err() {

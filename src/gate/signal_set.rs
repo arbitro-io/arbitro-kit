@@ -132,7 +132,7 @@ impl<W: Waiter> SignalSet<W> {
     /// (`acquire_any(mask: u64)`, `lock_mask(mask: u64)`, `state()`) only
     /// address the first chunk.
     pub fn with_capacity(n_bits: usize) -> Self {
-        let n_chunks = (n_bits.max(1) + 63) / 64;
+        let n_chunks = n_bits.max(1).div_ceil(64);
         let cap_bits = n_chunks * 64;
         let mut chunks: Vec<AtomicU64> = Vec::with_capacity(n_chunks);
         for _ in 0..n_chunks {

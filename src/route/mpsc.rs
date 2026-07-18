@@ -794,6 +794,8 @@ impl<T: Send, const CAP: usize> MpscConsumer<T, CAP, crate::waiter::NotifyWaiter
             let m = inner.m;
             loop {
                 let notified = inner.fanin_waiter.inner.notified();
+                // idx indexes two parallel arrays (ring_consumers + producer_waiters).
+                #[allow(clippy::needless_range_loop)]
                 for idx in 0..m {
                     if let Some(c) = ring_consumers[idx].as_mut() {
                         if let Ok(v) = c.try_recv() {
@@ -834,6 +836,8 @@ impl<T: Send, const CAP: usize> MpscConsumer<T, CAP, crate::waiter::NotifyWaiter
                 let mut round = true;
                 while round {
                     round = false;
+                    // idx indexes two parallel arrays (ring_consumers + producer_waiters).
+                    #[allow(clippy::needless_range_loop)]
                     for idx in 0..m {
                         if let Some(c) = ring_consumers[idx].as_mut() {
                             let n = c.drain(&mut f);
@@ -904,6 +908,7 @@ impl<W: Waiter> MpscShutdown<W> {
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::while_let_loop)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;

@@ -765,6 +765,7 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcShutdown<T, RING_CAP, W> {
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::while_let_loop, dead_code)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1135,7 +1136,7 @@ mod tests {
         let consumer = cs.remove(0);
         consumer.bind();
 
-        let producers: Vec<_> = ps.drain(..).collect();
+        let producers: Vec<_> = std::mem::take(&mut ps);
         let handles: Vec<_> = producers
             .into_iter()
             .enumerate()
@@ -1192,7 +1193,7 @@ mod tests {
         assert_eq!(c0.total_capacity(), 16);
         assert_eq!(c0.pending(), 0);
         assert_eq!(c0.available(), 16);
-        assert_eq!(c0.has_pending(), false);
+        assert!(!c0.has_pending());
 
         for v in 0..5u32 {
             p0.try_send(v).unwrap();

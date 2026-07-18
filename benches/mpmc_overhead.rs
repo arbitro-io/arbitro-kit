@@ -21,6 +21,9 @@
 //! Conforms to bench_safety: BATCH = 1000, rounds capped, tee log expected
 //! from runner, no background work.
 
+// Bench drain loops read `loop { match recv }` on purpose for timing symmetry.
+#![allow(clippy::while_let_loop)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
