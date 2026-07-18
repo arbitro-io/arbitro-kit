@@ -73,3 +73,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+
+[[bench]]
+name = "mpsc_notify_ab"
+harness = false
+required-features = ["tokio"]

@@ -1,6 +1,9 @@
 //! M:1 bounded channel built on per-producer [`Ring<T, CAP, NoopWaiter>`].
-//! The ring's internal `wake()` is a no-op; fan-in wakes go through
-//! Mpsc's own shared waiter, gated by [`Producer::should_notify_consumer`].
+//! The ring's internal `wake()` is a no-op; fan-in wakes go through Mpsc's own
+//! shared waiter, called **unconditionally** on every push. The waiter's own
+//! gate (NotifyWaiter armed-counter / ParkWaiter parked-flag) is the sound wake
+//! elision; the former caller-level `should_notify_consumer` pre-gate had a
+//! store-buffering lost-wake race and is no longer used (R1, see `try_send`).
 
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
@@ -214,9 +217,19 @@ impl<T: Send, const CAP: usize, W: Waiter> MpscProducer<T, CAP, W> {
             .expect("ring_producer only None during drop");
         match rp.try_send(value) {
             Ok(()) => {
-                if rp.should_notify_consumer(1) {
-                    self.inner.fanin_waiter.wake();
-                }
+                // R1: wake unconditionally. The fan-in waiter's OWN gate
+                // (NotifyWaiter armed-counter / ParkWaiter parked-flag) is the
+                // sound wake elision. The former `should_notify_consumer`
+                // pre-gate was a caller-level Vyukov gate whose head-store →
+                // tail-load had a fence on only one side (store-buffering race):
+                // both sides could read stale simultaneously and skip the ONLY
+                // wake, losing it permanently (self-sustaining, not self-healing).
+                // On the production NotifyWaiter path this is also ~1.8x FASTER:
+                // it drops the per-send Acquire load of the consumer's hot `tail`
+                // line (cache-line ping-pong) for a load of the rarely-written
+                // `armed` line. (On ParkWaiter it costs an mfence per send;
+                // recover with batched sends if that config is ever hot.)
+                self.inner.fanin_waiter.wake();
                 Ok(())
             }
             Err(TrySendError::Full(v)) => Err(v),
@@ -237,7 +250,10 @@ impl<T: Send, const CAP: usize, W: Waiter> MpscProducer<T, CAP, W> {
             .as_mut()
             .expect("ring_producer only None during drop");
         let n = rp.try_send_bulk(items);
-        if n > 0 && rp.should_notify_consumer(n) {
+        // R1: wake unconditionally when anything was pushed — the waiter's own
+        // gate handles elision (see `try_send`). The old `should_notify_consumer`
+        // pre-gate could skip and lose the only wake.
+        if n > 0 {
             self.inner.fanin_waiter.wake();
         }
         n
@@ -747,9 +763,8 @@ impl<T: Send, const CAP: usize> MpscProducer<T, CAP, crate::waiter::NotifyWaiter
                 };
                 match rp.try_send(value) {
                     Ok(()) => {
-                        if rp.should_notify_consumer(1) {
-                            inner.fanin_waiter.wake();
-                        }
+                        // R1: wake unconditionally (see `try_send`).
+                        inner.fanin_waiter.wake();
                         return;
                     }
                     Err(TrySendError::Full(v)) => value = v,

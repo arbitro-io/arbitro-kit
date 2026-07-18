@@ -422,10 +422,17 @@ impl<T, const CAP: usize, W: Waiter> Producer<T, CAP, W> {
         take
     }
 
-    /// Vyukov wake gate. Call after a successful `try_send` / `try_send_bulk`
-    /// that pushed `n_pushed` items. Refreshes `cached_tail` and returns
-    /// `true` iff the ring went 0 → `n_pushed` from the consumer's fresh
-    /// perspective — i.e. wake would not be redundant.
+    /// UNSOUND as a *sole* wake gate — kept for reference; do NOT reintroduce
+    /// as the only wake source (this was R1).
+    ///
+    /// It stores `head` (Release) then loads `tail` (Acquire) with a fence on
+    /// only one side — a store-buffering shape where both the producer and a
+    /// re-arming consumer can read stale simultaneously, so the gate returns
+    /// `false` while the consumer parks with an item pending: the only wake is
+    /// skipped and lost (self-sustaining, not self-healing). The Mpsc now wakes
+    /// its fan-in waiter unconditionally and relies on the waiter's own hardened
+    /// gate (armed-counter / parked-flag) for elision.
+    #[allow(dead_code)]
     #[inline]
     pub fn should_notify_consumer(&mut self, n_pushed: usize) -> bool {
         let shared = &*self.shared;
@@ -613,23 +620,45 @@ impl<T, const CAP: usize, W: Waiter> Consumer<T, CAP, W> {
     #[inline]
     pub fn drain<F: FnMut(T)>(&mut self, mut f: F) -> usize {
         let shared = &*self.shared;
-        let mut tail = shared.tail.0.load(Ordering::Relaxed);
+        let start = shared.tail.0.load(Ordering::Relaxed);
         let head = shared.head.0.load(Ordering::Acquire);
-        if tail == head {
+        if start == head {
             return 0;
         }
-        let start = tail;
-        while tail != head {
+
+        // R2: a panic in `f` must still publish the consumed `tail` (Release).
+        // Each slot is `assume_init_read` (moved out) BEFORE `f` runs; without
+        // this guard an unwind leaves `shared.tail` at `start`, so `Ring::drop`
+        // would `assume_init_drop` the already-moved slots again — double-drop
+        // (with `T` carrying an `Arc`/`Bytes`: refcount corruption).
+        struct Commit<'a> {
+            slot: &'a AtomicUsize,
+            tail: usize,
+        }
+        impl Drop for Commit<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.slot.store(self.tail, Ordering::Release);
+            }
+        }
+
+        let mut c = Commit {
+            slot: &shared.tail.0,
+            tail: start,
+        };
+        while c.tail != head {
             let v = unsafe {
-                (*shared.slots[tail & Ring::<T, CAP, W>::MASK].get()).assume_init_read()
+                (*shared.slots[c.tail & Ring::<T, CAP, W>::MASK].get()).assume_init_read()
             };
-            tail = tail.wrapping_add(1);
+            // Advance BEFORE `f`, so a panic leaves `c.tail` past the moved slot.
+            c.tail = c.tail.wrapping_add(1);
             f(v);
         }
-        shared.tail.0.store(tail, Ordering::Release);
+        let consumed = c.tail.wrapping_sub(start);
+        drop(c); // publishes the final tail (Release) on the normal path
         shared.not_full.0.wake();
         self.cached_head = head;
-        tail.wrapping_sub(start)
+        consumed
     }
 
     /// See [`Producer::register`].
