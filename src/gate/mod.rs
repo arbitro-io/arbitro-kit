@@ -19,13 +19,6 @@
 //! A signal is "open" when it has pending work. `release()` opens it,
 //! `lock()` closes it, `acquire*()` blocks until open.
 
-mod lifeline;
-mod one_signal;
 mod signal_set;
 
-pub use lifeline::{Cancelled, Lifeline, WaiterId, MAX_WAITERS};
-pub use one_signal::{
-    AcquireError as OneSignalError, OneSignal, Receiver as OneSignalReceiver,
-    Sender as OneSignalSender,
-};
 pub use signal_set::{SignalId, SignalSet, MAX_GATES};

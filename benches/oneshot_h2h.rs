@@ -1,516 +1,460 @@
-//! `oneshot_h2h` — head-to-head bench:
-//!   - `arbitro_kit::gate::OneSignal`     (payloadless, single-use)
-//!   - `arbitro_kit::route::OneShot<T>`   (payload-carrying, single-use)
-//!   - `tokio::sync::oneshot::channel<T>` (async, blocked via current_thread runtime)
+//! OneShot factorial head-to-head — kit vs tokio / crossbeam across the full
+//! cube: {os-thread | tokio-runtime} × {single-thread | cross-thread} ×
+//! {serial | batch}.
 //!
-//! Three scenarios per primitive:
-//!   A. Same-thread already-released — pure fast-path overhead.
-//!   B. Cross-thread, immediate release — receiver likely catches in spin.
-//!   C. Cross-thread, sender does ~50 µs busy work — receiver parks for sure.
+//! - backend **os**    → `kit::OneShot<ParkWaiter>` vs `crossbeam::bounded(1)`
+//! - backend **tokio** → `kit::OneShotAsync<NotifyWaiter>` vs `tokio::sync::oneshot`
 //!
-//! Methodology mirrors the rest of the bench suite: warmup + 500 rounds,
-//! report min/p50/p99 ns/op + ops/sec. Each round creates a fresh pair
-//! (these are single-use primitives), so per-round cost includes
-//! allocation + handle setup. That's the realistic cost of using these
-//! primitives — you don't reuse them.
+//! Axes:
+//! - threads: **single** = producer and consumer on one thread/task (no wake,
+//!   value already present); **cross** = consumer parks/awaits, a separate
+//!   thread sends → the real wake round-trip.
+//! - mode: **serial** = one oneshot fully round-trips before the next;
+//!   **batch(N)** = N oneshots in flight at once (fire all, then collect all)
+//!   to amortize handoff.
+//!
+//! Every cell performs OPS oneshot round-trips per timed sample, so ns/op is
+//! directly comparable across cells. Conforms to bench_safety: bounded work,
+//! one at a time, tee log expected, no background work.
 
-use std::sync::Arc;
-use std::sync::Barrier;
+use std::hint::black_box;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use arbitro_kit::gate::OneSignal;
-use arbitro_kit::route::OneShot;
-use arbitro_kit::slot::Pipe;
-use arbitro_kit::waiter::ParkWaiter;
+use arbitro_kit::route::{OneShot, OneShotAsync, OneShotAsyncSender, OneShotSender};
+use crossbeam_channel::{bounded, unbounded};
+use tokio::sync::oneshot as tokio_oneshot;
 
-const ROUNDS: usize = 500;
-const WARMUP: usize = 50;
+const OPS: usize = 1000; // oneshot round-trips per timed sample
+const INFLIGHT: usize = 64; // pipeline depth in batch mode
 
-fn pct(samples: &mut [u128], q: f64) -> u128 {
-    samples.sort_unstable();
-    let idx = ((samples.len() as f64) * q).clamp(0.0, (samples.len() - 1) as f64) as usize;
-    samples[idx]
-}
-
-fn report(label: &str, samples: &mut [u128]) {
-    let mean = (samples.iter().sum::<u128>() as f64) / (samples.len() as f64);
-    let p50 = pct(samples, 0.50);
-    let p99 = pct(samples, 0.99);
-    let min = *samples.iter().min().unwrap();
-    let ops_sec = if mean > 0.0 { 1e9 / mean } else { 0.0 };
-    println!(
-        "{:<46}  {:>10.2}  {:>10}  {:>10}  {:>10}  {:>14.0}",
-        label, mean, min, p50, p99, ops_sec
-    );
+fn rounds() -> usize {
+    std::env::var("BENCH_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40)
 }
 
 fn header(title: &str) {
     println!("\n── {} ──", title);
     println!(
-        "{:<46}  {:>10}  {:>10}  {:>10}  {:>10}  {:>14}",
-        "variant", "mean_ns", "min_ns", "p50_ns", "p99_ns", "ops/sec"
+        "{:<34} {:>12} {:>12} {:>12} {:>14}",
+        "variant", "mean_ns/op", "p50_ns/op", "p99_ns/op", "ops/sec"
     );
-    println!("{}", "─".repeat(46 + 4 + 10 * 4 + 4 * 4 + 14 + 4));
+    println!("{}", "─".repeat(88));
 }
 
-// ─── A. Same-thread already-released ──────────────────────────────────────
-
-fn a_one_signal() {
-    // Warmup
-    for _ in 0..WARMUP {
-        let (tx, rx) = OneSignal::<ParkWaiter>::new();
-        rx.bind();
-        tx.release();
-        let _ = rx.acquire();
-    }
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let (tx, rx) = OneSignal::<ParkWaiter>::new();
-        rx.bind();
-        let t0 = Instant::now();
-        tx.release();
-        let _ = rx.acquire();
-        samples.push(t0.elapsed().as_nanos());
-    }
-    report("OneSignal (kit)", &mut samples);
+fn row(name: &str, mut batch_ns: Vec<u64>) {
+    batch_ns.sort_unstable();
+    let samples = batch_ns.len();
+    let total: u64 = batch_ns.iter().sum();
+    let total_ops = samples * OPS;
+    let ops = total_ops as f64 / (total as f64 / 1e9);
+    let mean = total as f64 / total_ops as f64;
+    let p50 = batch_ns[samples / 2] as f64 / OPS as f64;
+    let p99 = batch_ns[samples * 99 / 100] as f64 / OPS as f64;
+    println!(
+        "{:<34} {:>12.2} {:>12.2} {:>12.2} {:>14}",
+        name, mean, p50, p99, ops as u64
+    );
 }
 
-fn a_oneshot_kit() {
-    for _ in 0..WARMUP {
-        let (tx, rx) = OneShot::<u64>::new();
-        let _ = tx.send(42);
-        let _ = rx.recv();
+/// 5 warmup batches, then `rounds()` timed batches (each OPS round-trips).
+fn measure<F: FnMut()>(mut batch: F) -> Vec<u64> {
+    for _ in 0..5 {
+        batch();
     }
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let (tx, rx) = OneShot::<u64>::new();
-        let t0 = Instant::now();
-        let _ = tx.send(42);
-        let _ = rx.recv();
-        samples.push(t0.elapsed().as_nanos());
-    }
-    report("OneShot<u64> (kit)", &mut samples);
+    (0..rounds())
+        .map(|_| {
+            let t0 = Instant::now();
+            batch();
+            t0.elapsed().as_nanos() as u64
+        })
+        .collect()
 }
 
-fn a_oneshot_tokio() {
-    let rt = tokio::runtime::Builder::new_current_thread()
+// ══════════════════════ OS-THREAD BACKEND ══════════════════════
+// kit::OneShot<Park> vs crossbeam::bounded(1)
+
+mod os_single_serial {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        measure(|| {
+            for _ in 0..OPS {
+                let (tx, rx) = OneShot::<u64>::new();
+                tx.send(1);
+                black_box(rx.recv().unwrap());
+            }
+        })
+    }
+    pub fn crossbeam() -> Vec<u64> {
+        measure(|| {
+            for _ in 0..OPS {
+                let (tx, rx) = bounded::<u64>(1);
+                tx.send(1).unwrap();
+                black_box(rx.recv().unwrap());
+            }
+        })
+    }
+}
+
+mod os_single_batch {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        measure(|| {
+            for _ in 0..(OPS / INFLIGHT) {
+                let mut rxs = Vec::with_capacity(INFLIGHT);
+                for _ in 0..INFLIGHT {
+                    let (tx, rx) = OneShot::<u64>::new();
+                    tx.send(1);
+                    rxs.push(rx);
+                }
+                for rx in rxs {
+                    black_box(rx.recv().unwrap());
+                }
+            }
+        })
+    }
+    pub fn crossbeam() -> Vec<u64> {
+        measure(|| {
+            for _ in 0..(OPS / INFLIGHT) {
+                let mut rxs = Vec::with_capacity(INFLIGHT);
+                for _ in 0..INFLIGHT {
+                    let (tx, rx) = bounded::<u64>(1);
+                    tx.send(1).unwrap();
+                    rxs.push(rx);
+                }
+                for rx in rxs {
+                    black_box(rx.recv().unwrap());
+                }
+            }
+        })
+    }
+}
+
+mod os_cross_serial {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        let (job_tx, job_rx) = unbounded::<OneShotSender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                tx.send(black_box(1));
+            }
+        });
+        let out = measure(|| {
+            for _ in 0..OPS {
+                let (tx, rx) = OneShot::<u64>::new();
+                rx.bind();
+                job_tx.send(tx).unwrap();
+                black_box(rx.recv().unwrap());
+            }
+        });
+        drop(job_tx);
+        worker.join().unwrap();
+        out
+    }
+    pub fn crossbeam() -> Vec<u64> {
+        let (job_tx, job_rx) = unbounded::<crossbeam_channel::Sender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                let _ = tx.send(black_box(1));
+            }
+        });
+        let out = measure(|| {
+            for _ in 0..OPS {
+                let (tx, rx) = bounded::<u64>(1);
+                job_tx.send(tx).unwrap();
+                black_box(rx.recv().unwrap());
+            }
+        });
+        drop(job_tx);
+        worker.join().unwrap();
+        out
+    }
+}
+
+mod os_cross_batch {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        let (job_tx, job_rx) = unbounded::<OneShotSender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                tx.send(black_box(1));
+            }
+        });
+        let out = measure(|| {
+            for _ in 0..(OPS / INFLIGHT) {
+                let mut rxs = Vec::with_capacity(INFLIGHT);
+                for _ in 0..INFLIGHT {
+                    let (tx, rx) = OneShot::<u64>::new();
+                    rx.bind();
+                    job_tx.send(tx).unwrap();
+                    rxs.push(rx);
+                }
+                for rx in rxs {
+                    black_box(rx.recv().unwrap());
+                }
+            }
+        });
+        drop(job_tx);
+        worker.join().unwrap();
+        out
+    }
+    pub fn crossbeam() -> Vec<u64> {
+        let (job_tx, job_rx) = unbounded::<crossbeam_channel::Sender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                let _ = tx.send(black_box(1));
+            }
+        });
+        let out = measure(|| {
+            for _ in 0..(OPS / INFLIGHT) {
+                let mut rxs = Vec::with_capacity(INFLIGHT);
+                for _ in 0..INFLIGHT {
+                    let (tx, rx) = bounded::<u64>(1);
+                    job_tx.send(tx).unwrap();
+                    rxs.push(rx);
+                }
+                for rx in rxs {
+                    black_box(rx.recv().unwrap());
+                }
+            }
+        });
+        drop(job_tx);
+        worker.join().unwrap();
+        out
+    }
+}
+
+// ══════════════════════ TOKIO-RUNTIME BACKEND ══════════════════════
+// kit::OneShotAsync<Notify> vs tokio::sync::oneshot
+
+fn rt_current() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+}
+fn rt_multi() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
-        .unwrap();
-    for _ in 0..WARMUP {
-        let (tx, rx) = tokio::sync::oneshot::channel::<u64>();
-        let _ = tx.send(42);
-        let _ = rt.block_on(rx);
-    }
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let (tx, rx) = tokio::sync::oneshot::channel::<u64>();
-        let t0 = Instant::now();
-        let _ = tx.send(42);
-        let _ = rt.block_on(rx);
-        samples.push(t0.elapsed().as_nanos());
-    }
-    report("tokio::oneshot<u64>", &mut samples);
+        .unwrap()
 }
 
-fn a_pipe_kit() {
-    // Pipe is reusable, but to match the per-round allocation cost of the
-    // other primitives we create a fresh one each round.
-    for _ in 0..WARMUP {
-        let pipe: Pipe<u64> = Pipe::new();
-        pipe.send(42);
-        let _ = pipe.recv();
+mod tokio_single_serial {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        let rt = rt_current();
+        measure(|| {
+            rt.block_on(async {
+                for _ in 0..OPS {
+                    let (tx, rx) = OneShotAsync::<u64>::new();
+                    tx.send(1);
+                    black_box(rx.recv_async().await.unwrap());
+                }
+            });
+        })
     }
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let pipe: Pipe<u64> = Pipe::new();
-        let t0 = Instant::now();
-        pipe.send(42);
-        let _ = pipe.recv();
-        samples.push(t0.elapsed().as_nanos());
+    pub fn tokio() -> Vec<u64> {
+        let rt = rt_current();
+        measure(|| {
+            rt.block_on(async {
+                for _ in 0..OPS {
+                    let (tx, rx) = tokio_oneshot::channel::<u64>();
+                    let _ = tx.send(1);
+                    black_box(rx.await.unwrap());
+                }
+            });
+        })
     }
-    report("Pipe<u64> (kit, slot)", &mut samples);
 }
 
-// ─── B. Cross-thread, immediate release ───────────────────────────────────
+mod tokio_single_batch {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        let rt = rt_current();
+        measure(|| {
+            rt.block_on(async {
+                for _ in 0..(OPS / INFLIGHT) {
+                    let mut rxs = Vec::with_capacity(INFLIGHT);
+                    for _ in 0..INFLIGHT {
+                        let (tx, rx) = OneShotAsync::<u64>::new();
+                        tx.send(1);
+                        rxs.push(rx);
+                    }
+                    for rx in rxs {
+                        black_box(rx.recv_async().await.unwrap());
+                    }
+                }
+            });
+        })
+    }
+    pub fn tokio() -> Vec<u64> {
+        let rt = rt_current();
+        measure(|| {
+            rt.block_on(async {
+                for _ in 0..(OPS / INFLIGHT) {
+                    let mut rxs = Vec::with_capacity(INFLIGHT);
+                    for _ in 0..INFLIGHT {
+                        let (tx, rx) = tokio_oneshot::channel::<u64>();
+                        let _ = tx.send(1);
+                        rxs.push(rx);
+                    }
+                    for rx in rxs {
+                        black_box(rx.await.unwrap());
+                    }
+                }
+            });
+        })
+    }
+}
 
-fn b_one_signal() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = OneSignal::<ParkWaiter>::new();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            rx.bind();
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = rx.acquire();
-            t0.elapsed().as_nanos()
+mod tokio_cross_serial {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        let rt = rt_multi();
+        let (job_tx, job_rx) = unbounded::<OneShotAsyncSender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                tx.send(black_box(1));
+            }
         });
-        barrier.wait();
-        tx.release();
-        let dt = handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("OneSignal (kit)", &mut samples);
-}
-
-fn b_oneshot_kit() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = OneShot::<u64>::new();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            rx.bind(); // ← register thread for unpark
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = rx.recv();
-            t0.elapsed().as_nanos()
-        });
-        barrier.wait();
-        let _ = tx.send(42);
-        let dt = handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("OneShot<u64> (kit)", &mut samples);
-}
-
-fn b_oneshot_tokio() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = tokio::sync::oneshot::channel::<u64>();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = rt.block_on(rx);
-            t0.elapsed().as_nanos()
-        });
-        barrier.wait();
-        let _ = tx.send(42);
-        let dt = handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("tokio::oneshot<u64>", &mut samples);
-}
-
-fn b_pipe_kit() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let pipe = Arc::new(Pipe::<u64>::new());
-        let barrier = Arc::new(Barrier::new(2));
-        let p2 = pipe.clone();
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            p2.set_consumer(thread::current());
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = p2.recv();
-            t0.elapsed().as_nanos()
-        });
-        barrier.wait();
-        pipe.send(42);
-        let dt = handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("Pipe<u64> (kit, slot)", &mut samples);
-}
-
-// ─── C. Cross-thread, sender delays so receiver definitely parks ──────────
-//
-// The sender does ~50 µs of cheap work after the barrier before releasing.
-// 50 µs >> the 64 + 512 spin budget of any of these primitives, so the
-// receiver pays a full park/unpark syscall round-trip.
-
-#[inline(never)]
-fn busy_50us() {
-    let t0 = Instant::now();
-    let mut x: u64 = 0;
-    while t0.elapsed() < Duration::from_micros(50) {
-        x = x.wrapping_add(1);
-        std::hint::black_box(x);
-    }
-    std::hint::black_box(x);
-}
-
-fn c_one_signal() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = OneSignal::<ParkWaiter>::new();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            rx.bind();
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = rx.acquire();
-            t0.elapsed().as_nanos()
-        });
-        barrier.wait();
-        busy_50us();
-        let t_release = Instant::now();
-        tx.release();
-        let dt_full = handle.join().unwrap();
-        // Subtract the 50 µs busy work to isolate the wakeup cost.
-        let dt_wake = dt_full.saturating_sub(t_release.elapsed().as_nanos());
-        let _ = dt_wake;
-        if r >= WARMUP {
-            samples.push(dt_full);
-        }
-    }
-    report("OneSignal (kit, full RT)", &mut samples);
-}
-
-fn c_oneshot_kit() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = OneShot::<u64>::new();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            rx.bind(); // ← register thread for unpark
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = rx.recv();
-            t0.elapsed().as_nanos()
-        });
-        barrier.wait();
-        busy_50us();
-        let _ = tx.send(42);
-        let dt = handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("OneShot<u64> (kit, full RT)", &mut samples);
-}
-
-fn c_oneshot_tokio() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx, rx) = tokio::sync::oneshot::channel::<u64>();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = rt.block_on(rx);
-            t0.elapsed().as_nanos()
-        });
-        barrier.wait();
-        busy_50us();
-        let _ = tx.send(42);
-        let dt = handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("tokio::oneshot<u64> (full RT)", &mut samples);
-}
-
-fn c_pipe_kit() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let pipe = Arc::new(Pipe::<u64>::new());
-        let barrier = Arc::new(Barrier::new(2));
-        let p2 = pipe.clone();
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            p2.set_consumer(thread::current());
-            b2.wait();
-            let t0 = Instant::now();
-            let _ = p2.recv();
-            t0.elapsed().as_nanos()
-        });
-        barrier.wait();
-        busy_50us();
-        pipe.send(42);
-        let dt = handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("Pipe<u64> (kit, slot, full RT)", &mut samples);
-}
-
-// ─── D. Cross-thread, full ACK round-trip ─────────────────────────────────
-//
-// Two single-use primitives per round (request + ack). Producer starts
-// the timer, fires the request, blocks on ack, stops the timer when ack
-// returns. This is the apples-to-apples RT comparison: every primitive
-// pays one wake forward + one wake back, plus its own allocation cost ×2.
-//
-// Receiver releases ack immediately on wake (no busy work between);
-// p50 is dominated by 2× the wake-syscall round-trip.
-
-fn d_one_signal() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx_req, rx_req) = OneSignal::<ParkWaiter>::new();
-        let (tx_ack, rx_ack) = OneSignal::<ParkWaiter>::new();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            rx_req.bind();
-            b2.wait();
-            let _ = rx_req.acquire();
-            tx_ack.release();
-        });
-        rx_ack.bind();
-        barrier.wait();
-        let t0 = Instant::now();
-        tx_req.release();
-        let _ = rx_ack.acquire();
-        let dt = t0.elapsed().as_nanos();
-        handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("OneSignal (kit, RT w/ ack)", &mut samples);
-}
-
-fn d_oneshot_kit() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx_req, rx_req) = OneShot::<u64>::new();
-        let (tx_ack, rx_ack) = OneShot::<u64>::new();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            rx_req.bind();
-            b2.wait();
-            let _ = rx_req.recv();
-            let _ = tx_ack.send(7);
-        });
-        rx_ack.bind();
-        barrier.wait();
-        let t0 = Instant::now();
-        let _ = tx_req.send(42);
-        let _ = rx_ack.recv();
-        let dt = t0.elapsed().as_nanos();
-        handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
-    }
-    report("OneShot<u64> (kit, RT w/ ack)", &mut samples);
-}
-
-fn d_oneshot_tokio() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let (tx_req, rx_req) = tokio::sync::oneshot::channel::<u64>();
-        let (tx_ack, rx_ack) = tokio::sync::oneshot::channel::<u64>();
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            b2.wait();
-            rt.block_on(async move {
-                let _ = rx_req.await;
-                let _ = tx_ack.send(7);
+        let out = measure(|| {
+            rt.block_on(async {
+                for _ in 0..OPS {
+                    let (tx, rx) = OneShotAsync::<u64>::new();
+                    job_tx.send(tx).unwrap();
+                    black_box(rx.recv_async().await.unwrap());
+                }
             });
         });
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        barrier.wait();
-        let t0 = Instant::now();
-        let _ = tx_req.send(42);
-        rt.block_on(async move {
-            let _ = rx_ack.await;
-        });
-        let dt = t0.elapsed().as_nanos();
-        handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
+        drop(job_tx);
+        worker.join().unwrap();
+        out
     }
-    report("tokio::oneshot<u64> (RT w/ ack)", &mut samples);
+    pub fn tokio() -> Vec<u64> {
+        let rt = rt_multi();
+        let (job_tx, job_rx) = unbounded::<tokio_oneshot::Sender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                let _ = tx.send(black_box(1));
+            }
+        });
+        let out = measure(|| {
+            rt.block_on(async {
+                for _ in 0..OPS {
+                    let (tx, rx) = tokio_oneshot::channel::<u64>();
+                    job_tx.send(tx).unwrap();
+                    black_box(rx.await.unwrap());
+                }
+            });
+        });
+        drop(job_tx);
+        worker.join().unwrap();
+        out
+    }
 }
 
-fn d_pipe_kit() {
-    let mut samples = Vec::with_capacity(ROUNDS);
-    for r in 0..(WARMUP + ROUNDS) {
-        let pipe_req = Arc::new(Pipe::<u64>::new());
-        let pipe_ack = Arc::new(Pipe::<u64>::new());
-        let barrier = Arc::new(Barrier::new(2));
-        let pr2 = pipe_req.clone();
-        let pa2 = pipe_ack.clone();
-        let b2 = barrier.clone();
-        let handle = thread::spawn(move || {
-            pr2.set_consumer(thread::current());
-            b2.wait();
-            let _ = pr2.recv();
-            pa2.send(7);
+mod tokio_cross_batch {
+    use super::*;
+    pub fn kit() -> Vec<u64> {
+        let rt = rt_multi();
+        let (job_tx, job_rx) = unbounded::<OneShotAsyncSender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                tx.send(black_box(1));
+            }
         });
-        pipe_ack.set_consumer(thread::current());
-        barrier.wait();
-        let t0 = Instant::now();
-        pipe_req.send(42);
-        let _ = pipe_ack.recv();
-        let dt = t0.elapsed().as_nanos();
-        handle.join().unwrap();
-        if r >= WARMUP {
-            samples.push(dt);
-        }
+        let out = measure(|| {
+            rt.block_on(async {
+                for _ in 0..(OPS / INFLIGHT) {
+                    let mut rxs = Vec::with_capacity(INFLIGHT);
+                    for _ in 0..INFLIGHT {
+                        let (tx, rx) = OneShotAsync::<u64>::new();
+                        job_tx.send(tx).unwrap();
+                        rxs.push(rx);
+                    }
+                    for rx in rxs {
+                        black_box(rx.recv_async().await.unwrap());
+                    }
+                }
+            });
+        });
+        drop(job_tx);
+        worker.join().unwrap();
+        out
     }
-    report("Pipe<u64> (kit, slot, RT w/ ack)", &mut samples);
+    pub fn tokio() -> Vec<u64> {
+        let rt = rt_multi();
+        let (job_tx, job_rx) = unbounded::<tokio_oneshot::Sender<u64>>();
+        let worker = thread::spawn(move || {
+            while let Ok(tx) = job_rx.recv() {
+                let _ = tx.send(black_box(1));
+            }
+        });
+        let out = measure(|| {
+            rt.block_on(async {
+                for _ in 0..(OPS / INFLIGHT) {
+                    let mut rxs = Vec::with_capacity(INFLIGHT);
+                    for _ in 0..INFLIGHT {
+                        let (tx, rx) = tokio_oneshot::channel::<u64>();
+                        rxs.push(rx);
+                        job_tx.send(tx).unwrap();
+                    }
+                    for rx in rxs {
+                        black_box(rx.await.unwrap());
+                    }
+                }
+            });
+        });
+        drop(job_tx);
+        worker.join().unwrap();
+        out
+    }
 }
-
-// ─── Driver ───────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("=== arbitro-kit oneshot head-to-head ===");
-    println!("rounds={ROUNDS} (+ {WARMUP} warmup)");
+    println!(
+        "oneshot factorial — OPS={OPS}/sample, INFLIGHT={INFLIGHT}, rounds={}",
+        rounds()
+    );
 
-    header("A. Same-thread, already-released (pure fast path)");
-    a_one_signal();
-    a_oneshot_kit();
-    a_pipe_kit();
-    a_oneshot_tokio();
+    println!("\n═══════════ OS-THREAD backend (kit::OneShot<Park> vs crossbeam::bounded(1)) ═══════════");
 
-    header("B. Cross-thread, immediate release (likely caught in spin)");
-    b_one_signal();
-    b_oneshot_tokio();
-    b_oneshot_kit();
-    b_pipe_kit();
+    header("os · single-thread · serial");
+    row("kit::OneShot<Park>", os_single_serial::kit());
+    row("crossbeam::bounded(1)", os_single_serial::crossbeam());
 
-    header("C. Cross-thread, ~50 µs sender delay (receiver definitely parks; full RT incl. delay)");
-    c_one_signal();
-    c_oneshot_tokio();
-    c_oneshot_kit();
-    c_pipe_kit();
+    header("os · single-thread · batch(64)");
+    row("kit::OneShot<Park>", os_single_batch::kit());
+    row("crossbeam::bounded(1)", os_single_batch::crossbeam());
 
-    header("D. Cross-thread, full ACK round-trip (request + ack-back, no delay)");
-    d_one_signal();
-    d_oneshot_tokio();
-    d_oneshot_kit();
-    d_pipe_kit();
+    header("os · cross-thread · serial");
+    row("kit::OneShot<Park>", os_cross_serial::kit());
+    row("crossbeam::bounded(1)", os_cross_serial::crossbeam());
+
+    header("os · cross-thread · batch(64)");
+    row("kit::OneShot<Park>", os_cross_batch::kit());
+    row("crossbeam::bounded(1)", os_cross_batch::crossbeam());
+
+    println!("\n═══════════ TOKIO-RUNTIME backend (kit::OneShotAsync<Notify> vs tokio::oneshot) ═══════════");
+
+    header("tokio · single-thread · serial");
+    row("kit::OneShotAsync<Notify>", tokio_single_serial::kit());
+    row("tokio::oneshot", tokio_single_serial::tokio());
+
+    header("tokio · single-thread · batch(64)");
+    row("kit::OneShotAsync<Notify>", tokio_single_batch::kit());
+    row("tokio::oneshot", tokio_single_batch::tokio());
+
+    header("tokio · cross-thread · serial");
+    row("kit::OneShotAsync<Notify>", tokio_cross_serial::kit());
+    row("tokio::oneshot", tokio_cross_serial::tokio());
+
+    header("tokio · cross-thread · batch(64)");
+    row("kit::OneShotAsync<Notify>", tokio_cross_batch::kit());
+    row("tokio::oneshot", tokio_cross_batch::tokio());
 
     println!("\nDone.");
 }

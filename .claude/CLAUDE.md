@@ -68,26 +68,30 @@ first (`Text file busy` otherwise).
 
 ## Architecture context (current state — update when major changes ship)
 
-arbitro-kit ships zero-dep synchronization primitives. Topology map:
+arbitro-kit ships zero-dep synchronization primitives. The surface was pruned
+to only what the arbitro server/client actually use plus two kept-on-purpose
+extras (see AUDIT.md). Topology map:
 
 ```
-Pipe        — 1:1 named slot (Signal + slot)
-Channel     — 1:1 RPC (req/resp pipe pair, fixed 1-slot)
-Hub         — N:1 named ports (SignalSet bitmap + per-port slots + per-port reply Pipe)
-Mpmc        — M:N anonymous (Vyukov-style sharded rings, per-(P,S) SPSC)
-Ring        — SPSC bounded
-Signal/SignalSet — primitives the rest are built on
-Park        — stateless park/unpark (cursor-state primitive, used by Ring/Mpmc)
+Ring        — SPSC bounded (canonical; split !Clone/!Sync handles)   [server: drain events]
+Mpsc        — M:1 fan-in on per-producer SPSC Rings + Vyukov gate    [server: NotifyRing]
+Mpmc        — M:N anonymous (sharded per-(P,S) SPSC rings, stealing)  [kept — not yet consumed]
+OneShot     — single value, once (1:1)                                [kept + client: pending]
+SignalSet   — bitmap of ≤64 binary signals → 1 consumer              [common: gate]
+Park/Notify/Noop — the Waiter backends (park/unpark · tokio · poll)  [injected into all above]
 ```
+
+Removed in the prune (were unused by server/client): `Pipe`, `Channel`, `Hub`,
+`OneSignal`, `Lifeline`, `Stream`, `Duplex`, `signal_packed`/`signal_states`.
+`route::Shutdown` (the shutdown-return marker used by Mpsc/Mpmc) now lives in
+`route/mod.rs`, not `hub.rs`.
 
 ### Picking a primitive (rules of thumb — run the bench for actual numbers)
 
-- **SPSC bounded** → `Ring`. Beats `crossbeam_channel::bounded` under real
-  backpressure (apples-to-apples bench: `benches/ring_vs_crossbeam.rs`).
-- **N:1 fan-in, named ports, fairness, low N (≤8)** → `Hub`.
-- **N:1 fan-in, high throughput, anonymous, N≥4** → `Mpmc`. Beats both
-  Hub and crossbeam at scale (bench: `benches/fanin_h2h.rs`).
-- **1:1 RPC** → `Channel`. **1:1 named slot** → `Pipe`.
+- **SPSC bounded** → `Ring`.
+- **M:1 fan-in** → `Mpsc`.
+- **M:N anonymous, high throughput** → `Mpmc`.
+- **single value once** → `OneShot`. **N binary signals → 1 consumer** → `SignalSet`.
 
 When in doubt, run `benches/<name>.rs` and read the actual numbers. Do not
 quote stale numbers from memory.

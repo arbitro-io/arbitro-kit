@@ -17,12 +17,10 @@
 //! - [`OneShot<T, W>`] — single-use 1:1 reply slot, sender consumes self
 //!   on send, receiver consumes self on recv.
 
-mod hub;
 mod mpmc;
 mod mpsc;
 mod oneshot;
 
-pub use hub::{Hub, HubDrain, HubPort, HubReply, HubShutdown, Shutdown, MAX_HUB_PORTS};
 pub use mpmc::{Mpmc, MpmcConsumer, MpmcProducer, MpmcShutdown, MAX_MPMC_PRODUCERS};
 pub use mpsc::{
     Mpsc, MpscConsumer, MpscProducer, MpscProducerLease, MpscProducerPool, MpscShutdown,
@@ -31,6 +29,11 @@ pub use mpsc::{
 pub use oneshot::{
     Closed as OneShotClosed, OneShot, Receiver as OneShotReceiver, Sender as OneShotSender,
 };
+
+/// Returned by blocking send/drain ops when a shutdown has been signalled.
+/// Callers should break out of their loop.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Shutdown;
 
 #[cfg(feature = "tokio")]
 use crate::waiter::NotifyWaiter;
@@ -43,9 +46,6 @@ pub type OneShotAsyncSender<T> = OneShotSender<T, NotifyWaiter>;
 pub type OneShotAsyncReceiver<T> = OneShotReceiver<T, NotifyWaiter>;
 #[cfg(feature = "tokio")]
 pub use oneshot::Closed as OneShotAsyncClosed;
-
-#[cfg(feature = "tokio")]
-pub type HubAsync<In, Out> = Hub<In, Out, NotifyWaiter>;
 
 #[cfg(feature = "tokio")]
 pub type MpmcAsync<T, const CAP: usize = 64> = Mpmc<T, CAP, NotifyWaiter>;

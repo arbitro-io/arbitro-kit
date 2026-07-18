@@ -8,7 +8,7 @@ use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::route::hub::Shutdown;
+use crate::route::Shutdown;
 use crate::stream::{Consumer, Producer, Ring, TryRecvError, TrySendError};
 use crate::waiter::{BlockingWaiter, NoopWaiter, ParkWaiter, Waiter};
 

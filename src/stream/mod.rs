@@ -27,21 +27,6 @@
 //! - Any thread may hold a [`Receipt`] and call `is_delivered` /
 //!   `wait_delivered` (Stream-only).
 
-mod buffered;
-mod duplex;
-mod receipt;
-mod recv;
 mod ring;
-mod segment;
-mod send;
-#[allow(clippy::module_inception)]
-mod stream;
 
-#[cfg(test)]
-mod tests;
-
-pub use buffered::BufferedSender;
-pub use duplex::{Duplex, DuplexEnd};
-pub use receipt::Receipt;
 pub use ring::{Consumer, Producer, Ring, TryRecvError, TrySendError};
-pub use stream::Stream;

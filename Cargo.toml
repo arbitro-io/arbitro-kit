@@ -2,6 +2,9 @@
 name = "arbitro-kit"
 version = "0.1.0"
 edition = "2021"
+# rustc 1.92 floor: `route::oneshot::recv_async` returns a concrete, unboxed
+# `impl Future` that relies on the rust#100013 fix landed in 1.92.
+rust-version = "1.92"
 license = "MIT"
 description = "Zero-dependency synchronization and utility primitives from the Arbitro ecosystem."
 readme = "README.md"
@@ -43,22 +46,6 @@ loom = "0.7"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [[bench]]
-name = "gate_overhead"
-harness = false
-
-[[bench]]
-name = "channel_overhead"
-harness = false
-
-[[bench]]
-name = "pipe_overhead"
-harness = false
-
-[[bench]]
-name = "hub_overhead"
-harness = false
-
-[[bench]]
 name = "mpmc_overhead"
 harness = false
 
@@ -67,19 +54,12 @@ name = "mpsc_overhead"
 harness = false
 
 [[bench]]
-name = "duplex_overhead"
+name = "mem_ring_batched"
 harness = false
-
-[[bench]]
-name = "lifeline_overhead"
-harness = false
+required-features = ["tokio"]
 
 [[bench]]
 name = "oneshot_h2h"
-harness = false
-
-[[bench]]
-name = "mem_ring_batched"
 harness = false
 required-features = ["tokio"]
 

@@ -1,5 +1,23 @@
-//! In-memory SPSC head-to-head with batching:
+//! SPSC Ring head-to-head — kit::Ring vs crossbeam / tokio, batched x36.
+//!
 //! Shuttles batches of 36 messages per queue slot to amortize sync overhead.
+//! Three scenarios cover both wake backends the Ring ships, matching the
+//! oneshot_h2h layout:
+//!   A. Single thread — same-thread push → pop (uncontended ring mechanics,
+//!      no cross-core sync). kit::Ring<Park> vs crossbeam::bounded.
+//!   B. Cross-thread — OS thread. Producer + consumer on two OS threads;
+//!      the real park/unpark path. kit::Ring<ParkWaiter> vs crossbeam::bounded.
+//!   C. Cross-thread — tokio runtime. Producer + consumer as tokio tasks;
+//!      the notify→task path. kit::Ring<NotifyWaiter> vs tokio::sync::mpsc.
+//!
+//! Integrity: the consumer sums every message it receives and the result is
+//! asserted against the closed-form expected sum. A lost or corrupted message
+//! panics the bench — so the throughput numbers are proven to move every byte
+//! intact, not just touch a black_box. The assert also blocks dead-code
+//! elision of the payload.
+//!
+//! Conforms to bench_safety: bounded N, one at a time, tee log expected,
+//! no background work.
 
 use std::time::Instant;
 
@@ -12,9 +30,29 @@ const BATCH_SIZE: usize = 36;
 type Msg = usize;
 type Batch = [Msg; BATCH_SIZE];
 
-fn header() {
+const N_BATCHES: usize = N / BATCH_SIZE;
+
+#[inline]
+fn make_batch(i: usize) -> Batch {
+    let mut batch = [0usize; BATCH_SIZE];
+    for (j, slot) in batch.iter_mut().enumerate() {
+        *slot = (i * BATCH_SIZE + j) as Msg;
+    }
+    batch
+}
+
+/// Closed-form sum of every value produced across all batches:
+/// value(i,j) = i*36 + j, for i in 0..N_BATCHES, j in 0..36.
+/// per-batch sum = 1296*i + 630 ⇒ total = 1296*Σi + 630*nb.
+fn expected_sum() -> u64 {
+    let nb = N_BATCHES as u64;
+    1296 * ((nb - 1) * nb / 2) + 630 * nb
+}
+
+fn header(title: &str) {
+    println!("\n── {} ──", title);
     println!(
-        "\n{:<32} {:>12} {:>12} {:>12} {:>14}",
+        "{:<32} {:>12} {:>12} {:>12} {:>14}",
         "impl (batched x36)", "min ns/msg", "p50 ns/msg", "p99 ns/msg", "msgs/sec (p50)"
     );
     println!("{}", "─".repeat(86));
@@ -36,163 +74,6 @@ fn row(name: &str, mut samples_ns_per_msg: Vec<f64>) {
     );
 }
 
-// ── tokio mpsc (baseline) ─────────────────────────────────────────────
-mod tokio_batched_impl {
-    use super::{Batch, Msg, BATCH_SIZE, CAP, N};
-    use std::time::Instant;
-    use tokio::sync::mpsc;
-
-    pub fn run() -> f64 {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let (tx, mut rx) = mpsc::channel::<Batch>(CAP);
-            let n_batches = N / BATCH_SIZE;
-            let t0 = Instant::now();
-            let consumer = tokio::spawn(async move {
-                while let Some(batch) = rx.recv().await {
-                    for m in batch {
-                        std::hint::black_box(m);
-                    }
-                }
-            });
-            for i in 0..n_batches {
-                let mut batch = [0usize; BATCH_SIZE];
-                for j in 0..BATCH_SIZE {
-                    batch[j] = (i * BATCH_SIZE + j) as Msg;
-                }
-                tx.send(batch).await.unwrap();
-            }
-            drop(tx);
-            consumer.await.unwrap();
-            let ns = t0.elapsed().as_nanos() as f64;
-            ns / (n_batches * BATCH_SIZE) as f64
-        })
-    }
-}
-
-// ── kit Ring (thread, ParkWaiter) ─────────────────────────────────────
-mod kit_ring_thread {
-    use super::{Batch, Msg, BATCH_SIZE, CAP, N};
-    use arbitro_kit::stream::Ring;
-    use std::thread;
-    use std::time::Instant;
-
-    pub fn run() -> f64 {
-        let (mut tx, mut rx) = Ring::<Batch, CAP>::new();
-        let n_batches = N / BATCH_SIZE;
-
-        let consumer = thread::spawn(move || {
-            for _ in 0..n_batches {
-                let batch = rx.recv().unwrap();
-                for m in batch {
-                    std::hint::black_box(m);
-                }
-            }
-        });
-
-        thread::yield_now();
-        let t0 = Instant::now();
-        for i in 0..n_batches {
-            let mut batch = [0usize; BATCH_SIZE];
-            for j in 0..BATCH_SIZE {
-                batch[j] = (i * BATCH_SIZE + j) as Msg;
-            }
-            tx.send(batch).unwrap();
-        }
-        consumer.join().unwrap();
-        let ns = t0.elapsed().as_nanos() as f64;
-        ns / (n_batches * BATCH_SIZE) as f64
-    }
-}
-
-// ── kit Ring (tokio, NotifyWaiter) ────────────────────────────────────
-mod kit_ring_tokio {
-    use super::{Batch, Msg, BATCH_SIZE, CAP, N};
-    use arbitro_kit::stream::Ring;
-    use arbitro_kit::waiter::NotifyWaiter;
-    use std::time::Instant;
-
-    pub fn run() -> f64 {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let (mut tx, mut rx) = Ring::<Batch, CAP, NotifyWaiter>::new();
-            let n_batches = N / BATCH_SIZE;
-            let t0 = Instant::now();
-            let producer = async {
-                for i in 0..n_batches {
-                    let mut batch = [0usize; BATCH_SIZE];
-                    for j in 0..BATCH_SIZE {
-                        batch[j] = (i * BATCH_SIZE + j) as Msg;
-                    }
-                    tx.send_async(batch).await.unwrap();
-                }
-            };
-            let consumer = async {
-                for _ in 0..n_batches {
-                    let batch = rx.recv_async().await.unwrap();
-                    for m in batch {
-                        std::hint::black_box(m);
-                    }
-                }
-            };
-            tokio::join!(producer, consumer);
-            let ns = t0.elapsed().as_nanos() as f64;
-            ns / (n_batches * BATCH_SIZE) as f64
-        })
-    }
-}
-
-mod kit_mpsc_async_tokio {
-    use super::{Batch, Msg, BATCH_SIZE, CAP, N};
-    use arbitro_kit::route::MpscAsync;
-    use std::time::Instant;
-
-    pub fn run() -> f64 {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let (mut producers, mut consumer, _sd) =
-                MpscAsync::<Batch, CAP>::new(1);
-            let mut producer = producers.remove(0);
-            producer.bind();
-            consumer.bind();
-            let n_batches = N / BATCH_SIZE;
-            let t0 = Instant::now();
-            let producer_task = async {
-                for i in 0..n_batches {
-                    let mut batch = [0usize; BATCH_SIZE];
-                    for j in 0..BATCH_SIZE {
-                        batch[j] = (i * BATCH_SIZE + j) as Msg;
-                    }
-                    producer.send_async(batch).await;
-                }
-            };
-            let consumer_task = async {
-                for _ in 0..n_batches {
-                    let batch = consumer.recv_async().await.unwrap();
-                    for m in batch {
-                        std::hint::black_box(m);
-                    }
-                }
-            };
-            tokio::join!(producer_task, consumer_task);
-            let ns = t0.elapsed().as_nanos() as f64;
-            ns / (n_batches * BATCH_SIZE) as f64
-        })
-    }
-}
-
 fn measure<F: FnMut() -> f64>(mut f: F) -> Vec<f64> {
     for _ in 0..WARMUP {
         let _ = f();
@@ -200,9 +81,168 @@ fn measure<F: FnMut() -> f64>(mut f: F) -> Vec<f64> {
     (0..ROUNDS).map(|_| f()).collect()
 }
 
+#[inline]
+fn ns_per_msg(elapsed: std::time::Duration) -> f64 {
+    elapsed.as_nanos() as f64 / (N_BATCHES * BATCH_SIZE) as f64
+}
+
+// ── A. Single thread (same-thread push → pop) ─────────────────────────────
+mod single {
+    use super::*;
+    use arbitro_kit::stream::Ring;
+    use crossbeam_channel::bounded;
+
+    pub fn kit_ring() -> f64 {
+        let (mut tx, mut rx) = Ring::<Batch, CAP>::new();
+        let mut recv: u64 = 0;
+        let t0 = Instant::now();
+        for i in 0..N_BATCHES {
+            tx.send(make_batch(i)).unwrap();
+            for m in rx.recv().unwrap() {
+                recv += m as u64;
+            }
+        }
+        let e = ns_per_msg(t0.elapsed());
+        assert_eq!(recv, expected_sum(), "kit::Ring single: integrity");
+        e
+    }
+
+    pub fn crossbeam() -> f64 {
+        let (tx, rx) = bounded::<Batch>(CAP);
+        let mut recv: u64 = 0;
+        let t0 = Instant::now();
+        for i in 0..N_BATCHES {
+            tx.send(make_batch(i)).unwrap();
+            for m in rx.recv().unwrap() {
+                recv += m as u64;
+            }
+        }
+        let e = ns_per_msg(t0.elapsed());
+        assert_eq!(recv, expected_sum(), "crossbeam single: integrity");
+        e
+    }
+}
+
+// ── B. Cross-thread — OS thread ───────────────────────────────────────────
+mod cross_os {
+    use super::*;
+    use arbitro_kit::stream::Ring;
+    use crossbeam_channel::bounded;
+    use std::thread;
+
+    pub fn kit_ring() -> f64 {
+        let (mut tx, mut rx) = Ring::<Batch, CAP>::new();
+        let consumer = thread::spawn(move || {
+            let mut recv: u64 = 0;
+            for _ in 0..N_BATCHES {
+                for m in rx.recv().unwrap() {
+                    recv += m as u64;
+                }
+            }
+            recv
+        });
+        thread::yield_now();
+        let t0 = Instant::now();
+        for i in 0..N_BATCHES {
+            tx.send(make_batch(i)).unwrap();
+        }
+        let recv = consumer.join().unwrap();
+        let e = ns_per_msg(t0.elapsed());
+        assert_eq!(recv, expected_sum(), "kit::Ring cross-os: integrity");
+        e
+    }
+
+    pub fn crossbeam() -> f64 {
+        let (tx, rx) = bounded::<Batch>(CAP);
+        let consumer = thread::spawn(move || {
+            let mut recv: u64 = 0;
+            for _ in 0..N_BATCHES {
+                for m in rx.recv().unwrap() {
+                    recv += m as u64;
+                }
+            }
+            recv
+        });
+        thread::yield_now();
+        let t0 = Instant::now();
+        for i in 0..N_BATCHES {
+            tx.send(make_batch(i)).unwrap();
+        }
+        let recv = consumer.join().unwrap();
+        let e = ns_per_msg(t0.elapsed());
+        assert_eq!(recv, expected_sum(), "crossbeam cross-os: integrity");
+        e
+    }
+}
+
+// ── C. Cross-thread — tokio runtime ───────────────────────────────────────
+mod cross_tokio {
+    use super::*;
+    use arbitro_kit::stream::Ring;
+    use arbitro_kit::waiter::NotifyWaiter;
+    use tokio::sync::mpsc;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    pub fn kit_ring() -> f64 {
+        rt().block_on(async {
+            let (mut tx, mut rx) = Ring::<Batch, CAP, NotifyWaiter>::new();
+            let t0 = Instant::now();
+            let producer = async {
+                for i in 0..N_BATCHES {
+                    tx.send_async(make_batch(i)).await.unwrap();
+                }
+            };
+            let consumer = async {
+                let mut recv: u64 = 0;
+                for _ in 0..N_BATCHES {
+                    for m in rx.recv_async().await.unwrap() {
+                        recv += m as u64;
+                    }
+                }
+                recv
+            };
+            let (_, recv) = tokio::join!(producer, consumer);
+            let e = ns_per_msg(t0.elapsed());
+            assert_eq!(recv, expected_sum(), "kit::Ring cross-tokio: integrity");
+            e
+        })
+    }
+
+    pub fn tokio_mpsc() -> f64 {
+        rt().block_on(async {
+            let (tx, mut rx) = mpsc::channel::<Batch>(CAP);
+            let t0 = Instant::now();
+            let consumer = tokio::spawn(async move {
+                let mut recv: u64 = 0;
+                while let Some(batch) = rx.recv().await {
+                    for m in batch {
+                        recv += m as u64;
+                    }
+                }
+                recv
+            });
+            for i in 0..N_BATCHES {
+                tx.send(make_batch(i)).await.unwrap();
+            }
+            drop(tx);
+            let recv = consumer.await.unwrap();
+            let e = ns_per_msg(t0.elapsed());
+            assert_eq!(recv, expected_sum(), "tokio::mpsc cross-tokio: integrity");
+            e
+        })
+    }
+}
+
 fn main() {
     println!(
-        "In-memory batched (x{}) (N={} msgs, CAP={}, batch={} B, warmup={}, rounds={})",
+        "SPSC Ring batched (x{}) (N={} msgs, CAP={}, batch={} B, warmup={}, rounds={})",
         BATCH_SIZE,
         N,
         CAP,
@@ -210,10 +250,22 @@ fn main() {
         WARMUP,
         ROUNDS
     );
-    header();
-    row("tokio mpsc [batched]", measure(tokio_batched_impl::run));
-    row("kit Ring (thread) [batched]", measure(kit_ring_thread::run));
-    row("kit Ring (tokio) [batched]", measure(kit_ring_tokio::run));
-    row("kit MpscAsync (tokio) [batched]", measure(kit_mpsc_async_tokio::run));
-    println!("Done.");
+    println!(
+        "integrity: consumer checksum asserted == {} (panics on any loss/corruption)",
+        expected_sum()
+    );
+
+    header("A. Single thread (push → pop, uncontended)");
+    row("kit::Ring<Park>", measure(single::kit_ring));
+    row("crossbeam::bounded", measure(single::crossbeam));
+
+    header("B. Cross-thread — OS thread (park/unpark)");
+    row("kit::Ring<Park>", measure(cross_os::kit_ring));
+    row("crossbeam::bounded", measure(cross_os::crossbeam));
+
+    header("C. Cross-thread — tokio runtime (notify→task)");
+    row("kit::Ring<Notify>", measure(cross_tokio::kit_ring));
+    row("tokio::mpsc", measure(cross_tokio::tokio_mpsc));
+
+    println!("\nDone — all integrity asserts passed.");
 }

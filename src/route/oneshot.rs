@@ -70,15 +70,16 @@ pub struct Closed;
 #[repr(C, align(64))]
 struct Inner<T: Send, W: Waiter> {
     /// State machine: EMPTY / FULL / CLOSED / TAKEN / RX_DROPPED.
+    /// Ordered adjacent to `slot` so `send`'s slot-write + state-store
+    /// touch a single cache line (`state` + a small `slot` share L0).
     state: AtomicU8,
-    /// Wait/wake backend. The trait is generic — `ParkWaiter` for sync
-    /// OS-thread, `NotifyWaiter` for tokio, future impls for io_uring.
-    waiter: W,
     /// Slot storage. Written once by the sender on `send`; read once by
     /// the receiver on a successful FULL→TAKEN CAS. Drop of `Inner`
     /// runs `assume_init_drop` if `state == FULL` (no one read it).
     slot: UnsafeCell<MaybeUninit<T>>,
-    _marker: PhantomData<fn() -> T>,
+    /// Wait/wake backend. The trait is generic — `ParkWaiter` for sync
+    /// OS-thread, `NotifyWaiter` for tokio, future impls for io_uring.
+    waiter: W,
 }
 
 // Safety: the slot is accessed only after the state machine grants
@@ -117,14 +118,12 @@ impl<T: Send, W: Waiter> OneShot<T, W> {
     pub fn new() -> (Sender<T, W>, Receiver<T, W>) {
         let inner = Arc::new(Inner {
             state: AtomicU8::new(STATE_EMPTY),
-            waiter: W::default(),
             slot: UnsafeCell::new(MaybeUninit::uninit()),
-            _marker: PhantomData,
+            waiter: W::default(),
         });
         (
             Sender {
                 inner: inner.clone(),
-                sent: false,
             },
             Receiver { inner },
         )
@@ -134,39 +133,61 @@ impl<T: Send, W: Waiter> OneShot<T, W> {
 /// Producer half. Fires exactly one value or drops without firing.
 pub struct Sender<T: Send, W: Waiter = ParkWaiter> {
     inner: Arc<Inner<T, W>>,
-    sent: bool,
 }
 
 impl<T: Send, W: Waiter> Sender<T, W> {
     /// Deliver the value. Consumes `self`. Wakes the receiver via
     /// `W::wake` if it had announced parking.
     #[inline]
-    pub fn send(mut self, value: T) {
-        // Receiver already gone: skip the write/store/wake entirely.
-        if self.inner.state.load(Ordering::Relaxed) == STATE_RX_DROPPED {
+    pub fn send(self, value: T) {
+        // Move `inner` out and suppress `Sender::Drop`: a completed send
+        // is not an "unsent drop", so the CLOSED marking Drop performs must
+        // not fire. Dropping the `sent` bool this way removes a flag store
+        // and a Drop-glue branch from the hot send path. Safety: `Sender`'s
+        // only non-ZST field is `inner: Arc<Inner>`; `ptr::read` moves it
+        // with no refcount change; the moved `inner` drops normally at the
+        // end of this call. Mirrors the `recv`/`recv_async` pattern.
+        let this = std::mem::ManuallyDrop::new(self);
+        let inner = unsafe { std::ptr::read(&this.inner) };
+
+        // Receiver already gone: skip the write/store/wake entirely. The
+        // Relaxed load is a best-effort skip — correctness never depends on
+        // it observing RX_DROPPED (see the Drop-safety proof below): if it
+        // reads a stale EMPTY, the value is written and published FULL, and
+        // `Inner::Drop` reclaims it exactly once via its FULL arm.
+        if inner.state.load(Ordering::Relaxed) == STATE_RX_DROPPED {
             drop(value);
-            self.sent = true;
             return;
         }
         // Safety: state is EMPTY (we are the only sender, no concurrent
         // writer to the slot exists yet); Release store on state makes
         // the slot's contents visible to the receiver's Acquire CAS.
         unsafe {
-            (*self.inner.slot.get()).write(value);
+            (*inner.slot.get()).write(value);
         }
-        self.inner.state.store(STATE_FULL, Ordering::Release);
-        self.sent = true;
-        self.inner.waiter.wake();
+        inner.state.store(STATE_FULL, Ordering::Release);
+        inner.waiter.wake();
     }
 }
 
 impl<T: Send, W: Waiter> Drop for Sender<T, W> {
     fn drop(&mut self) {
-        if !self.sent {
-            // Mark closed BEFORE waking. Release pairs with the
-            // receiver's Acquire CAS; the wake() call observes the
-            // state change.
-            self.inner.state.store(STATE_CLOSED, Ordering::Release);
+        // Reached only on an unsent drop (`send` suppresses this via
+        // ManuallyDrop). CAS EMPTY→CLOSED and wake only on success: if the
+        // receiver already marked RX_DROPPED the CAS fails and there is
+        // nothing to wake. Release pairs with the receiver's Acquire CAS;
+        // the wake() observes the state change.
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                STATE_EMPTY,
+                STATE_CLOSED,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             self.inner.waiter.wake();
         }
     }
@@ -215,37 +236,37 @@ impl<T: Send, W: Waiter> Receiver<T, W> {
     /// happened yet.
     #[inline]
     pub fn try_recv(&self) -> Result<Option<T>, Closed> {
-        match self.try_take() {
+        match try_take_inner(&self.inner) {
             Some(Ok(v)) => Ok(Some(v)),
             Some(Err(Closed)) => Err(Closed),
             None => Ok(None),
         }
     }
+}
 
-    /// Internal: attempt a state-machine transition that takes the slot
-    /// or observes closure. Returns:
-    ///   - `Some(Ok(v))`  → `FULL` → `TAKEN`, value extracted.
-    ///   - `Some(Err(C))` → `CLOSED` or already `TAKEN`.
-    ///   - `None`         → `EMPTY` (still pending).
-    #[inline]
-    fn try_take(&self) -> Option<Result<T, Closed>> {
-        match self.inner.state.compare_exchange(
-            STATE_FULL,
-            STATE_TAKEN,
-            Ordering::Acquire,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // Safety: we transitioned FULL → TAKEN; no one else
-                // can read or write the slot now. The sender wrote the
-                // value before storing FULL with Release; our Acquire
-                // CAS synchronizes-with that store.
-                let v = unsafe { (*self.inner.slot.get()).assume_init_read() };
-                Some(Ok(v))
-            }
-            Err(STATE_CLOSED) | Err(STATE_TAKEN) => Some(Err(Closed)),
-            Err(_) => None, // STATE_EMPTY — still pending
+/// Attempt a state-machine transition that takes the slot or observes
+/// closure. Shared by the sync and async recv paths (one implementation,
+/// one `unsafe` block). Returns:
+///   - `Some(Ok(v))`  → `FULL` → `TAKEN`, value extracted.
+///   - `Some(Err(C))` → `CLOSED` or already `TAKEN`.
+///   - `None`         → `EMPTY` (still pending).
+#[inline]
+fn try_take_inner<T: Send, W: Waiter>(inner: &Inner<T, W>) -> Option<Result<T, Closed>> {
+    match inner.state.compare_exchange(
+        STATE_FULL,
+        STATE_TAKEN,
+        Ordering::Acquire,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // Safety: we transitioned FULL → TAKEN; no one else can read or
+            // write the slot now. The sender wrote the value before storing
+            // FULL with Release; our Acquire CAS synchronizes-with that store.
+            let v = unsafe { (*inner.slot.get()).assume_init_read() };
+            Some(Ok(v))
         }
+        Err(STATE_CLOSED) | Err(STATE_TAKEN) => Some(Err(Closed)),
+        Err(_) => None, // STATE_EMPTY — still pending
     }
 }
 
@@ -255,17 +276,36 @@ impl<T: Send, W: BlockingWaiter> Receiver<T, W> {
     /// Block until a value is delivered or the [`Sender`] is dropped.
     /// Consumes `self`.
     ///
-    /// # Panics
-    /// If `bind` was never called (sync waiters only), the underlying
-    /// waiter's `wait_until` panics rather than deadlock silently.
+    /// Self-registers the calling thread if no worker was set — an explicit
+    /// [`bind`](Self::bind) is optional (hoist it out of a recv loop to save
+    /// the per-call registration). An externally registered worker (via
+    /// [`waiter`](Self::waiter)) is never overwritten.
     #[inline]
     pub fn recv(self) -> Result<T, Closed> {
-        self.inner
+        // Move `inner` out and suppress `Receiver::Drop`: recv executes the
+        // wait, it does not abandon it, so the EMPTY→RX_DROPPED marking Drop
+        // performs is both wrong here and a wasted locked CAS on every
+        // completed recv. Safety: `Receiver`'s only non-ZST field is
+        // `inner: Arc<Inner>`; `ptr::read` moves it with no refcount change;
+        // ManuallyDrop suppresses the now-unwanted Drop. Mirrors `recv_async`.
+        let this = std::mem::ManuallyDrop::new(self);
+        let inner = unsafe { std::ptr::read(&this.inner) };
+
+        // Fast path: value already published → single Acquire CAS, the
+        // waiter (and its park state) is never touched.
+        if let Some(r) = try_take_inner(&inner) {
+            return r;
+        }
+        // Not ready: self-register this thread so the park path can be woken.
+        // Guarded by `has_worker` so an externally registered worker is kept.
+        if !inner.waiter.has_worker() {
+            inner.waiter.set_worker(std::thread::current());
+        }
+        inner
             .waiter
-            .wait_until(|| self.inner.state.load(Ordering::Acquire) != STATE_EMPTY);
-        // Predicate guarantees state != EMPTY ⇒ try_take returns `Some`.
-        self.try_take()
-            .expect("state != EMPTY guaranteed by wait_until")
+            .wait_until(|| inner.state.load(Ordering::Acquire) != STATE_EMPTY);
+        // Predicate guarantees state != EMPTY ⇒ try_take_inner returns `Some`.
+        try_take_inner(&inner).expect("state != EMPTY guaranteed by wait_until")
     }
 }
 
@@ -280,24 +320,22 @@ impl<T: Send + 'static, W: AsyncWaiter + 'static> Receiver<T, W> {
     /// convention as `flume`. The sync sibling is [`recv`](Self::recv)
     /// (gated on `W: BlockingWaiter`).
     ///
-    /// Returns a boxed future to sidestep an RPITIT lifetime inference
-    /// limitation (rust-lang/rust#100013): the inner `wait_until` future
-    /// is `impl Future + Send + 'a`, and an `async fn` body that awaits
-    /// it propagates the `'a` borrow through auto-trait inference,
-    /// breaking `Send + 'static` coercion at downstream `tokio::spawn`
-    /// call sites. Boxing the inner future erases `'a`. One alloc per
-    /// receive — amortised against the syscall-class wake.
+    /// Returns a concrete `impl Future` — **zero heap allocation per
+    /// receive**. (This previously boxed to sidestep rust-lang/rust#100013,
+    /// a pre-1.92 RPITIT lifetime-inference limitation that broke
+    /// `Send + 'static` coercion on the awaited `wait_until` future. That
+    /// bug is fixed as of rustc 1.92, which is the crate's floor, so the box
+    /// is gone.)
     pub fn recv_async(
         self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Closed>> + Send>> {
-        // `self` now runs a Drop that CASes EMPTY→RX_DROPPED, which must
-        // NOT fire here — ownership of the wait moves into the returned
-        // future, it isn't being abandoned. ManuallyDrop + ptr::read move
-        // the `inner` field out (no refcount change) while suppressing
-        // that Drop.
+    ) -> impl std::future::Future<Output = Result<T, Closed>> + Send + 'static {
+        // `self` runs a Drop that CASes EMPTY→RX_DROPPED, which must NOT
+        // fire here — ownership of the wait moves into the returned future,
+        // it isn't being abandoned. ManuallyDrop + ptr::read move the
+        // `inner` field out (no refcount change) while suppressing that Drop.
         let this = std::mem::ManuallyDrop::new(self);
         let inner = unsafe { std::ptr::read(&this.inner) };
-        Box::pin(do_recv_async(inner))
+        do_recv_async(inner)
     }
 }
 
@@ -305,48 +343,19 @@ impl<T: Send + 'static, W: AsyncWaiter + 'static> Receiver<T, W> {
 async fn do_recv_async<T: Send + 'static, W: AsyncWaiter + 'static>(
     inner: std::sync::Arc<Inner<T, W>>,
 ) -> Result<T, Closed> {
-    match inner.state.load(Ordering::Acquire) {
-        STATE_FULL => {
-            return match inner.state.compare_exchange(
-                STATE_FULL,
-                STATE_TAKEN,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let v = unsafe { (*inner.slot.get()).assume_init_read() };
-                    Ok(v)
-                }
-                Err(_) => Err(Closed),
-            };
-        }
-        STATE_CLOSED | STATE_TAKEN => return Err(Closed),
-        _ => {}
+    // Fast path: value/closure already observable → no await, no clone.
+    if let Some(r) = try_take_inner(&inner) {
+        return r;
     }
     let inner_for_pred = inner.clone();
-    // Box the wait_until future to erase its `'a` borrow before the outer
-    // `async fn` auto-trait inference runs.
-    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(
-        inner
-            .waiter
-            .wait_until(move || inner_for_pred.state.load(Ordering::Acquire) != STATE_EMPTY),
-    );
-    fut.await;
-    // Predicate guarantees state != EMPTY ⇒ try_take returns `Some`.
-    match inner.state.compare_exchange(
-        STATE_FULL,
-        STATE_TAKEN,
-        Ordering::Acquire,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => {
-            // SAFETY: FULL → TAKEN; sender's Release pairs with our Acquire.
-            let v = unsafe { (*inner.slot.get()).assume_init_read() };
-            Ok(v)
-        }
-        Err(STATE_CLOSED) | Err(STATE_TAKEN) => Err(Closed),
-        Err(_) => unreachable!("state != EMPTY guaranteed by wait_until"),
-    }
+    // Await the wait_until future directly — no box. On rustc ≥ 1.92 the
+    // `'a`-borrow / `Send` coercion (rust#100013) resolves without erasure.
+    inner
+        .waiter
+        .wait_until(move || inner_for_pred.state.load(Ordering::Acquire) != STATE_EMPTY)
+        .await;
+    // Predicate guarantees state != EMPTY ⇒ try_take_inner returns `Some`.
+    try_take_inner(&inner).expect("state != EMPTY guaranteed by wait_until")
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -359,13 +368,16 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    #[should_panic(expected = "Park::wait_until reached park path without set_worker")]
-    fn recv_without_bind_panics() {
-        // Sender is alive but never sends; receiver never binds. After
-        // burning the spin budget recv must reach the park path and
-        // panic instead of hanging forever.
-        let (_tx, rx) = OneShot::<u64>::new();
-        let _ = rx.recv();
+    fn recv_without_bind_self_binds() {
+        // recv() self-registers the calling thread — no explicit bind()
+        // needed. A sender on another thread wakes the parked receiver.
+        // (The waiter-level panic backstop still guards primitives that
+        // drive ParkWaiter directly; see park.rs.)
+        let (tx, rx) = OneShot::<u64>::new();
+        let h = thread::spawn(move || rx.recv()); // note: no rx.bind()
+        thread::sleep(Duration::from_millis(10));
+        tx.send(77);
+        assert_eq!(h.join().unwrap(), Ok(77));
     }
 
     #[test]

@@ -46,7 +46,6 @@
 
 pub mod gate;
 pub mod route;
-pub mod slot;
 pub mod stream;
 pub mod waiter;
 

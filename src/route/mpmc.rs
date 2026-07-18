@@ -54,7 +54,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::route::hub::Shutdown;
+use crate::route::Shutdown;
 use crate::waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter, Waiter};
 
 /// Maximum number of producers in an [`Mpmc`].
