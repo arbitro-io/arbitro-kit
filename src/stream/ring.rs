@@ -80,6 +80,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 
 // Under `--cfg loom` we swap the shared atomics for `loom::sync::atomic::*`
@@ -89,10 +90,10 @@ use std::sync::Arc;
 // touch the whole file — Miri (run separately) validates cell access UB
 // under the real memory model, and loom's contribution here is the atomic-
 // ordering exploration on the cursors.
-#[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::waiter::{AsyncWaiter, BlockingWaiter, ParkWaiter, Waiter};
 
@@ -164,6 +165,32 @@ unsafe impl<T: Send, const CAP: usize, W: Waiter> Sync for Ring<T, CAP, W> {}
 impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
     const MASK: usize = CAP - 1;
 
+    /// Compile-time guard for the hand-rolled initialisation in [`Ring::new`].
+    ///
+    /// `new` populates `Self` field by field through raw pointers. Unlike a
+    /// struct literal, that spelling gives the compiler no way to notice a
+    /// field nobody initialised — and the omission would not be a warning,
+    /// it would be immediate UB: `assume_init` would hand out a `Ring` whose
+    /// `head` holds whatever the allocator left behind, and a garbage cursor
+    /// indexes straight out of the slot array.
+    ///
+    /// Destructuring binds every field by name, so adding one to the struct
+    /// fails the build right here with "pattern does not mention field `x`".
+    /// When that happens, add the matching `addr_of_mut!` write in `new`.
+    /// Only leave a field out of that write if — like `slots` — it is
+    /// genuinely valid while uninitialised.
+    #[allow(dead_code)]
+    fn assert_all_fields_initialised(&self) {
+        let Self {
+            head: _,
+            tail: _,
+            not_full: _,
+            not_empty: _,
+            closed: _,
+            slots: _,
+        } = self;
+    }
+
     /// Create a fresh ring and return its unique handle pair.
     /// `CAP` must be a non-zero power of two.
     ///
@@ -175,17 +202,53 @@ impl<T, const CAP: usize, W: Waiter> Ring<T, CAP, W> {
         assert!(CAP > 0, "Ring CAP must be > 0");
         assert!(CAP.is_power_of_two(), "Ring CAP must be a power of two");
 
-        let slots: [UnsafeCell<MaybeUninit<T>>; CAP] =
-            std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit()));
+        // Build the shared state DIRECTLY on the heap.
+        //
+        // The obvious spelling — `array::from_fn` into a local, then
+        // `Arc::new(Self { .., slots })` — materialises all CAP slots on the
+        // stack and leaves it to the optimiser to elide the copy into the
+        // Arc. Release builds have been observed to elide it, but nothing in
+        // the language guarantees that. Debug builds do not elide it: a ring
+        // of 4096 `WriteFrame`s is 576 KiB, `Mpsc::producer_pool` builds one
+        // per producer, and the frame overflowed the 2 MiB default stack of
+        // the libtest thread running a `#[tokio::test]` current_thread
+        // runtime — killing the process with SIGABRT rather than failing a
+        // test. Allocating uninitialised and writing the header fields in
+        // place keeps the slots off the stack in every profile.
+        //
+        // Both waiters are built BEFORE the allocation: once the first field
+        // is written, a panic between writes would leak the already-written
+        // fields (the Arc drops as `MaybeUninit`, so no drop glue runs).
+        let not_full = CachePadded(W::default());
+        let not_empty = CachePadded(W::default());
 
-        let shared = Arc::new(Self {
-            head: CachePadded(AtomicUsize::new(0)),
-            tail: CachePadded(AtomicUsize::new(0)),
-            not_full: CachePadded(W::default()),
-            not_empty: CachePadded(W::default()),
-            closed: CachePadded(AtomicBool::new(false)),
-            slots,
-        });
+        let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
+        // Safety: the Arc was just created, so this handle is unique and no
+        // Weak exists — `get_mut` cannot return None here.
+        let ptr = Arc::get_mut(&mut uninit)
+            .expect("freshly created Arc is unique")
+            .as_mut_ptr();
+
+        // Safety: `ptr` addresses an allocation sized and aligned for `Self`,
+        // and every field carrying a value is written exactly once below.
+        // `assert_all_fields_initialised` below is what keeps that true as
+        // the struct evolves — read its comment before adding a field.
+        //
+        // `slots` is deliberately NOT written. It is an array of
+        // `UnsafeCell<MaybeUninit<T>>`; `MaybeUninit<T>` is valid for every
+        // bit pattern and `UnsafeCell` is `repr(transparent)`, so
+        // "uninitialised" is already its initialised state — which is why the
+        // old `from_fn` call was pure ceremony. Writing it here would
+        // reintroduce the stack copy this exists to avoid. Slot contents stay
+        // governed by the head/tail cursors, as documented on the struct.
+        let shared = unsafe {
+            addr_of_mut!((*ptr).head).write(CachePadded(AtomicUsize::new(0)));
+            addr_of_mut!((*ptr).tail).write(CachePadded(AtomicUsize::new(0)));
+            addr_of_mut!((*ptr).not_full).write(not_full);
+            addr_of_mut!((*ptr).not_empty).write(not_empty);
+            addr_of_mut!((*ptr).closed).write(CachePadded(AtomicBool::new(false)));
+            uninit.assume_init()
+        };
 
         (
             Producer {
@@ -513,7 +576,9 @@ impl<T, const CAP: usize, W: Waiter> Drop for Producer<T, CAP, W> {
 
 impl<T, const CAP: usize, W: Waiter> std::fmt::Debug for Producer<T, CAP, W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Producer").field("ring", &*self.shared).finish()
+        f.debug_struct("Producer")
+            .field("ring", &*self.shared)
+            .finish()
     }
 }
 
@@ -601,9 +666,7 @@ impl<T, const CAP: usize, W: Waiter> Consumer<T, CAP, W> {
 
         // Safety: the producer's Release on `head` published
         // slot[tail & MASK]; cached_head > tail guarantees it is initialized.
-        let v = unsafe {
-            (*shared.slots[tail & Ring::<T, CAP, W>::MASK].get()).assume_init_read()
-        };
+        let v = unsafe { (*shared.slots[tail & Ring::<T, CAP, W>::MASK].get()).assume_init_read() };
 
         // Release publishes "slot at tail is free" to a producer that
         // Acquires `tail`.
@@ -725,7 +788,9 @@ impl<T, const CAP: usize, W: Waiter> Drop for Consumer<T, CAP, W> {
 
 impl<T, const CAP: usize, W: Waiter> std::fmt::Debug for Consumer<T, CAP, W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Consumer").field("ring", &*self.shared).finish()
+        f.debug_struct("Consumer")
+            .field("ring", &*self.shared)
+            .finish()
     }
 }
 
