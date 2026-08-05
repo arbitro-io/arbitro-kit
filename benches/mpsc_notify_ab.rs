@@ -75,7 +75,9 @@ fn main() {
     let _ = one_round(&rt); // warm
     let mut s: Vec<f64> = (0..ROUNDS).map(|_| one_round(&rt)).collect();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    println!("Mpsc<NotifyWaiter> 1P(os-thread) -> 1C(tokio-task), N={N}, CAP={CAP}, rounds={ROUNDS}");
+    println!(
+        "Mpsc<NotifyWaiter> 1P(os-thread) -> 1C(tokio-task), N={N}, CAP={CAP}, rounds={ROUNDS}"
+    );
     println!(
         "  min={:.2}  p50={:.2}  max={:.2}  ns/msg   ({:.1} M msg/s p50)",
         s[0],

@@ -420,7 +420,9 @@ fn main() {
         rounds()
     );
 
-    println!("\n═══════════ OS-THREAD backend (kit::OneShot<Park> vs crossbeam::bounded(1)) ═══════════");
+    println!(
+        "\n═══════════ OS-THREAD backend (kit::OneShot<Park> vs crossbeam::bounded(1)) ═══════════"
+    );
 
     header("os · single-thread · serial");
     row("kit::OneShot<Park>", os_single_serial::kit());

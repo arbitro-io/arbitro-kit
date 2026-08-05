@@ -295,8 +295,8 @@ fn loom_park_e_registration_visible_to_waker() {
         let waker = thread::spawn(move || {
             d.store(1, Ordering::Release);
             // wake(): T3a then T3b, T4 dereferences the registration.
-            let observed_parked = p.load(Ordering::Acquire) == PARKED
-                || p.fetch_add(0, Ordering::AcqRel) == PARKED;
+            let observed_parked =
+                p.load(Ordering::Acquire) == PARKED || p.fetch_add(0, Ordering::AcqRel) == PARKED;
             if observed_parked {
                 assert!(
                     w.lock().unwrap().is_some(),

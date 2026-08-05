@@ -165,13 +165,11 @@ struct MpmcInner<T: Send, const RING_CAP: usize, W: Waiter> {
 impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcInner<T, RING_CAP, W> {
     #[inline]
     fn is_terminal_for_consumer(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
-            || self.live_producers.load(Ordering::Acquire) == 0
+        self.shutdown.load(Ordering::Acquire) || self.live_producers.load(Ordering::Acquire) == 0
     }
     #[inline]
     fn is_terminal_for_producer(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
-            || self.live_consumers.load(Ordering::Acquire) == 0
+        self.shutdown.load(Ordering::Acquire) || self.live_consumers.load(Ordering::Acquire) == 0
     }
 }
 
@@ -638,7 +636,10 @@ impl<T: Send, const RING_CAP: usize, W: Waiter> MpmcConsumer<T, RING_CAP, W> {
                 if t0 == h {
                     continue;
                 }
-                let mut guard = TailGuard { tail: &ring.tail, t: t0 };
+                let mut guard = TailGuard {
+                    tail: &ring.tail,
+                    t: t0,
+                };
                 while guard.t != h {
                     let v = unsafe {
                         (*ring.slots[guard.t & PRing::<T, RING_CAP>::MASK].get()).assume_init_read()
@@ -670,9 +671,9 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcConsumer<T, RING_CAP
                 return Err(Shutdown);
             }
             let shard = &self.inner.shards[self.shard_idx];
-            shard.consumer_waiter.wait_until(|| {
-                shard.any_ring_has_work() || self.inner.is_terminal_for_consumer()
-            });
+            shard
+                .consumer_waiter
+                .wait_until(|| shard.any_ring_has_work() || self.inner.is_terminal_for_consumer());
         }
     }
 
@@ -688,9 +689,9 @@ impl<T: Send, const RING_CAP: usize, W: BlockingWaiter> MpmcConsumer<T, RING_CAP
                 return Err(Shutdown);
             }
             let shard = &self.inner.shards[self.shard_idx];
-            shard.consumer_waiter.wait_until(|| {
-                shard.any_ring_has_work() || self.inner.is_terminal_for_consumer()
-            });
+            shard
+                .consumer_waiter
+                .wait_until(|| shard.any_ring_has_work() || self.inner.is_terminal_for_consumer());
         }
     }
 }

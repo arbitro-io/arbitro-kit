@@ -133,7 +133,10 @@ impl<T: Send + 'static, const CAP: usize, W: Waiter + 'static> Mpsc<T, CAP, W> {
         producers: Vec<MpscProducer<T, CAP, W>>,
     ) -> Arc<MpscProducerPool<T, CAP, W>> {
         let m = producers.len();
-        assert!(m > 0, "Mpsc::pool_from_producers: producers must be non-empty");
+        assert!(
+            m > 0,
+            "Mpsc::pool_from_producers: producers must be non-empty"
+        );
         assert!(
             m <= MAX_MPSC_PRODUCERS,
             "Mpsc::pool_from_producers: m must be <= {MAX_MPSC_PRODUCERS}"
@@ -482,11 +485,7 @@ impl<T: Send, const CAP: usize, W: Waiter> MpscConsumer<T, CAP, W> {
     /// for metrics, not in the hot recv path.
     #[inline]
     pub fn pending(&self) -> usize {
-        self.ring_consumers
-            .iter()
-            .flatten()
-            .map(|c| c.len())
-            .sum()
+        self.ring_consumers.iter().flatten().map(|c| c.len()).sum()
     }
 
     /// `true` iff at least one ring has an item. O(M) direct-scan.
@@ -663,9 +662,8 @@ impl<T: Send + 'static, const CAP: usize, W: crate::waiter::AsyncWaiter + 'stati
                         if inner_ref.shutdown.load(Ordering::Acquire) {
                             return true;
                         }
-                        let rp = unsafe {
-                            &*(rp_addr as *const Option<Producer<T, CAP, NoopWaiter>>)
-                        };
+                        let rp =
+                            unsafe { &*(rp_addr as *const Option<Producer<T, CAP, NoopWaiter>>) };
                         match rp.as_ref() {
                             Some(p) => !p.is_full(),
                             None => true,
@@ -708,7 +706,8 @@ impl<T: Send + 'static, const CAP: usize, W: crate::waiter::AsyncWaiter + 'stati
     pub fn recv_batch_async<'a, F: FnMut(T) + Send + 'a>(
         &'a mut self,
         mut f: F,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, Shutdown>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, Shutdown>> + Send + 'a>>
+    {
         let inner_addr = Arc::as_ptr(&self.inner) as usize;
         let self_addr = self as *const Self as usize;
         Box::pin(async move {
@@ -806,10 +805,7 @@ impl<T: Send, const CAP: usize> MpscConsumer<T, CAP, crate::waiter::NotifyWaiter
                 }
                 if inner.is_shutdown_signaled()
                     || (inner.all_producers_gone()
-                        && !ring_consumers
-                            .iter()
-                            .flatten()
-                            .any(|c| !c.is_empty()))
+                        && !ring_consumers.iter().flatten().any(|c| !c.is_empty()))
                 {
                     return Err(Shutdown);
                 }
@@ -854,10 +850,7 @@ impl<T: Send, const CAP: usize> MpscConsumer<T, CAP, crate::waiter::NotifyWaiter
                 }
                 if inner.is_shutdown_signaled()
                     || (inner.all_producers_gone()
-                        && !ring_consumers
-                            .iter()
-                            .flatten()
-                            .any(|c| !c.is_empty()))
+                        && !ring_consumers.iter().flatten().any(|c| !c.is_empty()))
                 {
                     return Err(Shutdown);
                 }

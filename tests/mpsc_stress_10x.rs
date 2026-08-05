@@ -92,7 +92,10 @@ fn run_once(m: usize, iter: usize) {
     watchdog.join().unwrap();
 
     let elapsed = start.elapsed();
-    println!("iter {:2} m={:2}  {} msgs in {:?}", iter, m, target, elapsed);
+    println!(
+        "iter {:2} m={:2}  {} msgs in {:?}",
+        iter, m, target, elapsed
+    );
 }
 
 #[test]

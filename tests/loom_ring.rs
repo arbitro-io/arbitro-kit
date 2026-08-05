@@ -146,12 +146,10 @@ fn loom_b_three_items_cap2_backpressure() {
 fn loom_c_single_item_lifecycle() {
     model(|| {
         let (mut tx, mut rx) = Ring::<u32, 2>::new();
-        let c = thread::spawn(move || {
-            loop {
-                match rx.try_recv() {
-                    Ok(v) => return v,
-                    Err(_) => thread::yield_now(),
-                }
+        let c = thread::spawn(move || loop {
+            match rx.try_recv() {
+                Ok(v) => return v,
+                Err(_) => thread::yield_now(),
             }
         });
         while tx.try_send(42).is_err() {
@@ -186,8 +184,16 @@ fn loom_d_drop_drains_unread() {
         }
 
         let (mut tx, rx) = Ring::<Tracked, 2>::new();
-        assert!(tx.try_send(Tracked { drops: drops.clone() }).is_ok());
-        assert!(tx.try_send(Tracked { drops: drops.clone() }).is_ok());
+        assert!(tx
+            .try_send(Tracked {
+                drops: drops.clone()
+            })
+            .is_ok());
+        assert!(tx
+            .try_send(Tracked {
+                drops: drops.clone()
+            })
+            .is_ok());
         // Drop both handles with 2 items unread — the shared drain runs
         // when the second Arc reference goes away.
         drop(tx);

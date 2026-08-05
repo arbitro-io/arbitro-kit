@@ -31,14 +31,14 @@
 
 use std::future::Future;
 
+mod noop;
 #[cfg(feature = "tokio")]
 mod notify;
-mod noop;
 mod park;
 
+pub use noop::NoopWaiter;
 #[cfg(feature = "tokio")]
 pub use notify::NotifyWaiter;
-pub use noop::NoopWaiter;
 pub use park::ParkWaiter;
 
 /// Common surface every backend implements.
