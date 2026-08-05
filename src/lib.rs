@@ -8,36 +8,32 @@
 //! - [`waiter`] — the unified wait/wake contract:
 //!   [`Waiter`] / [`BlockingWaiter`] / [`AsyncWaiter`] +
 //!   [`ParkWaiter`] (sync OS thread) and [`NotifyWaiter`] (async, tokio).
-//! - [`gate`] — coalesced multi-channel signal: [`SignalSet`], plus
-//!   single-use [`OneSignal`] and the lifeline cancellation helper.
-//! - [`slot`] — single-message transports: [`Pipe`], [`Channel`].
-//! - [`stream`] — FIFO transports: [`Ring`] (bounded), [`Stream`]
-//!   (unbounded), [`Duplex`] (bidirectional pair), [`BufferedSender`].
-//! - [`route`] — multiplexed transports (N→1, M→N): [`Hub`], [`Mpmc`],
-//!   [`Mpsc`], [`OneShot`].
+//! - [`gate`] — coalesced multi-channel signal: [`SignalSet`], a bitmap of
+//!   up to 64 binary signals collapsing onto one consumer.
+//! - [`stream`] — FIFO transport: [`Ring`], a bounded SPSC queue with
+//!   split `!Clone`/`!Sync` handles, so the single-producer/single-consumer
+//!   contract is enforced at compile time.
+//! - [`route`] — multiplexed transports: [`Mpsc`] (M→1 fan-in),
+//!   [`Mpmc`] (M→N anonymous), [`OneShot`] (one value, once).
 //!
 //! ## Quick start
 //!
 //! ```no_run
-//! use arbitro_kit::slot::Channel;
+//! use arbitro_kit::stream::Ring;
 //!
-//! let (client, server) = Channel::<u64, u64>::spsc();
+//! // Bounded SPSC. CAP must be a power of two.
+//! let (mut tx, mut rx) = Ring::<u64, 1024>::new();
+//! tx.try_send(7).unwrap();
+//! assert_eq!(rx.try_recv().unwrap(), 7);
 //! ```
 //!
 //! Every transport is generic over a [`Waiter`] backend. Default is
 //! sync OS thread; opt into tokio with `feature = "tokio"` and the
-//! `*Async` type aliases (e.g. [`PipeAsync`](slot::PipeAsync),
+//! `*Async` type aliases (e.g. [`MpscAsync`](route::MpscAsync),
 //! [`OneShotAsync`](route::OneShotAsync)).
 //!
 //! [`SignalSet`]: gate::SignalSet
-//! [`OneSignal`]: gate::OneSignal
-//! [`Pipe`]: slot::Pipe
-//! [`Channel`]: slot::Channel
 //! [`Ring`]: stream::Ring
-//! [`Stream`]: stream::Stream
-//! [`Duplex`]: stream::Duplex
-//! [`BufferedSender`]: stream::BufferedSender
-//! [`Hub`]: route::Hub
 //! [`Mpmc`]: route::Mpmc
 //! [`Mpsc`]: route::Mpsc
 //! [`OneShot`]: route::OneShot
